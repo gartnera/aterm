@@ -25,6 +25,15 @@ fn family_of(name: &str) -> Family<'_> {
     }
 }
 
+fn srgb_to_linear(c: u8) -> f64 {
+    let v = c as f64 / 255.0;
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     let count = s.chars().count();
     if max_chars == 0 {
@@ -149,6 +158,7 @@ pub struct Gfx {
     line_height: f32,
     cell_width_logical: f32,
     font_family: String,
+    clear_color: wgpu::Color,
     /// Physical-pixel x-ranges for each rendered tab, refreshed every frame.
     tab_hit_regions: Vec<(usize, f32, f32)>,
     quads: QuadPipeline,
@@ -166,6 +176,7 @@ impl Gfx {
         font_size: f32,
         line_height: f32,
         font_family: String,
+        bg: [u8; 3],
     ) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
@@ -239,6 +250,12 @@ impl Gfx {
             line_height,
             cell_width_logical,
             font_family,
+            clear_color: wgpu::Color {
+                r: srgb_to_linear(bg[0]),
+                g: srgb_to_linear(bg[1]),
+                b: srgb_to_linear(bg[2]),
+                a: 1.0,
+            },
             tab_hit_regions: Vec::new(),
             quads,
             row_buffers: Vec::new(),
@@ -541,12 +558,7 @@ impl Gfx {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.06,
-                            g: 0.06,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(self.clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,

@@ -5,6 +5,7 @@ use alacritty_terminal::event_loop::{EventLoop as PtyLoop, Msg, Notifier};
 
 use winit::event_loop::EventLoopProxy;
 
+use crate::config::Colors as ConfigColors;
 use crate::WakeEvent;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
@@ -52,83 +53,82 @@ fn rgb_to_arr(rgb: Rgb) -> [u8; 3] {
     [rgb.r, rgb.g, rgb.b]
 }
 
-fn default_fg() -> Rgb {
-    Rgb { r: 0xd0, g: 0xd0, b: 0xd0 }
+fn named_from_palette(name: NamedColor, palette: &ConfigColors) -> Option<[u8; 3]> {
+    use NamedColor as N;
+    Some(match name {
+        N::Foreground => palette.foreground,
+        N::Background => palette.background,
+        N::Cursor => palette.cursor,
+        N::Black => palette.normal.black,
+        N::Red => palette.normal.red,
+        N::Green => palette.normal.green,
+        N::Yellow => palette.normal.yellow,
+        N::Blue => palette.normal.blue,
+        N::Magenta => palette.normal.magenta,
+        N::Cyan => palette.normal.cyan,
+        N::White => palette.normal.white,
+        N::BrightBlack => palette.bright.black,
+        N::BrightRed => palette.bright.red,
+        N::BrightGreen => palette.bright.green,
+        N::BrightYellow => palette.bright.yellow,
+        N::BrightBlue => palette.bright.blue,
+        N::BrightMagenta => palette.bright.magenta,
+        N::BrightCyan => palette.bright.cyan,
+        N::BrightWhite => palette.bright.white,
+        _ => return None,
+    })
 }
 
-fn default_bg() -> Rgb {
-    Rgb { r: 0x10, g: 0x10, b: 0x14 }
-}
-
-fn xterm_256(idx: u8) -> Rgb {
-    // Standard xterm palette. Used both for direct Indexed lookups and as a
-    // fallback for Named colors when the Term hasn't been told a palette
-    // (which is the normal case — alacritty's `Term::colors` is all-None
-    // until the application sets it via OSC sequences or we seed it).
-    static BASIC: [(u8, u8, u8); 16] = [
-        (0x00, 0x00, 0x00), (0xcd, 0x31, 0x31), (0x0d, 0xbc, 0x79), (0xe5, 0xe5, 0x10),
-        (0x24, 0x72, 0xc8), (0xbc, 0x3f, 0xbc), (0x11, 0xa8, 0xcd), (0xe5, 0xe5, 0xe5),
-        (0x66, 0x66, 0x66), (0xf1, 0x4c, 0x4c), (0x23, 0xd1, 0x8b), (0xf5, 0xf5, 0x43),
-        (0x3b, 0x8e, 0xea), (0xd6, 0x70, 0xd6), (0x29, 0xb8, 0xdb), (0xe5, 0xe5, 0xe5),
-    ];
+fn indexed_from_palette(idx: u8, palette: &ConfigColors) -> [u8; 3] {
+    // 0..16: configured normal / bright palette.
     if idx < 16 {
-        let (r, g, b) = BASIC[idx as usize];
-        return Rgb { r, g, b };
+        let bright = idx >= 8;
+        let pal = if bright { &palette.bright } else { &palette.normal };
+        return match idx % 8 {
+            0 => pal.black,
+            1 => pal.red,
+            2 => pal.green,
+            3 => pal.yellow,
+            4 => pal.blue,
+            5 => pal.magenta,
+            6 => pal.cyan,
+            _ => pal.white,
+        };
     }
+    // 16..232: 6x6x6 colour cube.
     if (16..=231).contains(&idx) {
         let n = idx - 16;
         let r = n / 36;
         let g = (n / 6) % 6;
         let b = n % 6;
         let scale = |v: u8| if v == 0 { 0 } else { 55 + 40 * v };
-        return Rgb { r: scale(r), g: scale(g), b: scale(b) };
+        return [scale(r), scale(g), scale(b)];
     }
+    // 232..256: 24-step greyscale ramp.
     let gray = 8 + 10 * (idx - 232);
-    Rgb { r: gray, g: gray, b: gray }
-}
-
-fn named_to_basic_idx(name: NamedColor) -> Option<u8> {
-    Some(match name {
-        NamedColor::Black => 0,
-        NamedColor::Red => 1,
-        NamedColor::Green => 2,
-        NamedColor::Yellow => 3,
-        NamedColor::Blue => 4,
-        NamedColor::Magenta => 5,
-        NamedColor::Cyan => 6,
-        NamedColor::White => 7,
-        NamedColor::BrightBlack => 8,
-        NamedColor::BrightRed => 9,
-        NamedColor::BrightGreen => 10,
-        NamedColor::BrightYellow => 11,
-        NamedColor::BrightBlue => 12,
-        NamedColor::BrightMagenta => 13,
-        NamedColor::BrightCyan => 14,
-        NamedColor::BrightWhite => 15,
-        _ => return None,
-    })
+    [gray, gray, gray]
 }
 
 fn resolve_color(
     color: AnsiColor,
     colors: &alacritty_terminal::term::color::Colors,
+    palette: &ConfigColors,
     role: Role,
 ) -> [u8; 3] {
-    let rgb = match color {
-        AnsiColor::Named(name) => colors[name].unwrap_or_else(|| {
-            if let Some(idx) = named_to_basic_idx(name) {
-                xterm_256(idx)
-            } else {
-                match role {
-                    Role::Fg => default_fg(),
-                    Role::Bg => default_bg(),
-                }
-            }
-        }),
-        AnsiColor::Spec(rgb) => rgb,
-        AnsiColor::Indexed(idx) => colors[idx as usize].unwrap_or_else(|| xterm_256(idx)),
-    };
-    rgb_to_arr(rgb)
+    match color {
+        AnsiColor::Named(name) => match colors[name] {
+            Some(rgb) => rgb_to_arr(rgb),
+            None => named_from_palette(name, palette).unwrap_or_else(|| match role {
+                Role::Fg => palette.foreground,
+                Role::Bg => palette.background,
+            }),
+        },
+        AnsiColor::Spec(rgb) => rgb_to_arr(rgb),
+        AnsiColor::Indexed(idx) => match colors[idx as usize] {
+            Some(rgb) => rgb_to_arr(rgb),
+            None => indexed_from_palette(idx, palette),
+        },
+    }
 }
 
 impl EventListener for ChannelListener {
@@ -146,6 +146,7 @@ pub struct TerminalSession {
     cols: u16,
     lines: u16,
     exited: bool,
+    palette: ConfigColors,
 }
 
 impl TerminalSession {
@@ -153,6 +154,7 @@ impl TerminalSession {
         cols: u16,
         lines: u16,
         proxy: EventLoopProxy<WakeEvent>,
+        palette: ConfigColors,
     ) -> std::io::Result<Self> {
         // Approximate cell size; the renderer will refine this when it knows
         // the real per-cell pixel size and call `resize`.
@@ -195,6 +197,7 @@ impl TerminalSession {
             cols,
             lines,
             exited: false,
+            palette,
         })
     }
 
@@ -259,8 +262,8 @@ impl TerminalSession {
                 continue;
             }
             let cell = &indexed.cell;
-            let mut fg = resolve_color(cell.fg, content.colors, Role::Fg);
-            let mut bg = resolve_color(cell.bg, content.colors, Role::Bg);
+            let mut fg = resolve_color(cell.fg, content.colors, &self.palette, Role::Fg);
+            let mut bg = resolve_color(cell.bg, content.colors, &self.palette, Role::Bg);
             if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
@@ -285,8 +288,12 @@ impl TerminalSession {
             cursor_line: cursor_vp.map(|p| p.line).unwrap_or(0),
             cursor_col: cursor_vp.map(|p| p.column.0).unwrap_or(0),
             cursor_visible,
-            fg: rgb_to_arr(content.colors[NamedColor::Foreground].unwrap_or(default_fg())),
-            bg: rgb_to_arr(content.colors[NamedColor::Background].unwrap_or(default_bg())),
+            fg: content.colors[NamedColor::Foreground]
+                .map(rgb_to_arr)
+                .unwrap_or(self.palette.foreground),
+            bg: content.colors[NamedColor::Background]
+                .map(rgb_to_arr)
+                .unwrap_or(self.palette.background),
         }
     }
 

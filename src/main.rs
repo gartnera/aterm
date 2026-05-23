@@ -52,7 +52,12 @@ impl App {
     fn spawn_tab(&mut self) {
         let Some(gfx) = self.gfx.as_ref() else { return };
         let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
-        match TerminalSession::spawn(cols, lines, self.proxy.clone()) {
+        match TerminalSession::spawn(
+            cols,
+            lines,
+            self.proxy.clone(),
+            self.config.colors.clone(),
+        ) {
             Ok(s) => {
                 self.tabs.push(s);
                 self.active_tab = self.tabs.len() - 1;
@@ -98,14 +103,20 @@ impl ApplicationHandler<WakeEvent> for App {
             self.config.font_size,
             line_height,
             self.config.font_family.clone(),
+            self.config.colors.background,
         ));
         self.window = Some(window.clone());
         self.gfx = Some(gfx);
 
         // Spawn an initial terminal tab sized to the current window.
         let (cols, lines) = gfx_ref(&self.gfx).grid_for_window(TAB_BAR_HEIGHT);
-        let session = TerminalSession::spawn(cols, lines, self.proxy.clone())
-            .expect("spawn terminal");
+        let session = TerminalSession::spawn(
+            cols,
+            lines,
+            self.proxy.clone(),
+            self.config.colors.clone(),
+        )
+        .expect("spawn terminal");
         self.tabs.push(session);
         self.active_tab = 0;
         window.request_redraw();

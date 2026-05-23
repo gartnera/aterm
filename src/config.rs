@@ -60,29 +60,31 @@ pub struct AnsiPalette {
 
 impl Default for Colors {
     fn default() -> Self {
+        // Matches alacritty's built-in default scheme so the look is
+        // identical when no [colors] table is provided.
         Self {
-            background: [0x10, 0x10, 0x14],
-            foreground: [0xd0, 0xd0, 0xd0],
-            cursor: [0xd0, 0xd0, 0xd0],
+            background: [0x18, 0x18, 0x18],
+            foreground: [0xd8, 0xd8, 0xd8],
+            cursor: [0xd8, 0xd8, 0xd8],
             normal: AnsiPalette {
-                black: [0x00, 0x00, 0x00],
-                red: [0xcc, 0x33, 0x33],
-                green: [0x33, 0xcc, 0x33],
-                yellow: [0xcc, 0xcc, 0x33],
-                blue: [0x33, 0x66, 0xcc],
-                magenta: [0xcc, 0x33, 0xcc],
-                cyan: [0x33, 0xcc, 0xcc],
-                white: [0xcc, 0xcc, 0xcc],
+                black: [0x18, 0x18, 0x18],
+                red: [0xac, 0x42, 0x42],
+                green: [0x90, 0xa9, 0x59],
+                yellow: [0xf4, 0xbf, 0x75],
+                blue: [0x6a, 0x9f, 0xb5],
+                magenta: [0xaa, 0x75, 0x9f],
+                cyan: [0x75, 0xb5, 0xaa],
+                white: [0xd8, 0xd8, 0xd8],
             },
             bright: AnsiPalette {
-                black: [0x66, 0x66, 0x66],
-                red: [0xff, 0x66, 0x66],
-                green: [0x66, 0xff, 0x66],
-                yellow: [0xff, 0xff, 0x66],
-                blue: [0x66, 0x99, 0xff],
-                magenta: [0xff, 0x66, 0xff],
-                cyan: [0x66, 0xff, 0xff],
-                white: [0xff, 0xff, 0xff],
+                black: [0x6b, 0x6b, 0x6b],
+                red: [0xc5, 0x55, 0x55],
+                green: [0xaa, 0xc4, 0x74],
+                yellow: [0xfe, 0xca, 0x88],
+                blue: [0x82, 0xb8, 0xc8],
+                magenta: [0xc2, 0x8c, 0xb8],
+                cyan: [0x93, 0xd3, 0xc3],
+                white: [0xf8, 0xf8, 0xf8],
             },
         }
     }
@@ -164,23 +166,101 @@ pub fn load() -> Config {
         log::info!("no alacritty config found; using defaults");
         return cfg;
     };
-    let body = match std::fs::read_to_string(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!("could not read {}: {e}", path.display());
-            return cfg;
-        }
+    let Some(merged) = load_value(&path, 0) else {
+        log::warn!("could not load {}", path.display());
+        return cfg;
     };
-    let raw: RawConfig = match toml::from_str(&body) {
+    let raw: RawConfig = match merged.try_into() {
         Ok(r) => r,
         Err(e) => {
-            log::warn!("failed to parse {}: {e}", path.display());
+            log::warn!("failed to interpret {}: {e}", path.display());
             return cfg;
         }
     };
     log::info!("loaded alacritty config from {}", path.display());
     apply_raw(&mut cfg, raw);
     cfg
+}
+
+/// Recursively load a config file, honouring `import = [...]` (both at the
+/// top level and under `[general]`). Imports are merged underneath the
+/// current file so the current file's keys win.
+fn load_value(path: &std::path::Path, depth: usize) -> Option<toml::Value> {
+    if depth > 4 {
+        return None;
+    }
+    let body = std::fs::read_to_string(path).ok()?;
+    let mut value: toml::Value = toml::from_str(&body).ok()?;
+
+    let imports = take_imports(&mut value);
+    let base_dir = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+
+    let mut merged = toml::Value::Table(Default::default());
+    for imp in imports {
+        let resolved = expand_path(&imp, base_dir);
+        if let Some(v) = load_value(&resolved, depth + 1) {
+            merge_toml(&mut merged, v);
+        }
+    }
+    merge_toml(&mut merged, value);
+    Some(merged)
+}
+
+fn take_imports(value: &mut toml::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let top_level = value
+        .as_table_mut()
+        .and_then(|t| t.remove("import"));
+    let nested = value
+        .get_mut("general")
+        .and_then(|g| g.as_table_mut())
+        .and_then(|t| t.remove("import"));
+    for entry in [top_level, nested].into_iter().flatten() {
+        if let toml::Value::Array(arr) = entry {
+            for v in arr {
+                if let toml::Value::String(s) = v {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(b), toml::Value::Table(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(existing) => merge_toml(existing, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (slot, overlay) => {
+            *slot = overlay;
+        }
+    }
+}
+
+fn expand_path(s: &str, base_dir: &std::path::Path) -> PathBuf {
+    let expanded = if let Some(rest) = s.strip_prefix("~/") {
+        match dirs::home_dir() {
+            Some(home) => home.join(rest),
+            None => PathBuf::from(s),
+        }
+    } else if s == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(s))
+    } else {
+        PathBuf::from(s)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        base_dir.join(expanded)
+    }
 }
 
 fn apply_raw(cfg: &mut Config, raw: RawConfig) {
