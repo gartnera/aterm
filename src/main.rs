@@ -2,9 +2,14 @@ use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
+
+/// Sent by the alacritty PTY thread to wake the winit event loop when the
+/// terminal has produced new content.
+#[derive(Debug, Clone, Copy)]
+pub struct WakeEvent;
 
 mod input;
 
@@ -21,6 +26,7 @@ const TAB_BAR_HEIGHT: f32 = 28.0;
 
 struct App {
     config: Config,
+    proxy: EventLoopProxy<WakeEvent>,
     window: Option<Arc<Window>>,
     gfx: Option<Gfx>,
     tabs: Vec<TerminalSession>,
@@ -30,9 +36,10 @@ struct App {
 }
 
 impl App {
-    fn new(config: Config) -> Self {
+    fn new(config: Config, proxy: EventLoopProxy<WakeEvent>) -> Self {
         Self {
             config,
+            proxy,
             window: None,
             gfx: None,
             tabs: Vec::new(),
@@ -45,7 +52,7 @@ impl App {
     fn spawn_tab(&mut self) {
         let Some(gfx) = self.gfx.as_ref() else { return };
         let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
-        match TerminalSession::spawn(cols, lines) {
+        match TerminalSession::spawn(cols, lines, self.proxy.clone()) {
             Ok(s) => {
                 self.tabs.push(s);
                 self.active_tab = self.tabs.len() - 1;
@@ -76,7 +83,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<WakeEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -97,7 +104,8 @@ impl ApplicationHandler for App {
 
         // Spawn an initial terminal tab sized to the current window.
         let (cols, lines) = gfx_ref(&self.gfx).grid_for_window(TAB_BAR_HEIGHT);
-        let session = TerminalSession::spawn(cols, lines).expect("spawn terminal");
+        let session = TerminalSession::spawn(cols, lines, self.proxy.clone())
+            .expect("spawn terminal");
         self.tabs.push(session);
         self.active_tab = 0;
         window.request_redraw();
@@ -184,8 +192,9 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Drain terminal events; request a redraw if any tab produced output.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: WakeEvent) {
+        // The PTY thread woke us; drain its events and ask for a redraw if
+        // any tab actually produced new content.
         let mut wake = false;
         for tab in &mut self.tabs {
             if tab.pump_events() {
@@ -267,8 +276,11 @@ fn main() {
         }
     }
 
-    let event_loop = EventLoop::new().expect("event loop");
+    let event_loop = EventLoop::<WakeEvent>::with_user_event()
+        .build()
+        .expect("event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
-    let mut app = App::new(config);
+    let proxy = event_loop.create_proxy();
+    let mut app = App::new(config, proxy);
     event_loop.run_app(&mut app).expect("run app");
 }

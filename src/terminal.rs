@@ -2,6 +2,10 @@ use std::sync::Arc;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop as PtyLoop, Msg, Notifier};
+
+use winit::event_loop::EventLoopProxy;
+
+use crate::WakeEvent;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
@@ -14,7 +18,10 @@ use alacritty_terminal::Term;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 #[derive(Clone)]
-pub struct ChannelListener(Sender<TermEvent>);
+pub struct ChannelListener {
+    tx: Sender<TermEvent>,
+    proxy: EventLoopProxy<WakeEvent>,
+}
 
 #[derive(Clone, Copy, Default)]
 pub struct SnapCell {
@@ -126,7 +133,8 @@ fn resolve_color(
 
 impl EventListener for ChannelListener {
     fn send_event(&self, event: TermEvent) {
-        let _ = self.0.send(event);
+        let _ = self.tx.send(event);
+        let _ = self.proxy.send_event(WakeEvent);
     }
 }
 
@@ -140,7 +148,11 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    pub fn spawn(cols: u16, lines: u16) -> std::io::Result<Self> {
+    pub fn spawn(
+        cols: u16,
+        lines: u16,
+        proxy: EventLoopProxy<WakeEvent>,
+    ) -> std::io::Result<Self> {
         // Approximate cell size; the renderer will refine this when it knows
         // the real per-cell pixel size and call `resize`.
         let cell_width = 8;
@@ -164,7 +176,7 @@ impl TerminalSession {
         let pty = tty::new(&pty_options, window_size, 0)?;
 
         let (events_tx, events_rx) = unbounded();
-        let listener = ChannelListener(events_tx);
+        let listener = ChannelListener { tx: events_tx, proxy };
 
         let term_config = TermConfig::default();
         let term = Term::new(term_config, &term_size, listener.clone());

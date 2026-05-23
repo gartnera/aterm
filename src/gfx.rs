@@ -17,6 +17,37 @@ struct RowSpan<'a> {
     attrs: Attrs<'a>,
 }
 
+fn family_of(name: &str) -> Family<'_> {
+    if name.eq_ignore_ascii_case("monospace") {
+        Family::Monospace
+    } else {
+        Family::Name(name)
+    }
+}
+
+fn push_bg_quad(
+    quads: &mut Vec<Quad>,
+    scale: f32,
+    cell_w_px: f32,
+    cell_h_px: f32,
+    start_col: usize,
+    end_col: usize,
+    y_px: f32,
+    bg: [u8; 3],
+) {
+    let x = PAD_X * scale + start_col as f32 * cell_w_px;
+    let w = (end_col - start_col) as f32 * cell_w_px;
+    quads.push(Quad {
+        rect: [x, y_px, w, cell_h_px],
+        color: [
+            bg[0] as f32 / 255.0,
+            bg[1] as f32 / 255.0,
+            bg[2] as f32 / 255.0,
+            1.0,
+        ],
+    });
+}
+
 fn build_row_text<'a>(
     row: &[crate::terminal::SnapCell],
     row_idx: usize,
@@ -106,6 +137,12 @@ pub struct Gfx {
     /// Physical-pixel x-ranges for each rendered tab, refreshed every frame.
     tab_hit_regions: Vec<(usize, f32, f32)>,
     quads: QuadPipeline,
+    /// Reusable per-row text buffers; grown as the grid grows. Recreating
+    /// these every frame was the dominant per-frame cost.
+    row_buffers: Vec<Buffer>,
+    tab_buffer: Option<Buffer>,
+    /// Reusable quad accumulator so we don't reallocate Vec<Quad> per frame.
+    quad_scratch: Vec<Quad>,
 }
 
 impl Gfx {
@@ -189,6 +226,9 @@ impl Gfx {
             font_family,
             tab_hit_regions: Vec::new(),
             quads,
+            row_buffers: Vec::new(),
+            tab_buffer: None,
+            quad_scratch: Vec::new(),
         }
     }
 
@@ -253,32 +293,16 @@ impl Gfx {
             .map(|s| Color::rgb(s.fg[0], s.fg[1], s.fg[2]))
             .unwrap_or_else(|| Color::rgb(0xd0, 0xd0, 0xd0));
 
-        let mut quads: Vec<Quad> = Vec::new();
-        // Tab bar background strip.
+        let quads = &mut self.quad_scratch;
+        quads.clear();
         quads.push(Quad {
             rect: [0.0, 0.0, width as f32, tab_bar_height * scale],
             color: [0.16, 0.16, 0.20, 1.0],
         });
 
-        // Collect (Buffer, x_px, y_px, default_color) entries; build them first
-        // so all borrows of font_system are released before we hand the Vec to
-        // glyphon's prepare() (which also borrows font_system mutably).
-        #[allow(clippy::type_complexity)]
-        let mut entries: Vec<(Buffer, f32, f32, Color)> = Vec::new();
+        let family_name = self.font_family.clone();
 
-        // Borrow font_family as a local &str so we can build Family<'_> values
-        // without re-borrowing &self alongside &mut self.font_system.
-        let family_name: String = self.font_family.clone();
-        fn family_of(name: &str) -> Family<'_> {
-            if name.eq_ignore_ascii_case("monospace") {
-                Family::Monospace
-            } else {
-                Family::Name(name)
-            }
-        }
-
-        // Tab bar: build the text and capture per-tab character ranges so we
-        // can hit-test mouse clicks back to a tab index.
+        // ===== Tab bar text + hit regions + active-tab quad. =====
         self.tab_hit_regions.clear();
         let mut tab_text = String::new();
         for (i, t) in tabs.iter().enumerate() {
@@ -302,55 +326,44 @@ impl Gfx {
         if tab_text.is_empty() {
             tab_text.push_str("(no tabs)");
         }
-        let mut tab_buf = Buffer::new(&mut self.font_system, metrics);
-        tab_buf.set_size(
-            &mut self.font_system,
-            Some(width as f32),
-            Some(tab_bar_height * scale),
-        );
-        tab_buf.set_text(
-            &mut self.font_system,
-            &tab_text,
-            &Attrs::new().family(family_of(&family_name)),
-            Shaping::Advanced,
-            None,
-        );
-        tab_buf.shape_until_scroll(&mut self.font_system, false);
-        entries.push((
-            tab_buf,
+
+        // Reuse the cached tab buffer.
+        if self.tab_buffer.is_none() {
+            self.tab_buffer = Some(Buffer::new(&mut self.font_system, metrics));
+        }
+        {
+            let buf = self.tab_buffer.as_mut().unwrap();
+            buf.set_metrics(&mut self.font_system, metrics);
+            buf.set_size(
+                &mut self.font_system,
+                Some(width as f32),
+                Some(tab_bar_height * scale),
+            );
+            buf.set_text(
+                &mut self.font_system,
+                &tab_text,
+                &Attrs::new().family(family_of(&family_name)),
+                Shaping::Advanced,
+                None,
+            );
+            buf.shape_until_scroll(&mut self.font_system, false);
+        }
+        let tab_pos = (
             PAD_X * scale,
             (tab_bar_height - self.line_height) * 0.5 * scale,
             Color::rgb(0xc8, 0xc8, 0xd0),
-        ));
+        );
 
-        // Grid rows: one Buffer per visible line.
+        // ===== Grid: background quads, cursor quad, row text buffers. =====
         let top_offset_px = (tab_bar_height + PAD_Y) * scale;
+        let mut row_count = 0usize;
         if let Some(snap) = snapshot.as_ref() {
-            // Cell backgrounds: emit one quad per run of same-bg cells in a
-            // row. Cells matching the terminal's default bg are skipped so
-            // they fall through to the surface clear. The cursor cell is
-            // skipped here because the cursor block covers it.
             let default_bg = snap.bg;
             for (row_idx, row) in snap.cells.iter().enumerate() {
                 let y = top_offset_px + row_idx as f32 * cell_h_px;
                 let cursor_col = (snap.cursor_visible && snap.cursor_line == row_idx)
                     .then_some(snap.cursor_col);
                 let mut run: Option<(usize, [u8; 3])> = None;
-                let flush = |run: Option<(usize, [u8; 3])>, end_col: usize, quads: &mut Vec<Quad>| {
-                    if let Some((start, bg)) = run {
-                        let x = PAD_X * scale + start as f32 * cell_w_px;
-                        let w = (end_col - start) as f32 * cell_w_px;
-                        quads.push(Quad {
-                            rect: [x, y, w, cell_h_px],
-                            color: [
-                                bg[0] as f32 / 255.0,
-                                bg[1] as f32 / 255.0,
-                                bg[2] as f32 / 255.0,
-                                1.0,
-                            ],
-                        });
-                    }
-                };
                 for (col, cell) in row.iter().enumerate() {
                     let is_cursor = Some(col) == cursor_col;
                     let bg_opt = if is_cursor || cell.bg == default_bg {
@@ -362,8 +375,8 @@ impl Gfx {
                         (Some((start, bg)), Some(new_bg)) if bg == new_bg => {
                             run = Some((start, bg));
                         }
-                        (Some(_), _) => {
-                            flush(run, col, &mut quads);
+                        (Some((start, bg)), _) => {
+                            push_bg_quad(quads, scale, cell_w_px, cell_h_px, start, col, y, bg);
                             run = bg_opt.map(|b| (col, b));
                         }
                         (None, Some(b)) => {
@@ -372,7 +385,9 @@ impl Gfx {
                         (None, None) => {}
                     }
                 }
-                flush(run, row.len(), &mut quads);
+                if let Some((start, bg)) = run {
+                    push_bg_quad(quads, scale, cell_w_px, cell_h_px, start, row.len(), y, bg);
+                }
             }
             if snap.cursor_visible {
                 let x = PAD_X * scale + snap.cursor_col as f32 * cell_w_px;
@@ -388,8 +403,15 @@ impl Gfx {
                     ],
                 });
             }
+
+            // Grow the row-buffer pool as needed; reuse what we have.
+            while self.row_buffers.len() < snap.cells.len() {
+                self.row_buffers
+                    .push(Buffer::new(&mut self.font_system, metrics));
+            }
             for (row_idx, row) in snap.cells.iter().enumerate() {
-                let mut buf = Buffer::new(&mut self.font_system, metrics);
+                let buf = &mut self.row_buffers[row_idx];
+                buf.set_metrics(&mut self.font_system, metrics);
                 buf.set_size(
                     &mut self.font_system,
                     Some(cell_w_px * row.len() as f32 + cell_w_px),
@@ -397,7 +419,9 @@ impl Gfx {
                 );
                 let (text, spans_meta) =
                     build_row_text(row, row_idx, snap, family_of(&family_name));
-                let spans = spans_meta.iter().map(|s| (&text[s.range.clone()], s.attrs.clone()));
+                let spans = spans_meta
+                    .iter()
+                    .map(|s| (&text[s.range.clone()], s.attrs.clone()));
                 buf.set_rich_text(
                     &mut self.font_system,
                     spans,
@@ -406,28 +430,39 @@ impl Gfx {
                     None,
                 );
                 buf.shape_until_scroll(&mut self.font_system, false);
-                let y = top_offset_px + row_idx as f32 * cell_h_px;
-                entries.push((buf, PAD_X * scale, y, default_fg));
             }
+            row_count = snap.cells.len();
         }
 
-        let text_areas: Vec<TextArea<'_>> = entries
-            .iter()
-            .map(|(buf, x, y, color)| TextArea {
-                buffer: buf,
-                left: *x,
-                top: *y,
+        // ===== Build TextAreas borrowing from the cached buffers. =====
+        let bounds = TextBounds {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
+        let tab_area = self.tab_buffer.as_ref().map(|buf| TextArea {
+            buffer: buf,
+            left: tab_pos.0,
+            top: tab_pos.1,
+            scale: 1.0,
+            bounds,
+            default_color: tab_pos.2,
+            custom_glyphs: &[],
+        });
+        let row_areas = (0..row_count).map(|i| {
+            let y = top_offset_px + i as f32 * cell_h_px;
+            TextArea {
+                buffer: &self.row_buffers[i],
+                left: PAD_X * scale,
+                top: y,
                 scale: 1.0,
-                bounds: TextBounds {
-                    left: 0,
-                    top: 0,
-                    right: width as i32,
-                    bottom: height as i32,
-                },
-                default_color: *color,
+                bounds,
+                default_color: default_fg,
                 custom_glyphs: &[],
-            })
-            .collect();
+            }
+        });
+        let text_areas: Vec<TextArea<'_>> = tab_area.into_iter().chain(row_areas).collect();
 
         self.text_renderer
             .prepare(
@@ -441,7 +476,7 @@ impl Gfx {
             )
             .expect("prepare text");
 
-        self.quads.upload(&self.device, &self.queue, width, height, &quads);
+        self.quads.upload(&self.device, &self.queue, width, height, &self.quad_scratch);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
