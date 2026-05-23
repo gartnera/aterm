@@ -7,13 +7,19 @@
 
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
+#[derive(Clone, Copy)]
+pub struct TermKeyMode {
+    pub app_cursor: bool,
+}
+
 pub fn encode_key(
     logical_key: &Key,
     text: Option<&str>,
     mods: ModifiersState,
+    term_mode: TermKeyMode,
 ) -> Option<Vec<u8>> {
     if let Key::Named(named) = logical_key {
-        if let Some(seq) = encode_named(*named) {
+        if let Some(seq) = encode_named(*named, term_mode) {
             return Some(prefix_alt(seq.to_vec(), mods));
         }
     }
@@ -56,19 +62,23 @@ fn prefix_alt(mut bytes: Vec<u8>, mods: ModifiersState) -> Vec<u8> {
     bytes
 }
 
-fn encode_named(named: NamedKey) -> Option<&'static [u8]> {
+fn encode_named(named: NamedKey, mode: TermKeyMode) -> Option<&'static [u8]> {
+    // In DECCKM (application cursor) mode, arrow + Home/End emit SS3 (ESC O)
+    // sequences instead of CSI (ESC [). htop, vim, less, etc. switch into
+    // this mode and use it to recognise arrow keys.
+    let app = mode.app_cursor;
     Some(match named {
         NamedKey::Enter => b"\r",
         NamedKey::Tab => b"\t",
         NamedKey::Backspace => b"\x7f",
         NamedKey::Escape => b"\x1b",
         NamedKey::Space => b" ",
-        NamedKey::ArrowUp => b"\x1b[A",
-        NamedKey::ArrowDown => b"\x1b[B",
-        NamedKey::ArrowRight => b"\x1b[C",
-        NamedKey::ArrowLeft => b"\x1b[D",
-        NamedKey::Home => b"\x1b[H",
-        NamedKey::End => b"\x1b[F",
+        NamedKey::ArrowUp => if app { b"\x1bOA" } else { b"\x1b[A" },
+        NamedKey::ArrowDown => if app { b"\x1bOB" } else { b"\x1b[B" },
+        NamedKey::ArrowRight => if app { b"\x1bOC" } else { b"\x1b[C" },
+        NamedKey::ArrowLeft => if app { b"\x1bOD" } else { b"\x1b[D" },
+        NamedKey::Home => if app { b"\x1bOH" } else { b"\x1b[H" },
+        NamedKey::End => if app { b"\x1bOF" } else { b"\x1b[F" },
         NamedKey::PageUp => b"\x1b[5~",
         NamedKey::PageDown => b"\x1b[6~",
         NamedKey::Insert => b"\x1b[2~",

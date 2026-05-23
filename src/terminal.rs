@@ -145,6 +145,7 @@ pub struct TerminalSession {
     title: String,
     cols: u16,
     lines: u16,
+    exited: bool,
 }
 
 impl TerminalSession {
@@ -193,8 +194,20 @@ impl TerminalSession {
             title: "shell".into(),
             cols,
             lines,
+            exited: false,
         })
     }
+
+    pub fn is_exited(&self) -> bool {
+        self.exited
+    }
+
+    /// Whether the terminal is in DECCKM (application cursor) mode. Used by
+    /// the keyboard mapper to choose between CSI and SS3 arrow sequences.
+    pub fn app_cursor_mode(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::APP_CURSOR)
+    }
+
 
     pub fn title(&self) -> &str {
         &self.title
@@ -285,7 +298,10 @@ impl TerminalSession {
                 TermEvent::Title(t) => self.title = t,
                 TermEvent::ResetTitle => self.title = "shell".into(),
                 TermEvent::Wakeup => wake = true,
-                TermEvent::Exit => wake = true,
+                TermEvent::Exit | TermEvent::ChildExit(_) => {
+                    self.exited = true;
+                    wake = true;
+                }
                 _ => {}
             }
         }

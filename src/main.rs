@@ -162,7 +162,12 @@ impl ApplicationHandler<WakeEvent> for App {
                     return;
                 }
                 let Some(session) = self.tabs.get(self.active_tab) else { return };
-                if let Some(bytes) = input::encode_key(&logical_key, text.as_deref(), self.mods) {
+                let term_mode = input::TermKeyMode {
+                    app_cursor: session.app_cursor_mode(),
+                };
+                if let Some(bytes) =
+                    input::encode_key(&logical_key, text.as_deref(), self.mods, term_mode)
+                {
                     session.send_input(bytes);
                 }
             }
@@ -192,7 +197,7 @@ impl ApplicationHandler<WakeEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: WakeEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: WakeEvent) {
         // The PTY thread woke us; drain its events and ask for a redraw if
         // any tab actually produced new content.
         let mut wake = false;
@@ -201,6 +206,27 @@ impl ApplicationHandler<WakeEvent> for App {
                 wake = true;
             }
         }
+
+        // Reap tabs whose shell has exited. If that empties the tab list,
+        // close the app.
+        let pre_len = self.tabs.len();
+        let active_was_exited = self
+            .tabs
+            .get(self.active_tab)
+            .map(|t| t.is_exited())
+            .unwrap_or(false);
+        self.tabs.retain(|t| !t.is_exited());
+        if self.tabs.len() != pre_len {
+            wake = true;
+        }
+        if self.tabs.is_empty() {
+            event_loop.exit();
+            return;
+        }
+        if active_was_exited || self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        }
+
         if wake {
             if let Some(w) = &self.window {
                 w.request_redraw();
