@@ -5,7 +5,7 @@ use alacritty_terminal::event_loop::{EventLoop as PtyLoop, Msg, Notifier};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::tty::{self, Options as PtyOptions};
+use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use alacritty_terminal::Term;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
@@ -41,7 +41,13 @@ impl TerminalSession {
         };
         let term_size = TermSize::new(cols as usize, lines as usize);
 
-        let pty_options = PtyOptions::default();
+        let mut pty_options = PtyOptions::default();
+        // On macOS, alacritty defaults to `/usr/bin/login`, which the harness
+        // sandbox blocks. Explicitly use $SHELL (with a /bin/zsh fallback) so
+        // we spawn the shell directly without `login`.
+        let shell_path =
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        pty_options.shell = Some(Shell::new(shell_path, Vec::new()));
         // window_id is opaque metadata used by alacritty's PTY layer.
         let pty = tty::new(&pty_options, window_size, 0)?;
 

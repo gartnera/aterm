@@ -36,11 +36,12 @@ impl Gfx {
             })
             .await
             .expect("no adapter");
+        let adapter_limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("alacritty-tabs device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits: adapter_limits,
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -206,6 +207,10 @@ impl Gfx {
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
+                return Ok(());
+            }
+            // Occluded (window hidden) and Timeout aren't errors — skip the frame.
+            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
                 return Ok(());
             }
             other => return Err(format!("surface texture unavailable: {other:?}")),
