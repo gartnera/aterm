@@ -47,26 +47,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alacritty-tabs"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "arboard",
- "bytemuck",
- "crossbeam-channel",
- "dirs",
- "env_logger",
- "glyphon",
- "log",
- "parking_lot",
- "pollster",
- "serde",
- "toml",
- "wgpu",
- "winit",
-]
-
-[[package]]
 name = "alacritty_terminal"
 version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -226,6 +206,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
 dependencies = [
  "libloading",
+]
+
+[[package]]
+name = "aterm"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "arboard",
+ "bytemuck",
+ "crossbeam-channel",
+ "dirs",
+ "env_logger",
+ "glyphon",
+ "log",
+ "parking_lot",
+ "pollster",
+ "serde",
+ "toml",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]

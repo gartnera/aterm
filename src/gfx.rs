@@ -282,7 +282,7 @@ impl Gfx {
         let adapter_limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("alacritty-tabs device"),
+                label: Some("aterm device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: adapter_limits,
                 memory_hints: wgpu::MemoryHints::default(),

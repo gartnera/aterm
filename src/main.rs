@@ -169,7 +169,7 @@ impl ApplicationHandler<WakeEvent> for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("alacritty-tabs")
+            .with_title("aterm")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 600.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let line_height = (self.config.font_size * 1.25).round();
