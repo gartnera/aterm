@@ -31,6 +31,9 @@ pub struct GridSnapshot {
     pub cursor_col: usize,
     pub cursor_visible: bool,
     pub fg: [u8; 3],
+    /// Terminal's default background — cells with this bg are not drawn so
+    /// they fall through to the surface clear color.
+    pub bg: [u8; 3],
 }
 
 enum Role {
@@ -258,6 +261,7 @@ impl TerminalSession {
             cursor_col: cursor_vp.map(|p| p.column.0).unwrap_or(0),
             cursor_visible,
             fg: rgb_to_arr(content.colors[NamedColor::Foreground].unwrap_or(default_fg())),
+            bg: rgb_to_arr(content.colors[NamedColor::Background].unwrap_or(default_bg())),
         }
     }
 

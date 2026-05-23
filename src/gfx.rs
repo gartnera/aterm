@@ -326,6 +326,54 @@ impl Gfx {
         // Grid rows: one Buffer per visible line.
         let top_offset_px = (tab_bar_height + PAD_Y) * scale;
         if let Some(snap) = snapshot.as_ref() {
+            // Cell backgrounds: emit one quad per run of same-bg cells in a
+            // row. Cells matching the terminal's default bg are skipped so
+            // they fall through to the surface clear. The cursor cell is
+            // skipped here because the cursor block covers it.
+            let default_bg = snap.bg;
+            for (row_idx, row) in snap.cells.iter().enumerate() {
+                let y = top_offset_px + row_idx as f32 * cell_h_px;
+                let cursor_col = (snap.cursor_visible && snap.cursor_line == row_idx)
+                    .then_some(snap.cursor_col);
+                let mut run: Option<(usize, [u8; 3])> = None;
+                let flush = |run: Option<(usize, [u8; 3])>, end_col: usize, quads: &mut Vec<Quad>| {
+                    if let Some((start, bg)) = run {
+                        let x = PAD_X * scale + start as f32 * cell_w_px;
+                        let w = (end_col - start) as f32 * cell_w_px;
+                        quads.push(Quad {
+                            rect: [x, y, w, cell_h_px],
+                            color: [
+                                bg[0] as f32 / 255.0,
+                                bg[1] as f32 / 255.0,
+                                bg[2] as f32 / 255.0,
+                                1.0,
+                            ],
+                        });
+                    }
+                };
+                for (col, cell) in row.iter().enumerate() {
+                    let is_cursor = Some(col) == cursor_col;
+                    let bg_opt = if is_cursor || cell.bg == default_bg {
+                        None
+                    } else {
+                        Some(cell.bg)
+                    };
+                    match (run, bg_opt) {
+                        (Some((start, bg)), Some(new_bg)) if bg == new_bg => {
+                            run = Some((start, bg));
+                        }
+                        (Some(_), _) => {
+                            flush(run, col, &mut quads);
+                            run = bg_opt.map(|b| (col, b));
+                        }
+                        (None, Some(b)) => {
+                            run = Some((col, b));
+                        }
+                        (None, None) => {}
+                    }
+                }
+                flush(run, row.len(), &mut quads);
+            }
             if snap.cursor_visible {
                 let x = PAD_X * scale + snap.cursor_col as f32 * cell_w_px;
                 let y = top_offset_px + snap.cursor_line as f32 * cell_h_px;
