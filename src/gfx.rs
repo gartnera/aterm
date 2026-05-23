@@ -387,6 +387,23 @@ impl Gfx {
         (self.cell_width_logical, self.line_height)
     }
 
+    /// Update font size and recompute the logical cell width. The cached
+    /// per-row text buffers are dropped so the next render rebuilds them
+    /// with the new metrics — re-shaping all rows on every zoom keystroke
+    /// is fine because they'd otherwise stay at the old size.
+    pub fn set_font_metrics(&mut self, font_size: f32, line_height: f32) {
+        self.font_size = font_size;
+        self.line_height = line_height;
+        self.cell_width_logical = measure_cell_width(
+            &mut self.font_system,
+            font_size,
+            line_height,
+            &self.font_family,
+        );
+        self.row_buffers.clear();
+        self.tab_buffer = None;
+    }
+
     /// Compute the grid (cols, lines) that fit in the current window below the
     /// tab bar.
     pub fn grid_for_window(&self, tab_bar_height: f32) -> (u16, u16) {

@@ -7,13 +7,19 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::binding::{self, Keybinding};
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub font_family: String,
     pub font_size: f32,
+    /// Original font size as configured by the user. `font_size` is the
+    /// current (possibly zoomed) size; this is what ResetFontSize restores.
+    pub font_size_initial: Option<f32>,
     pub colors: Colors,
     pub padding_x: f32,
     pub padding_y: f32,
+    pub bindings: Vec<Keybinding>,
 }
 
 impl Default for Config {
@@ -21,9 +27,11 @@ impl Default for Config {
         Self {
             font_family: default_font_family().to_string(),
             font_size: 13.0,
+            font_size_initial: None,
             colors: Colors::default(),
             padding_x: 6.0,
             padding_y: 6.0,
+            bindings: binding::defaults(),
         }
     }
 }
@@ -98,6 +106,22 @@ struct RawConfig {
     colors: Option<RawColors>,
     #[serde(default)]
     window: Option<RawWindow>,
+    #[serde(default)]
+    keyboard: Option<RawKeyboard>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawKeyboard {
+    #[serde(default)]
+    bindings: Vec<RawBinding>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawBinding {
+    key: String,
+    #[serde(default)]
+    mods: Option<String>,
+    action: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -267,6 +291,7 @@ fn apply_raw(cfg: &mut Config, raw: RawConfig) {
     if let Some(font) = raw.font {
         if let Some(size) = font.size {
             cfg.font_size = size;
+            cfg.font_size_initial = Some(size);
         }
         if let Some(family) = font.normal.and_then(|n| n.family) {
             cfg.font_family = family;
@@ -298,6 +323,28 @@ fn apply_raw(cfg: &mut Config, raw: RawConfig) {
         }
         apply_ansi(&mut cfg.colors.normal, colors.normal);
         apply_ansi(&mut cfg.colors.bright, colors.bright);
+    }
+    if let Some(kb) = raw.keyboard {
+        let mut user = Vec::with_capacity(kb.bindings.len());
+        for rb in kb.bindings {
+            let Some(key) = binding::parse_key(&rb.key) else {
+                log::warn!("ignoring binding: unknown key {:?}", rb.key);
+                continue;
+            };
+            let Some(action) = binding::parse_action(&rb.action) else {
+                log::warn!("ignoring binding: unknown action {:?}", rb.action);
+                continue;
+            };
+            let mods = rb
+                .mods
+                .as_deref()
+                .map(binding::parse_mods)
+                .unwrap_or_else(winit::keyboard::ModifiersState::empty);
+            user.push(Keybinding { key, mods, action });
+        }
+        if !user.is_empty() {
+            cfg.bindings = binding::merge(user, binding::defaults());
+        }
     }
 }
 

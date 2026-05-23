@@ -5,7 +5,7 @@ use arboard::Clipboard;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 /// Sent by the alacritty PTY thread to wake the winit event loop when the
@@ -15,11 +15,13 @@ pub struct WakeEvent;
 
 mod input;
 
+mod binding;
 mod config;
 mod gfx;
 mod quad;
 mod terminal;
 
+use binding::Action;
 use config::Config;
 use gfx::Gfx;
 use terminal::TerminalSession;
@@ -208,6 +210,7 @@ impl ApplicationHandler<WakeEvent> for App {
                 event:
                     KeyEvent {
                         state: ElementState::Pressed,
+                        physical_key,
                         logical_key,
                         text,
                         repeat: _,
@@ -215,32 +218,15 @@ impl ApplicationHandler<WakeEvent> for App {
                     },
                 ..
             } => {
-                // Cmd-prefixed shortcuts are app-level; consume them here.
-                if self.mods.super_key() {
-                    if self.handle_app_shortcut(&logical_key, event_loop) {
-                        window.request_redraw();
+                // Check app-level keybindings first, against the physical
+                // key, so e.g. Option+1 on macOS triggers SelectTab1
+                // regardless of the layout-derived character (which would be
+                // "¡" on a US layout with Alt held).
+                if let PhysicalKey::Code(code) = physical_key {
+                    if let Some(b) = binding::find(&self.config.bindings, code, self.mods) {
+                        let action = b.action;
+                        self.run_action(action, event_loop);
                         return;
-                    }
-                    return;
-                }
-                // Shift+PageUp / Shift+PageDown scroll the viewport over
-                // scrollback before the keystroke is sent to the PTY.
-                if self.mods.shift_key() {
-                    if let Key::Named(named) = &logical_key {
-                        let scroll = match named {
-                            NamedKey::PageUp => Some(Scroll::PageUp),
-                            NamedKey::PageDown => Some(Scroll::PageDown),
-                            NamedKey::Home => Some(Scroll::Top),
-                            NamedKey::End => Some(Scroll::Bottom),
-                            _ => None,
-                        };
-                        if let Some(s) = scroll {
-                            if let Some(session) = self.tabs.get(self.active_tab) {
-                                session.scroll(s);
-                                window.request_redraw();
-                                return;
-                            }
-                        }
                     }
                 }
                 let Some(session) = self.tabs.get(self.active_tab) else { return };
@@ -379,56 +365,76 @@ fn gfx_ref(opt: &Option<Gfx>) -> &Gfx {
 }
 
 impl App {
-    /// Returns true if the shortcut was handled (caller should swallow it).
-    fn handle_app_shortcut(&mut self, key: &Key, event_loop: &ActiveEventLoop) -> bool {
-        match key {
-            Key::Character(s) => match s.as_str() {
-                "t" | "T" => {
-                    self.spawn_tab();
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                    true
-                }
-                "w" | "W" => {
-                    self.close_active_tab(event_loop);
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                    true
-                }
-                "c" | "C" => {
-                    self.copy_selection();
-                    true
-                }
-                "v" | "V" => {
-                    self.paste();
-                    true
-                }
-                "1" => { self.select_tab(0); true }
-                "2" => { self.select_tab(1); true }
-                "3" => { self.select_tab(2); true }
-                "4" => { self.select_tab(3); true }
-                "5" => { self.select_tab(4); true }
-                "6" => { self.select_tab(5); true }
-                "7" => { self.select_tab(6); true }
-                "8" => { self.select_tab(7); true }
-                "9" => { self.select_tab(8); true }
-                _ => false,
-            },
-            Key::Named(NamedKey::ArrowLeft) => {
+    fn run_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        match action {
+            Action::CreateTab => self.spawn_tab(),
+            Action::CloseTab => self.close_active_tab(event_loop),
+            Action::SelectTab(n) => self.select_tab((n as usize).saturating_sub(1)),
+            Action::PrevTab => {
                 if self.active_tab > 0 {
                     self.active_tab -= 1;
                 }
-                true
             }
-            Key::Named(NamedKey::ArrowRight) => {
+            Action::NextTab => {
                 if self.active_tab + 1 < self.tabs.len() {
                     self.active_tab += 1;
                 }
-                true
             }
-            _ => false,
+            Action::Copy => self.copy_selection(),
+            Action::Paste => self.paste(),
+            Action::ScrollLineUp => self.scroll_active(Scroll::Delta(1)),
+            Action::ScrollLineDown => self.scroll_active(Scroll::Delta(-1)),
+            Action::ScrollPageUp => self.scroll_active(Scroll::PageUp),
+            Action::ScrollPageDown => self.scroll_active(Scroll::PageDown),
+            Action::ScrollToTop => self.scroll_active(Scroll::Top),
+            Action::ScrollToBottom => self.scroll_active(Scroll::Bottom),
+            Action::IncreaseFontSize => self.adjust_font_size(1.0),
+            Action::DecreaseFontSize => self.adjust_font_size(-1.0),
+            Action::ResetFontSize => self.reset_font_size(),
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    fn scroll_active(&self, scroll: Scroll) {
+        if let Some(session) = self.tabs.get(self.active_tab) {
+            session.scroll(scroll);
+        }
+    }
+
+    fn adjust_font_size(&mut self, delta: f32) {
+        let new_size = (self.config.font_size + delta).clamp(6.0, 72.0);
+        self.set_font_size(new_size);
+    }
+
+    fn reset_font_size(&mut self) {
+        let base = config::Config::default().font_size;
+        // Preserve the user-configured size from their alacritty.toml — fall
+        // back to the built-in default only if no file was loaded.
+        let target = self
+            .config
+            .font_size_initial
+            .unwrap_or(base);
+        self.set_font_size(target);
+    }
+
+    fn set_font_size(&mut self, size: f32) {
+        if (self.config.font_size - size).abs() < f32::EPSILON {
+            return;
+        }
+        self.config.font_size = size;
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        let Some(window) = self.window.as_ref() else { return };
+        let line_height = (size * 1.25).round();
+        gfx.set_font_metrics(size, line_height);
+        let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+        let scale = window.scale_factor() as f32;
+        let (cw, ch) = gfx.cell_dims_logical();
+        let cell_w_px = (cw * scale).round().max(1.0) as u16;
+        let cell_h_px = (ch * scale).round().max(1.0) as u16;
+        for tab in &mut self.tabs {
+            tab.resize(cols, lines, cell_w_px, cell_h_px);
         }
     }
 }
