@@ -15,3 +15,19 @@ cargo build --release
 ```
 cargo run --release
 ```
+
+## Install (macOS)
+
+Quick install to `~/.cargo/bin`:
+
+```
+cargo install --path .
+```
+
+Or build a `.app` bundle:
+
+```
+cargo install cargo-bundle
+cargo bundle --release
+cp -r target/release/bundle/osx/aterm.app /Applications/
+```

@@ -3,6 +3,14 @@ name = "aterm"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
+description = "A minimal tabbed terminal built on alacritty_terminal, winit, and wgpu."
+
+[package.metadata.bundle]
+name = "aterm"
+identifier = "com.gartnera.aterm"
+short_description = "Minimal tabbed terminal."
+category = "public.app-category.developer-tools"
+osx_minimum_system_version = "11.0"
 
 [dependencies]
 alacritty_terminal = "0.26"

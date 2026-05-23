@@ -207,6 +207,19 @@ impl TerminalSession {
         let shell_path =
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         pty_options.shell = Some(Shell::new(shell_path, Vec::new()));
+        // Launchd-spawned processes (Finder/Spotlight/.app) inherit an empty
+        // TERM, leaving ncurses programs unable to initialize. Set it here so
+        // the shell works regardless of how aterm itself was launched.
+        pty_options.env.insert("TERM".into(), "xterm-256color".into());
+        pty_options.env.insert("COLORTERM".into(), "truecolor".into());
+        // Launchd starts the .app in `/`. If our cwd looks like a launchd
+        // default, start the shell in $HOME instead. When aterm was launched
+        // from a shell in a real directory, inherit that cwd as usual.
+        if std::env::current_dir().map(|p| p == std::path::Path::new("/")).unwrap_or(false) {
+            if let Some(home) = dirs::home_dir() {
+                pty_options.working_directory = Some(home);
+            }
+        }
         // window_id is opaque metadata used by alacritty's PTY layer.
         let pty = tty::new(&pty_options, window_size, 0)?;
 
