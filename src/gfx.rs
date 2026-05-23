@@ -8,7 +8,7 @@ use winit::window::Window;
 
 use crate::config::Colors as ConfigColors;
 use crate::quad::{Quad, QuadPipeline};
-use crate::terminal::{GridSnapshot, TerminalSession};
+use crate::terminal::{GridSnapshot, TerminalSession, UrlMatch, UrlSpan};
 
 struct TabBarTheme {
     /// Background of the strip behind all tabs (linear-space wgpu color).
@@ -113,6 +113,36 @@ fn push_bg_quad(
             1.0,
         ],
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_underline_quad(
+    quads: &mut Vec<Quad>,
+    scale: f32,
+    cell_w_px: f32,
+    h_px: f32,
+    start_col: usize,
+    end_col: usize,
+    y_px: f32,
+    fg: [u8; 3],
+) {
+    let x = PAD_X * scale + start_col as f32 * cell_w_px;
+    let w = (end_col - start_col) as f32 * cell_w_px;
+    quads.push(Quad {
+        rect: [x, y_px, w, h_px],
+        color: [
+            fg[0] as f32 / 255.0,
+            fg[1] as f32 / 255.0,
+            fg[2] as f32 / 255.0,
+            1.0,
+        ],
+    });
+}
+
+fn hover_url_covers(spans: &[UrlSpan], row: usize, col: usize) -> bool {
+    spans
+        .iter()
+        .any(|s| s.line == row && col >= s.start_col && col <= s.end_col)
 }
 
 fn cell_in_selection(snap: &GridSnapshot, row: usize, col: usize) -> bool {
@@ -255,6 +285,9 @@ pub struct Gfx {
     /// these every frame was the dominant per-frame cost.
     row_buffers: Vec<Buffer>,
     tab_buffer: Option<Buffer>,
+    /// Reusable buffer for the bottom URL preview text. Allocated lazily the
+    /// first time a hover URL is shown.
+    url_bar_buffer: Option<Buffer>,
     /// Reusable quad accumulator so we don't reallocate Vec<Quad> per frame.
     quad_scratch: Vec<Quad>,
 }
@@ -351,6 +384,7 @@ impl Gfx {
             quads,
             row_buffers: Vec::new(),
             tab_buffer: None,
+            url_bar_buffer: None,
             quad_scratch: Vec::new(),
         }
     }
@@ -418,6 +452,7 @@ impl Gfx {
         );
         self.row_buffers.clear();
         self.tab_buffer = None;
+        self.url_bar_buffer = None;
     }
 
     /// Compute the grid (cols, lines) that fit in the current window below the
@@ -450,6 +485,7 @@ impl Gfx {
         tabs: &[TerminalSession],
         active_idx: usize,
         tab_bar_height: f32,
+        hover_url: Option<&UrlMatch>,
     ) -> Result<(), String> {
         let width = self.surface_config.width;
         let height = self.surface_config.height;
@@ -644,6 +680,49 @@ impl Gfx {
                 });
             }
 
+            // Underlines: SGR underline or OSC 8 hyperlink cells are drawn
+            // permanently; hovered plain-text URLs add to the same set. We
+            // collect (line, col_start, col_end_exclusive) ranges and emit
+            // one thin quad per range so wide underlines are still one draw.
+            let hover_spans = hover_url.map(|u| u.spans.as_slice()).unwrap_or(&[]);
+            let underline_h_px = (scale.round()).max(1.0);
+            let underline_y_off = cell_h_px - underline_h_px;
+            for (row_idx, row) in snap.cells.iter().enumerate() {
+                let mut start: Option<usize> = None;
+                for (col, cell) in row.iter().enumerate() {
+                    let on = cell.underline || hover_url_covers(hover_spans, row_idx, col);
+                    match (start, on) {
+                        (None, true) => start = Some(col),
+                        (Some(s), false) => {
+                            push_underline_quad(
+                                quads,
+                                scale,
+                                cell_w_px,
+                                underline_h_px,
+                                s,
+                                col,
+                                top_offset_px + row_idx as f32 * cell_h_px + underline_y_off,
+                                snap.fg,
+                            );
+                            start = None;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(s) = start {
+                    push_underline_quad(
+                        quads,
+                        scale,
+                        cell_w_px,
+                        underline_h_px,
+                        s,
+                        row.len(),
+                        top_offset_px + row_idx as f32 * cell_h_px + underline_y_off,
+                        snap.fg,
+                    );
+                }
+            }
+
             // Grow the row-buffer pool as needed; reuse what we have.
             while self.row_buffers.len() < snap.cells.len() {
                 self.row_buffers
@@ -674,6 +753,57 @@ impl Gfx {
             row_count = snap.cells.len();
         }
 
+        // ===== Bottom URL preview bar. =====
+        // Mirrors alacritty's hint-mode UX: while a URL is hovered we show
+        // the full URI in a strip near the bottom of the window. Insets on
+        // the sides and bottom keep the bar clear of the macOS rounded
+        // window corners and any system shadow on the bottom edge.
+        let mut url_bar_pos: Option<(f32, f32, Color)> = None;
+        if let Some(url) = hover_url {
+            let bar_inset_x = 12.0 * scale;
+            let bar_inset_bottom = 8.0 * scale;
+            let bar_pad_x = 8.0 * scale;
+            let bar_pad_y = 3.0 * scale;
+            let bar_h_px = cell_h_px + 2.0 * bar_pad_y;
+            let bar_w_px = (width as f32 - 2.0 * bar_inset_x).max(0.0);
+            let bar_x = bar_inset_x;
+            let bar_y = (height as f32 - bar_h_px - bar_inset_bottom).max(0.0);
+            let usable_chars = ((bar_w_px - 2.0 * bar_pad_x) / cell_w_px)
+                .floor()
+                .max(1.0) as usize;
+            let display = truncate_with_ellipsis(&url.uri, usable_chars);
+
+            quads.push(Quad {
+                rect: [bar_x, bar_y, bar_w_px, bar_h_px],
+                color: self.tab_theme.bar_bg,
+            });
+
+            if self.url_bar_buffer.is_none() {
+                self.url_bar_buffer =
+                    Some(Buffer::new(&mut self.font_system, metrics));
+            }
+            let buf = self.url_bar_buffer.as_mut().unwrap();
+            buf.set_metrics(&mut self.font_system, metrics);
+            buf.set_size(&mut self.font_system, Some(bar_w_px), Some(bar_h_px));
+            let fg = self.tab_theme.active_fg;
+            let family = family_of(&family_name);
+            buf.set_text(
+                &mut self.font_system,
+                &display,
+                &Attrs::new()
+                    .family(family)
+                    .color(Color::rgb(fg[0], fg[1], fg[2])),
+                Shaping::Advanced,
+                None,
+            );
+            buf.shape_until_scroll(&mut self.font_system, false);
+            url_bar_pos = Some((
+                bar_x + bar_pad_x,
+                bar_y + bar_pad_y,
+                Color::rgb(fg[0], fg[1], fg[2]),
+            ));
+        }
+
         // ===== Build TextAreas borrowing from the cached buffers. =====
         let bounds = TextBounds {
             left: 0,
@@ -702,7 +832,22 @@ impl Gfx {
                 custom_glyphs: &[],
             }
         });
-        let text_areas: Vec<TextArea<'_>> = tab_area.into_iter().chain(row_areas).collect();
+        let url_bar_area = url_bar_pos.and_then(|(x, y, color)| {
+            self.url_bar_buffer.as_ref().map(|buf| TextArea {
+                buffer: buf,
+                left: x,
+                top: y,
+                scale: 1.0,
+                bounds,
+                default_color: color,
+                custom_glyphs: &[],
+            })
+        });
+        let text_areas: Vec<TextArea<'_>> = tab_area
+            .into_iter()
+            .chain(row_areas)
+            .chain(url_bar_area)
+            .collect();
 
         self.text_renderer
             .prepare(
@@ -838,6 +983,22 @@ mod tests {
         assert!(cell_in_selection(&snap, 3, 0));
         assert!(cell_in_selection(&snap, 3, 2));
         assert!(!cell_in_selection(&snap, 3, 3));
+    }
+
+    #[test]
+    fn hover_url_covers_matches_only_inside_spans() {
+        let spans = vec![
+            UrlSpan { line: 1, start_col: 2, end_col: 5 },
+            UrlSpan { line: 3, start_col: 0, end_col: 9 },
+        ];
+        assert!(!hover_url_covers(&spans, 0, 3));
+        assert!(!hover_url_covers(&spans, 1, 1));
+        assert!(hover_url_covers(&spans, 1, 2));
+        assert!(hover_url_covers(&spans, 1, 5));
+        assert!(!hover_url_covers(&spans, 1, 6));
+        assert!(hover_url_covers(&spans, 3, 0));
+        assert!(hover_url_covers(&spans, 3, 9));
+        assert!(!hover_url_covers(&spans, 4, 0));
     }
 
     #[test]

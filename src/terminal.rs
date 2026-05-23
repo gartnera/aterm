@@ -8,11 +8,12 @@ use winit::event_loop::EventLoopProxy;
 use crate::config::Colors as ConfigColors;
 use crate::WakeEvent;
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Config as TermConfig;
+use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{point_to_viewport, viewport_to_point, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
@@ -33,6 +34,10 @@ pub struct SnapCell {
     pub bg: [u8; 3],
     pub bold: bool,
     pub italic: bool,
+    /// True for cells with SGR underline *or* an OSC 8 hyperlink — the latter
+    /// are conventionally rendered underlined so the user can see they're
+    /// clickable without holding a modifier.
+    pub underline: bool,
 }
 
 pub struct GridSnapshot {
@@ -57,6 +62,42 @@ pub struct SelectionView {
     pub end_line: usize,
     pub end_col: usize,
     pub is_block: bool,
+}
+
+/// One inclusive horizontal span of a URL in viewport coordinates. URLs that
+/// wrap across rows produce multiple spans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UrlSpan {
+    pub line: usize,
+    pub start_col: usize,
+    pub end_col: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct UrlMatch {
+    pub uri: String,
+    pub spans: Vec<UrlSpan>,
+}
+
+/// URL regex borrowed from alacritty's hint mode defaults.
+const URL_REGEX_PATTERN: &str =
+    "(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)\
+     [^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{-}\\^⟨⟩`\\\\]+";
+
+/// Bound the regex sweep across linewraps. Without a cap, a URL stretched
+/// across the whole scrollback would force us to scan it all.
+const URL_MAX_SEARCH_LINES: i32 = 100;
+
+/// Compile the URL regex used by `url_at`. Returns `None` only if the
+/// hardcoded pattern fails to build, which is a programmer error.
+pub fn compile_url_regex() -> Option<RegexSearch> {
+    match RegexSearch::new(URL_REGEX_PATTERN) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            log::warn!("failed to compile URL regex: {e}");
+            None
+        }
+    }
 }
 
 enum Role {
@@ -163,6 +204,62 @@ fn resolve_color(
             None => indexed_from_palette(idx, palette),
         },
     }
+}
+
+/// Walk left and right from `point` on the same row, collecting cells that
+/// share the OSC 8 hyperlink id. Returns a single-row span; OSC 8 links that
+/// wrap to a new line aren't extended onto it (rare in practice and not worth
+/// the complexity).
+fn osc8_spans<T>(
+    term: &alacritty_terminal::Term<T>,
+    point: Point,
+    id: &str,
+    vp_line: usize,
+    cols: usize,
+) -> Vec<UrlSpan> {
+    let row = &term.grid()[point.line];
+    let mut start_col = point.column.0;
+    while start_col > 0 {
+        match row[Column(start_col - 1)].hyperlink() {
+            Some(h) if h.id() == id => start_col -= 1,
+            _ => break,
+        }
+    }
+    let mut end_col = point.column.0;
+    while end_col + 1 < cols {
+        match row[Column(end_col + 1)].hyperlink() {
+            Some(h) if h.id() == id => end_col += 1,
+            _ => break,
+        }
+    }
+    vec![UrlSpan { line: vp_line, start_col, end_col }]
+}
+
+/// Convert a regex `Match` (inclusive grid-line range) into per-row viewport
+/// spans, clamped to the visible grid. Returns empty if the entire match is
+/// off-screen.
+fn match_to_spans(
+    start: Point,
+    end: Point,
+    display_offset: usize,
+    vp_lines: usize,
+    vp_cols: usize,
+) -> Vec<UrlSpan> {
+    let start_line = start.line.0 + display_offset as i32;
+    let end_line = end.line.0 + display_offset as i32;
+    if end_line < 0 || start_line >= vp_lines as i32 || vp_cols == 0 {
+        return Vec::new();
+    }
+    let max_col = vp_cols - 1;
+    let lo = start_line.max(0);
+    let hi = end_line.min(vp_lines as i32 - 1);
+    let mut spans = Vec::with_capacity((hi - lo + 1) as usize);
+    for line in lo..=hi {
+        let s = if line == start_line { start.column.0.min(max_col) } else { 0 };
+        let e = if line == end_line { end.column.0.min(max_col) } else { max_col };
+        spans.push(UrlSpan { line: line as usize, start_col: s, end_col: e });
+    }
+    spans
 }
 
 impl EventListener for ChannelListener {
@@ -313,6 +410,66 @@ impl TerminalSession {
         self.term.lock().selection = None;
     }
 
+    /// Resolve an OSC 8 hyperlink at the given viewport cell, if any. Pure
+    /// cell-attribute lookup — does not run the URL regex. Used for hover
+    /// preview without a modifier, since OSC 8 link text hides its URI.
+    pub fn osc8_at(&self, vp_line: usize, vp_col: usize) -> Option<UrlMatch> {
+        let term = self.term.lock();
+        let lines = term.screen_lines();
+        let cols = term.columns();
+        if cols == 0 || lines == 0 || vp_line >= lines || vp_col >= cols {
+            return None;
+        }
+        let display_offset = term.grid().display_offset();
+        let point = viewport_to_point(display_offset, Point::new(vp_line, Column(vp_col)));
+        let link = term.grid()[point].hyperlink()?;
+        let uri = link.uri().to_string();
+        let id = link.id().to_string();
+        let spans = osc8_spans(&term, point, &id, vp_line, cols);
+        Some(UrlMatch { uri, spans })
+    }
+
+    /// Resolve the URL (if any) at the given viewport cell. Tries OSC 8
+    /// first; falls back to running the URL regex across the visible
+    /// viewport (plus a bounded gutter for wrapped long URLs) and returns
+    /// the match containing the point.
+    pub fn url_at(
+        &self,
+        regex: &mut RegexSearch,
+        vp_line: usize,
+        vp_col: usize,
+    ) -> Option<UrlMatch> {
+        if let Some(m) = self.osc8_at(vp_line, vp_col) {
+            return Some(m);
+        }
+
+        let term = self.term.lock();
+        let lines = term.screen_lines();
+        let cols = term.columns();
+        if cols == 0 || lines == 0 || vp_line >= lines || vp_col >= cols {
+            return None;
+        }
+        let display_offset = term.grid().display_offset();
+        let point = viewport_to_point(display_offset, Point::new(vp_line, Column(vp_col)));
+
+        let viewport_start = Line(-(display_offset as i32));
+        let viewport_end = viewport_start + (lines as i32 - 1);
+        let mut start = term.line_search_left(Point::new(viewport_start, Column(0)));
+        let mut end = term
+            .line_search_right(Point::new(viewport_end, Column(cols.saturating_sub(1))));
+        start.line = start.line.max(viewport_start - URL_MAX_SEARCH_LINES);
+        end.line = end.line.min(viewport_end + URL_MAX_SEARCH_LINES);
+
+        let mat = RegexIter::new(start, end, Direction::Right, &term, regex)
+            .skip_while(|rm| rm.end().line < viewport_start)
+            .take_while(|rm| rm.start().line <= viewport_end)
+            .find(|rm| rm.contains(&point))?;
+
+        let uri = term.bounds_to_string(*mat.start(), *mat.end());
+        let spans = match_to_spans(*mat.start(), *mat.end(), display_offset, lines, cols);
+        Some(UrlMatch { uri, spans })
+    }
+
     pub fn selection_text(&self) -> Option<String> {
         self.term.lock().selection_to_string().filter(|s| !s.is_empty())
     }
@@ -387,12 +544,15 @@ impl TerminalSession {
             } else {
                 cell.c
             };
+            let underline = cell.hyperlink().is_some()
+                || cell.flags.intersects(Flags::ALL_UNDERLINES);
             cells[vp.line][vp.column.0] = SnapCell {
                 ch,
                 fg,
                 bg,
                 bold: cell.flags.contains(Flags::BOLD),
                 italic: cell.flags.contains(Flags::ITALIC),
+                underline,
             };
         }
         let cursor_vp = point_to_viewport(display_offset, cursor_point);
@@ -471,6 +631,63 @@ mod tests {
     fn dim_reduces_intensity() {
         assert_eq!(dim([100, 200, 0]), [66, 132, 0]);
         assert_eq!(dim([0, 0, 0]), [0, 0, 0]);
+    }
+
+    #[test]
+    fn url_regex_compiles() {
+        // The pattern is hardcoded; a compile failure would silently disable
+        // URL detection, so guard it with a build-time-ish check.
+        assert!(compile_url_regex().is_some());
+    }
+
+    fn pt(line: i32, col: usize) -> Point {
+        Point::new(Line(line), Column(col))
+    }
+
+    #[test]
+    fn match_to_spans_single_line_in_viewport() {
+        // Match on viewport row 2 (grid line -3 with display_offset 5),
+        // columns 4..=10. Spans should be a single inclusive range.
+        let spans = match_to_spans(pt(-3, 4), pt(-3, 10), 5, 10, 80);
+        assert_eq!(
+            spans,
+            vec![UrlSpan { line: 2, start_col: 4, end_col: 10 }]
+        );
+    }
+
+    #[test]
+    fn match_to_spans_multi_line_fills_middle_rows() {
+        // Match from row 1 col 70 to row 3 col 5; middle row should span the
+        // full width.
+        let spans = match_to_spans(pt(-4, 70), pt(-2, 5), 5, 10, 80);
+        assert_eq!(
+            spans,
+            vec![
+                UrlSpan { line: 1, start_col: 70, end_col: 79 },
+                UrlSpan { line: 2, start_col: 0, end_col: 79 },
+                UrlSpan { line: 3, start_col: 0, end_col: 5 },
+            ]
+        );
+    }
+
+    #[test]
+    fn match_to_spans_clips_off_screen_top_and_bottom() {
+        // Match starts above the viewport (grid line -10, display_offset 5
+        // → vp line -5) and ends inside it on row 1. Spans should start at
+        // row 0.
+        let spans = match_to_spans(pt(-10, 0), pt(-4, 3), 5, 10, 80);
+        assert_eq!(spans.first().map(|s| s.line), Some(0));
+        assert_eq!(spans.last().map(|s| (s.line, s.end_col)), Some((1, 3)));
+
+        // Entirely below the viewport: no spans.
+        let spans = match_to_spans(pt(20, 0), pt(20, 5), 5, 10, 80);
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn match_to_spans_handles_zero_width_grid() {
+        let spans = match_to_spans(pt(0, 0), pt(0, 0), 0, 5, 0);
+        assert!(spans.is_empty());
     }
 }
 

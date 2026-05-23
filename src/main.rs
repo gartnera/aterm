@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::term::search::RegexSearch;
 use arboard::Clipboard;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{ModifiersState, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 /// Sent by the alacritty PTY thread to wake the winit event loop when the
 /// terminal has produced new content.
@@ -24,7 +25,7 @@ mod terminal;
 use binding::Action;
 use config::Config;
 use gfx::Gfx;
-use terminal::TerminalSession;
+use terminal::{TerminalSession, UrlMatch};
 
 const TAB_BAR_HEIGHT: f32 = 28.0;
 
@@ -43,6 +44,14 @@ struct App {
     /// pixel-delta events get converted using the cell height).
     scroll_accum: f32,
     clipboard: Option<Clipboard>,
+    /// Compiled URL regex shared by all sessions. `None` if the hardcoded
+    /// pattern failed to compile (treated as no auto-URL support).
+    url_regex: Option<RegexSearch>,
+    /// URL currently under the cursor with the open-url modifier held. Cleared
+    /// whenever the modifier is released or the cursor moves off the URL.
+    hover_url: Option<UrlMatch>,
+    /// Last cursor icon we set on the window, so we don't ask winit to repeat.
+    cursor_icon: CursorIcon,
 }
 
 impl App {
@@ -61,6 +70,9 @@ impl App {
             clipboard: Clipboard::new()
                 .map_err(|e| log::warn!("clipboard unavailable: {e}"))
                 .ok(),
+            url_regex: terminal::compile_url_regex(),
+            hover_url: None,
+            cursor_icon: CursorIcon::Default,
         }
     }
 
@@ -124,6 +136,69 @@ impl App {
         let Some(cb) = self.clipboard.as_mut() else { return };
         if let Err(e) = cb.set_text(text) {
             log::warn!("clipboard set_text: {e}");
+        }
+    }
+
+    /// Recompute the URL under the cursor and update the cursor icon. Called
+    /// on every cursor move and on modifier changes. OSC 8 hyperlinks always
+    /// surface their URI on hover (the visible text masks the URL); plain
+    /// URLs only surface under the open-url modifier. The pointer-cursor
+    /// and click-to-open are still modifier-gated.
+    fn refresh_hover_url(&mut self, window: &Window) {
+        let prev_uri = self.hover_url.as_ref().map(|u| u.uri.clone());
+        let prev_spans = self.hover_url.as_ref().map(|u| u.spans.clone());
+
+        let new_url = self.compute_hover_url();
+
+        let icon = if new_url.is_some() && url_modifier_held(self.mods) {
+            CursorIcon::Pointer
+        } else {
+            CursorIcon::Default
+        };
+        if icon != self.cursor_icon {
+            window.set_cursor(icon);
+            self.cursor_icon = icon;
+        }
+
+        let new_uri = new_url.as_ref().map(|u| u.uri.clone());
+        let new_spans = new_url.as_ref().map(|u| u.spans.clone());
+        self.hover_url = new_url;
+        if prev_uri != new_uri || prev_spans != new_spans {
+            window.request_redraw();
+        }
+    }
+
+    /// Drop the hovered-URL state and reset the cursor icon. Used when focus
+    /// or the pointer leaves the window so the open-url cursor doesn't get
+    /// stranded across click-to-open.
+    fn clear_hover_url(&mut self, window: &Window) {
+        let had_url = self.hover_url.is_some();
+        self.hover_url = None;
+        if self.cursor_icon != CursorIcon::Default {
+            window.set_cursor(CursorIcon::Default);
+            self.cursor_icon = CursorIcon::Default;
+        }
+        if had_url {
+            window.request_redraw();
+        }
+    }
+
+    fn compute_hover_url(&mut self) -> Option<UrlMatch> {
+        let gfx = self.gfx.as_ref()?;
+        let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+        let (line, col, _) = gfx.cell_at(
+            self.cursor_pos.0 as f32,
+            self.cursor_pos.1 as f32,
+            TAB_BAR_HEIGHT,
+            cols,
+            lines,
+        )?;
+        let session = self.tabs.get(self.active_tab)?;
+        if url_modifier_held(self.mods) {
+            let regex = self.url_regex.as_mut()?;
+            session.url_at(regex, line, col)
+        } else {
+            session.osc8_at(line, col)
         }
     }
 
@@ -207,10 +282,13 @@ impl ApplicationHandler<WakeEvent> for App {
         event: WindowEvent,
     ) {
         let Some(window) = self.window.clone() else { return };
-        let Some(gfx) = self.gfx.as_mut() else { return };
+        if self.gfx.is_none() {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
+                let gfx = self.gfx.as_mut().unwrap();
                 gfx.resize(size);
                 let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
                 let (cell_w_px, cell_h_px) = cell_dims_px(gfx, &window);
@@ -222,12 +300,25 @@ impl ApplicationHandler<WakeEvent> for App {
             WindowEvent::RedrawRequested => {
                 let active_tab = self.active_tab;
                 let term = self.tabs.get(active_tab);
-                if let Err(e) = gfx.render(term, &self.tabs, active_tab, TAB_BAR_HEIGHT) {
+                let hover_url = self.hover_url.as_ref();
+                let gfx = self.gfx.as_mut().unwrap();
+                if let Err(e) =
+                    gfx.render(term, &self.tabs, active_tab, TAB_BAR_HEIGHT, hover_url)
+                {
                     log::error!("render error: {e}");
                 }
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.mods = mods.state();
+                self.refresh_hover_url(&window);
+            }
+            // Focus loss / cursor leaving the window strands the modifier
+            // state — we won't see the key release that happens in another
+            // app's context. Reset so the pointer-cursor and underline don't
+            // stay stuck across the click-to-open round trip.
+            WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. } => {
+                self.mods = ModifiersState::empty();
+                self.clear_hover_url(&window);
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -285,6 +376,7 @@ impl ApplicationHandler<WakeEvent> for App {
                 self.cursor_pos = (position.x, position.y);
                 if self.selecting {
                     if let Some(session) = self.tabs.get(self.active_tab) {
+                        let gfx = self.gfx.as_ref().unwrap();
                         let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
                         if let Some((line, col, right)) = gfx.cell_at(
                             position.x as f32,
@@ -297,6 +389,8 @@ impl ApplicationHandler<WakeEvent> for App {
                             window.request_redraw();
                         }
                     }
+                } else {
+                    self.refresh_hover_url(&window);
                 }
             }
             WindowEvent::MouseInput {
@@ -308,12 +402,22 @@ impl ApplicationHandler<WakeEvent> for App {
                 let y_px = self.cursor_pos.1;
                 let tab_bar_h_px = TAB_BAR_HEIGHT as f64 * scale;
                 let x_px = self.cursor_pos.0;
+                let gfx = self.gfx.as_ref().unwrap();
                 if y_px <= tab_bar_h_px {
                     if let Some(idx) = gfx.tab_at_x(x_px as f32) {
                         self.select_tab(idx);
                         window.request_redraw();
                     }
                     return;
+                }
+                // Modifier+click on a URL opens it instead of starting a
+                // selection. Hover state is the source of truth — if we
+                // underlined it, we'll open the same URL.
+                if url_modifier_held(self.mods) {
+                    if let Some(url) = self.hover_url.as_ref() {
+                        open_url(&url.uri);
+                        return;
+                    }
                 }
                 // Click inside the grid begins (or replaces) a selection.
                 if let Some(session) = self.tabs.get(self.active_tab) {
@@ -341,6 +445,7 @@ impl ApplicationHandler<WakeEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 let Some(session) = self.tabs.get(self.active_tab) else { return };
                 let scale = window.scale_factor() as f32;
+                let gfx = self.gfx.as_ref().unwrap();
                 let (_, cell_h) = gfx.cell_dims_logical();
                 let cell_h_px = (cell_h * scale).max(1.0);
                 let lines_delta = match delta {
@@ -399,6 +504,61 @@ impl ApplicationHandler<WakeEvent> for App {
 
 fn gfx_ref(opt: &Option<Gfx>) -> &Gfx {
     opt.as_ref().expect("gfx initialized")
+}
+
+/// Modifier that turns the cursor into a link-opener. Cmd on macOS, Ctrl
+/// elsewhere — matches the convention in iTerm2 and alacritty's hint mode.
+fn url_modifier_held(mods: ModifiersState) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mods.super_key()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        mods.control_key()
+    }
+}
+
+/// Hand the URL off to the OS opener. We deliberately don't go through a
+/// shell — `Command::arg` passes the URI as a single argv slot, so URLs
+/// containing shell metacharacters can't escape the opener invocation.
+fn open_url(uri: &str) {
+    // Reject control characters defensively; the OS opener should reject
+    // them too, but skipping the spawn avoids surprising error noise.
+    if uri.chars().any(|c| c.is_control()) {
+        log::warn!("refusing to open URL with control characters");
+        return;
+    }
+    let result = spawn_url_opener(uri);
+    if let Err(e) = result {
+        log::warn!("failed to launch URL opener: {e}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_url_opener(uri: &str) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("open").arg(uri).spawn()
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_url_opener(uri: &str) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("xdg-open").arg(uri).spawn()
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_url_opener(uri: &str) -> std::io::Result<std::process::Child> {
+    // `start` takes a window-title argument before the URL.
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", uri])
+        .spawn()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn spawn_url_opener(_uri: &str) -> std::io::Result<std::process::Child> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no URL opener configured for this platform",
+    ))
 }
 
 fn cell_dims_px(gfx: &Gfx, window: &Window) -> (u16, u16) {
