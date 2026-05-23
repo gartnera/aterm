@@ -103,7 +103,7 @@ impl ApplicationHandler<WakeEvent> for App {
             self.config.font_size,
             line_height,
             self.config.font_family.clone(),
-            self.config.colors.background,
+            self.config.colors.clone(),
         ));
         self.window = Some(window.clone());
         self.gfx = Some(gfx);

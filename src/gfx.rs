@@ -6,8 +6,50 @@ use glyphon::{
 };
 use winit::window::Window;
 
+use crate::config::Colors as ConfigColors;
 use crate::quad::{Quad, QuadPipeline};
 use crate::terminal::{GridSnapshot, TerminalSession};
+
+struct TabBarTheme {
+    /// Background of the strip behind all tabs (linear-space wgpu color).
+    bar_bg: [f32; 4],
+    /// Background of the active tab — matches the terminal content bg so the
+    /// active tab visually merges into the page.
+    active_bg: [f32; 4],
+    /// Text color for the active tab (sRGB; glyphon uses sRGB).
+    active_fg: [u8; 3],
+    /// Text color for inactive tabs and separators.
+    inactive_fg: [u8; 3],
+}
+
+impl TabBarTheme {
+    fn derive(colors: &ConfigColors) -> Self {
+        Self {
+            bar_bg: linear_rgba(darken(colors.background, 0.7)),
+            active_bg: linear_rgba(colors.background),
+            active_fg: colors.foreground,
+            inactive_fg: colors.bright.black,
+        }
+    }
+}
+
+fn darken([r, g, b]: [u8; 3], factor: f32) -> [u8; 3] {
+    let f = factor.clamp(0.0, 1.0);
+    [
+        (r as f32 * f).round() as u8,
+        (g as f32 * f).round() as u8,
+        (b as f32 * f).round() as u8,
+    ]
+}
+
+fn linear_rgba(c: [u8; 3]) -> [f32; 4] {
+    [
+        srgb_to_linear(c[0]) as f32,
+        srgb_to_linear(c[1]) as f32,
+        srgb_to_linear(c[2]) as f32,
+        1.0,
+    ]
+}
 
 const PAD_X: f32 = 6.0;
 const PAD_Y: f32 = 4.0;
@@ -159,6 +201,7 @@ pub struct Gfx {
     cell_width_logical: f32,
     font_family: String,
     clear_color: wgpu::Color,
+    tab_theme: TabBarTheme,
     /// Physical-pixel x-ranges for each rendered tab, refreshed every frame.
     tab_hit_regions: Vec<(usize, f32, f32)>,
     quads: QuadPipeline,
@@ -176,8 +219,9 @@ impl Gfx {
         font_size: f32,
         line_height: f32,
         font_family: String,
-        bg: [u8; 3],
+        colors: ConfigColors,
     ) -> Self {
+        let bg = colors.background;
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window.clone()).expect("create surface");
@@ -256,6 +300,7 @@ impl Gfx {
                 b: srgb_to_linear(bg[2]),
                 a: 1.0,
             },
+            tab_theme: TabBarTheme::derive(&colors),
             tab_hit_regions: Vec::new(),
             quads,
             row_buffers: Vec::new(),
@@ -329,7 +374,7 @@ impl Gfx {
         quads.clear();
         quads.push(Quad {
             rect: [0.0, 0.0, width as f32, tab_bar_height * scale],
-            color: [0.16, 0.16, 0.20, 1.0],
+            color: self.tab_theme.bar_bg,
         });
 
         let family_name = self.font_family.clone();
@@ -355,17 +400,21 @@ impl Gfx {
         };
 
         self.tab_hit_regions.clear();
+        // Build the tab strip as (text segment, is_active) pairs so we can
+        // emit each with the correct fg color via set_rich_text.
+        let mut segments: Vec<(String, bool)> = Vec::new();
         let mut tab_text = String::new();
         for (i, t) in tabs.iter().enumerate() {
             if i > 0 {
+                segments.push((SEP.into(), false));
                 tab_text.push_str(SEP);
             }
             let chars_before = tab_text.chars().count();
             let marker = if i == active_idx { "● " } else { "○ " };
             let max_title_chars = per_tab_budget.saturating_sub(MARKER_CHARS);
             let title = truncate_with_ellipsis(t.title(), max_title_chars);
-            tab_text.push_str(marker);
-            tab_text.push_str(&title);
+            let seg = format!("{marker}{title}");
+            tab_text.push_str(&seg);
             let chars_after = tab_text.chars().count();
             let x0 = PAD_X * scale + chars_before as f32 * cell_w_px;
             let x1 = PAD_X * scale + chars_after as f32 * cell_w_px;
@@ -373,18 +422,21 @@ impl Gfx {
             if i == active_idx {
                 quads.push(Quad {
                     rect: [x0 - 4.0, 0.0, (x1 - x0) + 8.0, tab_bar_height * scale],
-                    color: [0.24, 0.24, 0.30, 1.0],
+                    color: self.tab_theme.active_bg,
                 });
             }
+            segments.push((seg, i == active_idx));
         }
-        if tab_text.is_empty() {
-            tab_text.push_str("(no tabs)");
+        if segments.is_empty() {
+            segments.push(("(no tabs)".into(), false));
         }
 
         // Reuse the cached tab buffer.
         if self.tab_buffer.is_none() {
             self.tab_buffer = Some(Buffer::new(&mut self.font_system, metrics));
         }
+        let active_fg = self.tab_theme.active_fg;
+        let inactive_fg = self.tab_theme.inactive_fg;
         {
             let buf = self.tab_buffer.as_mut().unwrap();
             buf.set_metrics(&mut self.font_system, metrics);
@@ -393,10 +445,20 @@ impl Gfx {
                 Some(width as f32),
                 Some(tab_bar_height * scale),
             );
-            buf.set_text(
+            let family = family_of(&family_name);
+            let spans = segments.iter().map(|(text, active)| {
+                let fg = if *active { active_fg } else { inactive_fg };
+                (
+                    text.as_str(),
+                    Attrs::new()
+                        .family(family)
+                        .color(Color::rgb(fg[0], fg[1], fg[2])),
+                )
+            });
+            buf.set_rich_text(
                 &mut self.font_system,
-                &tab_text,
-                &Attrs::new().family(family_of(&family_name)),
+                spans,
+                &Attrs::new().family(family),
                 Shaping::Advanced,
                 None,
             );
@@ -405,7 +467,7 @@ impl Gfx {
         let tab_pos = (
             PAD_X * scale,
             (tab_bar_height - self.line_height) * 0.5 * scale,
-            Color::rgb(0xc8, 0xc8, 0xd0),
+            Color::rgb(inactive_fg[0], inactive_fg[1], inactive_fg[2]),
         );
 
         // ===== Grid: background quads, cursor quad, row text buffers. =====
