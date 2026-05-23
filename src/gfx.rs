@@ -25,6 +25,21 @@ fn family_of(name: &str) -> Family<'_> {
     }
 }
 
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if max_chars == 0 {
+        return String::new();
+    }
+    if count <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 1 {
+        return "…".into();
+    }
+    let head: String = s.chars().take(max_chars - 1).collect();
+    format!("{head}…")
+}
+
 fn push_bg_quad(
     quads: &mut Vec<Quad>,
     scale: f32,
@@ -303,15 +318,37 @@ impl Gfx {
         let family_name = self.font_family.clone();
 
         // ===== Tab bar text + hit regions + active-tab quad. =====
+        // Distribute available width across tabs and truncate titles that
+        // exceed their share. Each tab uses 2 chars for the marker plus the
+        // title, separated by 3 spaces between tabs.
+        const SEP: &str = "   ";
+        const MARKER_CHARS: usize = 2;
+        let usable_chars = ((width as f32 - 2.0 * PAD_X * scale) / cell_w_px)
+            .floor()
+            .max(0.0) as usize;
+        let per_tab_budget = if tabs.is_empty() {
+            0
+        } else {
+            let total_seps = tabs.len().saturating_sub(1) * SEP.chars().count();
+            usable_chars
+                .saturating_sub(total_seps)
+                .checked_div(tabs.len())
+                .unwrap_or(0)
+                .max(MARKER_CHARS + 1)
+        };
+
         self.tab_hit_regions.clear();
         let mut tab_text = String::new();
         for (i, t) in tabs.iter().enumerate() {
             if i > 0 {
-                tab_text.push_str("   ");
+                tab_text.push_str(SEP);
             }
             let chars_before = tab_text.chars().count();
             let marker = if i == active_idx { "● " } else { "○ " };
-            tab_text.push_str(&format!("{marker}{}", t.title()));
+            let max_title_chars = per_tab_budget.saturating_sub(MARKER_CHARS);
+            let title = truncate_with_ellipsis(t.title(), max_title_chars);
+            tab_text.push_str(marker);
+            tab_text.push_str(&title);
             let chars_after = tab_text.chars().count();
             let x0 = PAD_X * scale + chars_before as f32 * cell_w_px;
             let x1 = PAD_X * scale + chars_after as f32 * cell_w_px;
