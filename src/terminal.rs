@@ -159,10 +159,6 @@ impl TerminalSession {
         &self.title
     }
 
-    pub fn term(&self) -> &Arc<FairMutex<Term<ChannelListener>>> {
-        &self.term
-    }
-
     pub fn send_input<B: Into<std::borrow::Cow<'static, [u8]>>>(&self, bytes: B) {
         self.notifier.notify(bytes);
     }

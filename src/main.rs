@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
+
+mod input;
 
 mod config;
 mod gfx;
@@ -21,6 +24,7 @@ struct App {
     gfx: Option<Gfx>,
     tabs: Vec<TerminalSession>,
     active_tab: usize,
+    mods: ModifiersState,
 }
 
 impl App {
@@ -31,6 +35,7 @@ impl App {
             gfx: None,
             tabs: Vec::new(),
             active_tab: 0,
+            mods: ModifiersState::empty(),
         }
     }
 }
@@ -89,6 +94,30 @@ impl ApplicationHandler for App {
                 let term = self.tabs.get(active_tab);
                 if let Err(e) = gfx.render(term, &self.tabs, active_tab, TAB_BAR_HEIGHT) {
                     log::error!("render error: {e}");
+                }
+            }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.mods = mods.state();
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        logical_key,
+                        text,
+                        repeat: _,
+                        ..
+                    },
+                ..
+            } => {
+                // Cmd-prefixed shortcuts are app-level (tabs, copy, paste);
+                // let those fall through without reaching the PTY.
+                if self.mods.super_key() {
+                    return;
+                }
+                let Some(session) = self.tabs.get(self.active_tab) else { return };
+                if let Some(bytes) = input::encode_key(&logical_key, text.as_deref(), self.mods) {
+                    session.send_input(bytes);
                 }
             }
             _ => {}
