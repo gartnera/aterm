@@ -10,6 +10,7 @@ mod input;
 
 mod config;
 mod gfx;
+mod quad;
 mod terminal;
 
 use config::Config;

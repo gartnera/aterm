@@ -6,6 +6,7 @@ use glyphon::{
 };
 use winit::window::Window;
 
+use crate::quad::{Quad, QuadPipeline};
 use crate::terminal::{GridSnapshot, TerminalSession};
 
 const PAD_X: f32 = 6.0;
@@ -30,8 +31,10 @@ fn build_row_text<'a>(
         // Skip wide-char-spacer slots; the wide glyph in the previous column
         // already advances two columns visually.
         let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
-        let invert = cursor_here && col == snap.cursor_col;
-        let fg = if invert { cell.bg } else { cell.fg };
+        // At the cursor cell we want the glyph to read against the cursor
+        // block, so invert fg to the cell's bg (typically the terminal bg).
+        let on_cursor = cursor_here && col == snap.cursor_col;
+        let fg = if on_cursor { cell.bg } else { cell.fg };
         let start = text.len();
         // Push the actual char; pad with a NBSP if the cell is empty (cosmic-text
         // collapses runs of spaces in some shaping paths, which can drift the
@@ -102,6 +105,7 @@ pub struct Gfx {
     font_family: String,
     /// Physical-pixel x-ranges for each rendered tab, refreshed every frame.
     tab_hit_regions: Vec<(usize, f32, f32)>,
+    quads: QuadPipeline,
 }
 
 impl Gfx {
@@ -157,6 +161,7 @@ impl Gfx {
         let swash_cache = SwashCache::new();
         let cell_width_logical =
             measure_cell_width(&mut font_system, font_size, line_height, &font_family);
+        let quads = QuadPipeline::new(&device, format);
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
         let mut text_atlas = TextAtlas::new(&device, &queue, &cache, format);
@@ -183,6 +188,7 @@ impl Gfx {
             cell_width_logical,
             font_family,
             tab_hit_regions: Vec::new(),
+            quads,
         }
     }
 
@@ -247,6 +253,13 @@ impl Gfx {
             .map(|s| Color::rgb(s.fg[0], s.fg[1], s.fg[2]))
             .unwrap_or_else(|| Color::rgb(0xd0, 0xd0, 0xd0));
 
+        let mut quads: Vec<Quad> = Vec::new();
+        // Tab bar background strip.
+        quads.push(Quad {
+            rect: [0.0, 0.0, width as f32, tab_bar_height * scale],
+            color: [0.16, 0.16, 0.20, 1.0],
+        });
+
         // Collect (Buffer, x_px, y_px, default_color) entries; build them first
         // so all borrows of font_system are released before we hand the Vec to
         // glyphon's prepare() (which also borrows font_system mutably).
@@ -279,6 +292,12 @@ impl Gfx {
             let x0 = PAD_X * scale + chars_before as f32 * cell_w_px;
             let x1 = PAD_X * scale + chars_after as f32 * cell_w_px;
             self.tab_hit_regions.push((i, x0, x1));
+            if i == active_idx {
+                quads.push(Quad {
+                    rect: [x0 - 4.0, 0.0, (x1 - x0) + 8.0, tab_bar_height * scale],
+                    color: [0.24, 0.24, 0.30, 1.0],
+                });
+            }
         }
         if tab_text.is_empty() {
             tab_text.push_str("(no tabs)");
@@ -305,8 +324,22 @@ impl Gfx {
         ));
 
         // Grid rows: one Buffer per visible line.
+        let top_offset_px = (tab_bar_height + PAD_Y) * scale;
         if let Some(snap) = snapshot.as_ref() {
-            let top_offset_px = (tab_bar_height + PAD_Y) * scale;
+            if snap.cursor_visible {
+                let x = PAD_X * scale + snap.cursor_col as f32 * cell_w_px;
+                let y = top_offset_px + snap.cursor_line as f32 * cell_h_px;
+                let fg = snap.fg;
+                quads.push(Quad {
+                    rect: [x, y, cell_w_px, cell_h_px],
+                    color: [
+                        fg[0] as f32 / 255.0,
+                        fg[1] as f32 / 255.0,
+                        fg[2] as f32 / 255.0,
+                        1.0,
+                    ],
+                });
+            }
             for (row_idx, row) in snap.cells.iter().enumerate() {
                 let mut buf = Buffer::new(&mut self.font_system, metrics);
                 buf.set_size(
@@ -360,6 +393,8 @@ impl Gfx {
             )
             .expect("prepare text");
 
+        self.quads.upload(&self.device, &self.queue, width, height, &quads);
+
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -401,6 +436,7 @@ impl Gfx {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            self.quads.render(&mut pass);
             self.text_renderer
                 .render(&self.text_atlas, &self.viewport, &mut pass)
                 .expect("render text");

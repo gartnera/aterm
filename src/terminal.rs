@@ -23,7 +23,6 @@ pub struct SnapCell {
     pub bg: [u8; 3],
     pub bold: bool,
     pub italic: bool,
-    pub wide: bool,
 }
 
 pub struct GridSnapshot {
@@ -52,13 +51,15 @@ fn default_bg() -> Rgb {
 }
 
 fn xterm_256(idx: u8) -> Rgb {
-    // 0..16: alacritty's palette will already cover these; we only get here
-    // as a fallback.
+    // Standard xterm palette. Used both for direct Indexed lookups and as a
+    // fallback for Named colors when the Term hasn't been told a palette
+    // (which is the normal case — alacritty's `Term::colors` is all-None
+    // until the application sets it via OSC sequences or we seed it).
     static BASIC: [(u8, u8, u8); 16] = [
-        (0, 0, 0), (170, 0, 0), (0, 170, 0), (170, 85, 0),
-        (0, 0, 170), (170, 0, 170), (0, 170, 170), (170, 170, 170),
-        (85, 85, 85), (255, 85, 85), (85, 255, 85), (255, 255, 85),
-        (85, 85, 255), (255, 85, 255), (85, 255, 255), (255, 255, 255),
+        (0x00, 0x00, 0x00), (0xcd, 0x31, 0x31), (0x0d, 0xbc, 0x79), (0xe5, 0xe5, 0x10),
+        (0x24, 0x72, 0xc8), (0xbc, 0x3f, 0xbc), (0x11, 0xa8, 0xcd), (0xe5, 0xe5, 0xe5),
+        (0x66, 0x66, 0x66), (0xf1, 0x4c, 0x4c), (0x23, 0xd1, 0x8b), (0xf5, 0xf5, 0x43),
+        (0x3b, 0x8e, 0xea), (0xd6, 0x70, 0xd6), (0x29, 0xb8, 0xdb), (0xe5, 0xe5, 0xe5),
     ];
     if idx < 16 {
         let (r, g, b) = BASIC[idx as usize];
@@ -76,15 +77,43 @@ fn xterm_256(idx: u8) -> Rgb {
     Rgb { r: gray, g: gray, b: gray }
 }
 
+fn named_to_basic_idx(name: NamedColor) -> Option<u8> {
+    Some(match name {
+        NamedColor::Black => 0,
+        NamedColor::Red => 1,
+        NamedColor::Green => 2,
+        NamedColor::Yellow => 3,
+        NamedColor::Blue => 4,
+        NamedColor::Magenta => 5,
+        NamedColor::Cyan => 6,
+        NamedColor::White => 7,
+        NamedColor::BrightBlack => 8,
+        NamedColor::BrightRed => 9,
+        NamedColor::BrightGreen => 10,
+        NamedColor::BrightYellow => 11,
+        NamedColor::BrightBlue => 12,
+        NamedColor::BrightMagenta => 13,
+        NamedColor::BrightCyan => 14,
+        NamedColor::BrightWhite => 15,
+        _ => return None,
+    })
+}
+
 fn resolve_color(
     color: AnsiColor,
     colors: &alacritty_terminal::term::color::Colors,
     role: Role,
 ) -> [u8; 3] {
     let rgb = match color {
-        AnsiColor::Named(name) => colors[name].unwrap_or_else(|| match role {
-            Role::Fg => default_fg(),
-            Role::Bg => default_bg(),
+        AnsiColor::Named(name) => colors[name].unwrap_or_else(|| {
+            if let Some(idx) = named_to_basic_idx(name) {
+                xterm_256(idx)
+            } else {
+                match role {
+                    Role::Fg => default_fg(),
+                    Role::Bg => default_bg(),
+                }
+            }
         }),
         AnsiColor::Spec(rgb) => rgb,
         AnsiColor::Indexed(idx) => colors[idx as usize].unwrap_or_else(|| xterm_256(idx)),
@@ -218,7 +247,6 @@ impl TerminalSession {
                 bg,
                 bold: cell.flags.contains(Flags::BOLD),
                 italic: cell.flags.contains(Flags::ITALIC),
-                wide: cell.flags.contains(Flags::WIDE_CHAR),
             };
         }
         let _ = reverse;

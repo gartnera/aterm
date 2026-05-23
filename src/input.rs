@@ -34,7 +34,7 @@ pub fn encode_key(
             if chars.chars().count() == 1 && c.is_ascii() {
                 let byte = match c {
                     '@'..='_' => (c as u8) & 0x1f,
-                    'a'..='z' => (c as u8 - b'a' + 1),
+                    'a'..='z' => c as u8 - b'a' + 1,
                     ' ' => 0,
                     '?' => 0x7f,
                     _ => return None,
