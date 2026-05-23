@@ -18,6 +18,7 @@ crossbeam-channel = "0.5"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 dirs = "5"
+arboard = "3"
 
 [profile.dev]
 opt-level = 1

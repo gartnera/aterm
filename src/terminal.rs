@@ -7,12 +7,14 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::config::Colors as ConfigColors;
 use crate::WakeEvent;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{point_to_viewport, TermMode};
+use alacritty_terminal::term::{point_to_viewport, viewport_to_point, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use alacritty_terminal::Term;
@@ -42,6 +44,19 @@ pub struct GridSnapshot {
     /// Terminal's default background — cells with this bg are not drawn so
     /// they fall through to the surface clear color.
     pub bg: [u8; 3],
+    /// Active selection translated to viewport coordinates, if any. `end` is
+    /// inclusive. For non-block selections, rows between start.line and
+    /// end.line are fully selected across their entire width.
+    pub selection: Option<SelectionView>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SelectionView {
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+    pub is_block: bool,
 }
 
 enum Role {
@@ -211,6 +226,11 @@ impl TerminalSession {
         self.term.lock().mode().contains(TermMode::APP_CURSOR)
     }
 
+    /// Whether the application has enabled bracketed paste (DEC private 2004).
+    /// When true, pasted text should be wrapped in `\x1b[200~ … \x1b[201~`.
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
+    }
 
     pub fn title(&self) -> &str {
         &self.title
@@ -218,6 +238,53 @@ impl TerminalSession {
 
     pub fn send_input<B: Into<std::borrow::Cow<'static, [u8]>>>(&self, bytes: B) {
         self.notifier.notify(bytes);
+    }
+
+    /// Scroll the viewport. Use `Scroll::Bottom` to snap back to live output.
+    pub fn scroll(&self, scroll: Scroll) {
+        self.term.lock().scroll_display(scroll);
+    }
+
+    /// Begin a new selection at the given viewport cell.
+    pub fn selection_start(&self, vp_line: usize, vp_col: usize, right_half: bool) {
+        let mut term = self.term.lock();
+        let lines = term.screen_lines();
+        let cols = term.columns();
+        let vp_line = vp_line.min(lines.saturating_sub(1));
+        let vp_col = vp_col.min(cols.saturating_sub(1));
+        let display_offset = term.grid().display_offset();
+        let point = viewport_to_point(
+            display_offset,
+            Point::new(vp_line, Column(vp_col)),
+        );
+        let side = if right_half { Side::Right } else { Side::Left };
+        term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+    }
+
+    /// Extend the in-progress selection to the given viewport cell.
+    pub fn selection_update(&self, vp_line: usize, vp_col: usize, right_half: bool) {
+        let mut term = self.term.lock();
+        let lines = term.screen_lines();
+        let cols = term.columns();
+        let vp_line = vp_line.min(lines.saturating_sub(1));
+        let vp_col = vp_col.min(cols.saturating_sub(1));
+        let display_offset = term.grid().display_offset();
+        let point = viewport_to_point(
+            display_offset,
+            Point::new(vp_line, Column(vp_col)),
+        );
+        let side = if right_half { Side::Right } else { Side::Left };
+        if let Some(sel) = term.selection.as_mut() {
+            sel.update(point, side);
+        }
+    }
+
+    pub fn clear_selection(&self) {
+        self.term.lock().selection = None;
+    }
+
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.lock().selection_to_string().filter(|s| !s.is_empty())
     }
 
     pub fn resize(&mut self, cols: u16, lines: u16, cell_width: u16, cell_height: u16) {
@@ -245,6 +312,25 @@ impl TerminalSession {
         let cursor_point = content.cursor.point;
         let cursor_visible = !matches!(content.cursor.shape, CursorShape::Hidden);
         let reverse = content.mode.contains(TermMode::ALT_SCREEN); // unused; placeholder
+        let selection = content.selection.and_then(|range| {
+            // Convert to viewport coordinates and clamp to the visible grid so
+            // selections that extend into scrollback off-screen render as a
+            // partial highlight rather than disappearing.
+            let start_line = range.start.line.0 + display_offset as i32;
+            let end_line = range.end.line.0 + display_offset as i32;
+            if end_line < 0 || start_line >= lines as i32 {
+                return None;
+            }
+            let start_line = start_line.max(0) as usize;
+            let end_line = end_line.min(lines as i32 - 1) as usize;
+            Some(SelectionView {
+                start_line,
+                start_col: range.start.column.0.min(cols.saturating_sub(1)),
+                end_line,
+                end_col: range.end.column.0.min(cols.saturating_sub(1)),
+                is_block: range.is_block,
+            })
+        });
 
         let mut cells: Vec<Vec<SnapCell>> = (0..lines)
             .map(|_| {
@@ -294,6 +380,7 @@ impl TerminalSession {
             bg: content.colors[NamedColor::Background]
                 .map(rgb_to_arr)
                 .unwrap_or(self.palette.background),
+            selection,
         }
     }
 

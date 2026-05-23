@@ -114,6 +114,28 @@ fn push_bg_quad(
     });
 }
 
+fn cell_in_selection(snap: &GridSnapshot, row: usize, col: usize) -> bool {
+    let Some(sel) = snap.selection else { return false };
+    if sel.is_block {
+        return row >= sel.start_line
+            && row <= sel.end_line
+            && col >= sel.start_col
+            && col <= sel.end_col;
+    }
+    if row < sel.start_line || row > sel.end_line {
+        return false;
+    }
+    if sel.start_line == sel.end_line {
+        col >= sel.start_col && col <= sel.end_col
+    } else if row == sel.start_line {
+        col >= sel.start_col
+    } else if row == sel.end_line {
+        col <= sel.end_col
+    } else {
+        true
+    }
+}
+
 fn build_row_text<'a>(
     row: &[crate::terminal::SnapCell],
     row_idx: usize,
@@ -131,7 +153,15 @@ fn build_row_text<'a>(
         // At the cursor cell we want the glyph to read against the cursor
         // block, so invert fg to the cell's bg (typically the terminal bg).
         let on_cursor = cursor_here && col == snap.cursor_col;
-        let fg = if on_cursor { cell.bg } else { cell.fg };
+        let selected = cell_in_selection(snap, row_idx, col);
+        let fg = if on_cursor {
+            cell.bg
+        } else if selected {
+            // Render text against the selection highlight by swapping fg/bg.
+            cell.bg
+        } else {
+            cell.fg
+        };
         let start = text.len();
         // Push the actual char; pad with a NBSP if the cell is empty (cosmic-text
         // collapses runs of spaces in some shaping paths, which can drift the
@@ -315,6 +345,40 @@ impl Gfx {
             .iter()
             .find(|(_, x0, x1)| x_px >= *x0 && x_px <= *x1)
             .map(|(idx, _, _)| *idx)
+    }
+
+    /// Map a window-relative physical pixel position to a (viewport_line,
+    /// viewport_col, right_half) cell coordinate inside the terminal grid.
+    /// Returns `None` if the position is above the grid (in the tab bar) or
+    /// the grid has zero cells.
+    pub fn cell_at(
+        &self,
+        x_px: f32,
+        y_px: f32,
+        tab_bar_height: f32,
+        cols: u16,
+        lines: u16,
+    ) -> Option<(usize, usize, bool)> {
+        let scale = self.window.scale_factor() as f32;
+        let cw = self.cell_width_logical * scale;
+        let ch = self.line_height * scale;
+        if cw <= 0.0 || ch <= 0.0 || cols == 0 || lines == 0 {
+            return None;
+        }
+        let pad_x = PAD_X * scale;
+        let top = (tab_bar_height + PAD_Y) * scale;
+        if y_px < top {
+            return None;
+        }
+        let x_rel = (x_px - pad_x).max(0.0);
+        let y_rel = y_px - top;
+        let col_f = x_rel / cw;
+        let line = (y_rel / ch).floor() as i64;
+        let line = line.clamp(0, lines as i64 - 1) as usize;
+        let col_floor = col_f.floor();
+        let col = col_floor.clamp(0.0, cols as f32 - 1.0) as usize;
+        let frac = col_f - col_floor;
+        Some((line, col, frac >= 0.5))
     }
 
 
@@ -503,6 +567,35 @@ impl Gfx {
                 }
                 if let Some((start, bg)) = run {
                     push_bg_quad(quads, scale, cell_w_px, cell_h_px, start, row.len(), y, bg);
+                }
+            }
+            // Selection highlight: drawn after cell-bg runs so it sits on top
+            // when the underlying cells had a non-default bg. Uses the
+            // terminal's default fg as the selection color so the inverted
+            // text (rendered with cell.bg) reads against it.
+            if let Some(sel) = snap.selection {
+                for row_idx in sel.start_line..=sel.end_line.min(snap.cells.len().saturating_sub(1))
+                {
+                    let row = &snap.cells[row_idx];
+                    let row_len = row.len();
+                    if row_len == 0 {
+                        continue;
+                    }
+                    let (s, e) = if sel.is_block {
+                        (sel.start_col, sel.end_col)
+                    } else if sel.start_line == sel.end_line {
+                        (sel.start_col, sel.end_col)
+                    } else if row_idx == sel.start_line {
+                        (sel.start_col, row_len - 1)
+                    } else if row_idx == sel.end_line {
+                        (0, sel.end_col)
+                    } else {
+                        (0, row_len - 1)
+                    };
+                    let s = s.min(row_len - 1);
+                    let e = e.min(row_len - 1);
+                    let y = top_offset_px + row_idx as f32 * cell_h_px;
+                    push_bg_quad(quads, scale, cell_w_px, cell_h_px, s, e + 1, y, snap.fg);
                 }
             }
             if snap.cursor_visible {
