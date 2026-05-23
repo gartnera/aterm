@@ -2,15 +2,98 @@ use std::sync::Arc;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop as PtyLoop, Msg, Notifier};
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::{point_to_viewport, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use alacritty_terminal::Term;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 #[derive(Clone)]
 pub struct ChannelListener(Sender<TermEvent>);
+
+#[derive(Clone, Copy, Default)]
+pub struct SnapCell {
+    pub ch: char,
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+    pub bold: bool,
+    pub italic: bool,
+    pub wide: bool,
+}
+
+pub struct GridSnapshot {
+    pub cols: usize,
+    pub lines: usize,
+    pub cells: Vec<Vec<SnapCell>>,
+    pub cursor_line: usize,
+    pub cursor_col: usize,
+    pub cursor_visible: bool,
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+}
+
+enum Role {
+    Fg,
+    Bg,
+}
+
+fn rgb_to_arr(rgb: Rgb) -> [u8; 3] {
+    [rgb.r, rgb.g, rgb.b]
+}
+
+fn default_fg() -> Rgb {
+    Rgb { r: 0xd0, g: 0xd0, b: 0xd0 }
+}
+
+fn default_bg() -> Rgb {
+    Rgb { r: 0x10, g: 0x10, b: 0x14 }
+}
+
+fn xterm_256(idx: u8) -> Rgb {
+    // 0..16: alacritty's palette will already cover these; we only get here
+    // as a fallback.
+    static BASIC: [(u8, u8, u8); 16] = [
+        (0, 0, 0), (170, 0, 0), (0, 170, 0), (170, 85, 0),
+        (0, 0, 170), (170, 0, 170), (0, 170, 170), (170, 170, 170),
+        (85, 85, 85), (255, 85, 85), (85, 255, 85), (255, 255, 85),
+        (85, 85, 255), (255, 85, 255), (85, 255, 255), (255, 255, 255),
+    ];
+    if idx < 16 {
+        let (r, g, b) = BASIC[idx as usize];
+        return Rgb { r, g, b };
+    }
+    if (16..=231).contains(&idx) {
+        let n = idx - 16;
+        let r = n / 36;
+        let g = (n / 6) % 6;
+        let b = n % 6;
+        let scale = |v: u8| if v == 0 { 0 } else { 55 + 40 * v };
+        return Rgb { r: scale(r), g: scale(g), b: scale(b) };
+    }
+    let gray = 8 + 10 * (idx - 232);
+    Rgb { r: gray, g: gray, b: gray }
+}
+
+fn resolve_color(
+    color: AnsiColor,
+    colors: &alacritty_terminal::term::color::Colors,
+    role: Role,
+) -> [u8; 3] {
+    let rgb = match color {
+        AnsiColor::Named(name) => colors[name].unwrap_or_else(|| match role {
+            Role::Fg => default_fg(),
+            Role::Bg => default_bg(),
+        }),
+        AnsiColor::Spec(rgb) => rgb,
+        AnsiColor::Indexed(idx) => colors[idx as usize].unwrap_or_else(|| xterm_256(idx)),
+    };
+    rgb_to_arr(rgb)
+}
 
 impl EventListener for ChannelListener {
     fn send_event(&self, event: TermEvent) {
@@ -96,6 +179,68 @@ impl TerminalSession {
         let size = TermSize::new(cols as usize, lines as usize);
         let _ = self.notifier.0.send(Msg::Resize(window_size));
         self.term.lock().resize(size);
+    }
+
+    /// Snapshot the current viewport for rendering. Takes the lock briefly,
+    /// then releases it so the renderer can run unsynchronized.
+    pub fn snapshot(&self) -> GridSnapshot {
+        let term = self.term.lock();
+        let content = term.renderable_content();
+        let display_offset = content.display_offset;
+        let cols = term.columns();
+        let lines = term.screen_lines();
+        let cursor_point = content.cursor.point;
+        let cursor_visible = !matches!(content.cursor.shape, CursorShape::Hidden);
+        let reverse = content.mode.contains(TermMode::ALT_SCREEN); // unused; placeholder
+
+        let mut cells: Vec<Vec<SnapCell>> = (0..lines)
+            .map(|_| {
+                (0..cols)
+                    .map(|_| SnapCell::default())
+                    .collect()
+            })
+            .collect();
+
+        for indexed in content.display_iter {
+            let Some(vp) = point_to_viewport(display_offset, indexed.point) else {
+                continue;
+            };
+            if vp.line >= lines || vp.column.0 >= cols {
+                continue;
+            }
+            let cell = &indexed.cell;
+            let mut fg = resolve_color(cell.fg, content.colors, Role::Fg);
+            let mut bg = resolve_color(cell.bg, content.colors, Role::Bg);
+            if cell.flags.contains(Flags::INVERSE) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            let ch = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                '\0'
+            } else {
+                cell.c
+            };
+            cells[vp.line][vp.column.0] = SnapCell {
+                ch,
+                fg,
+                bg,
+                bold: cell.flags.contains(Flags::BOLD),
+                italic: cell.flags.contains(Flags::ITALIC),
+                wide: cell.flags.contains(Flags::WIDE_CHAR),
+            };
+        }
+        let _ = reverse;
+
+        let cursor_vp = point_to_viewport(display_offset, cursor_point);
+        GridSnapshot {
+            cols,
+            lines,
+            cells,
+            cursor_line: cursor_vp.map(|p| p.line).unwrap_or(0),
+            cursor_col: cursor_vp.map(|p| p.column.0).unwrap_or(0),
+            cursor_visible,
+            fg: rgb_to_arr(content.colors[NamedColor::Foreground].unwrap_or(default_fg())),
+            bg: rgb_to_arr(content.colors[NamedColor::Background].unwrap_or(default_bg())),
+        }
     }
 
     /// Drain any pending alacritty events. Returns whether a redraw is needed.

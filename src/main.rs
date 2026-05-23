@@ -49,12 +49,14 @@ impl ApplicationHandler for App {
             window.clone(),
             self.config.font_size,
             line_height,
+            self.config.font_family.clone(),
         ));
         self.window = Some(window.clone());
         self.gfx = Some(gfx);
 
-        // Spawn an initial terminal tab.
-        let session = TerminalSession::spawn(80, 24).expect("spawn terminal");
+        // Spawn an initial terminal tab sized to the current window.
+        let (cols, lines) = gfx_ref(&self.gfx).grid_for_window(TAB_BAR_HEIGHT);
+        let session = TerminalSession::spawn(cols, lines).expect("spawn terminal");
         self.tabs.push(session);
         self.active_tab = 0;
         window.request_redraw();
@@ -72,6 +74,14 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 gfx.resize(size);
+                let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+                let scale = window.scale_factor() as f32;
+                let (cw, ch) = gfx.cell_dims_logical();
+                let cell_w_px = (cw * scale).round().max(1.0) as u16;
+                let cell_h_px = (ch * scale).round().max(1.0) as u16;
+                for tab in &mut self.tabs {
+                    tab.resize(cols, lines, cell_w_px, cell_h_px);
+                }
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
@@ -86,17 +96,41 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // For now: request redraws each frame so we keep rendering. We will
-        // switch to event-driven repaints once the terminal wakes us up.
-        if let Some(w) = &self.window {
-            w.request_redraw();
+        // Drain terminal events; request a redraw if any tab produced output.
+        let mut wake = false;
+        for tab in &mut self.tabs {
+            if tab.pump_events() {
+                wake = true;
+            }
+        }
+        if wake {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
     }
+}
+
+fn gfx_ref(opt: &Option<Gfx>) -> &Gfx {
+    opt.as_ref().expect("gfx initialized")
 }
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let config = config::load();
+
+    // Convenience for headless test runs: set ATABS_EXIT_AFTER_MS=5000 to make
+    // the process exit cleanly after N ms.
+    if let Ok(ms) = std::env::var("ATABS_EXIT_AFTER_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                log::info!("ATABS_EXIT_AFTER_MS elapsed; exiting");
+                std::process::exit(0);
+            });
+        }
+    }
+
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     let mut app = App::new(config);

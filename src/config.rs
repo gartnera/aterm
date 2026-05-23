@@ -262,12 +262,19 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
 }
 
 fn find_config_path() -> Option<PathBuf> {
-    let cfg_dir = dirs::config_dir()?;
-    for name in ["alacritty.toml", "alacritty/alacritty.toml"] {
-        let p = cfg_dir.join(name);
-        if p.exists() {
-            return Some(p);
-        }
+    let home = dirs::home_dir();
+    // Alacritty's canonical search path: ~/.config/alacritty/alacritty.toml
+    // first, then platform-specific config_dir() variants as fallbacks. On
+    // macOS dirs::config_dir() returns ~/Library/Application Support which is
+    // not where alacritty looks, so the ~/.config check is required.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(h) = home.as_ref() {
+        candidates.push(h.join(".config/alacritty/alacritty.toml"));
+        candidates.push(h.join(".alacritty.toml"));
     }
-    None
+    if let Some(cfg) = dirs::config_dir() {
+        candidates.push(cfg.join("alacritty/alacritty.toml"));
+        candidates.push(cfg.join("alacritty.toml"));
+    }
+    candidates.into_iter().find(|p| p.exists())
 }
