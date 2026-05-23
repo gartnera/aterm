@@ -68,6 +68,16 @@ fn rgb_to_arr(rgb: Rgb) -> [u8; 3] {
     [rgb.r, rgb.g, rgb.b]
 }
 
+fn dim([r, g, b]: [u8; 3]) -> [u8; 3] {
+    // SGR 2 (dim) renders at ~66% intensity. Matches alacritty's fallback
+    // when no explicit dim color is configured.
+    [
+        (r as f32 * 0.66).round() as u8,
+        (g as f32 * 0.66).round() as u8,
+        (b as f32 * 0.66).round() as u8,
+    ]
+}
+
 fn named_from_palette(name: NamedColor, palette: &ConfigColors) -> Option<[u8; 3]> {
     use NamedColor as N;
     Some(match name {
@@ -90,7 +100,16 @@ fn named_from_palette(name: NamedColor, palette: &ConfigColors) -> Option<[u8; 3
         N::BrightMagenta => palette.bright.magenta,
         N::BrightCyan => palette.bright.cyan,
         N::BrightWhite => palette.bright.white,
-        _ => return None,
+        N::BrightForeground => palette.foreground,
+        N::DimForeground => dim(palette.foreground),
+        N::DimBlack => dim(palette.normal.black),
+        N::DimRed => dim(palette.normal.red),
+        N::DimGreen => dim(palette.normal.green),
+        N::DimYellow => dim(palette.normal.yellow),
+        N::DimBlue => dim(palette.normal.blue),
+        N::DimMagenta => dim(palette.normal.magenta),
+        N::DimCyan => dim(palette.normal.cyan),
+        N::DimWhite => dim(palette.normal.white),
     })
 }
 
@@ -133,7 +152,7 @@ fn resolve_color(
     match color {
         AnsiColor::Named(name) => match colors[name] {
             Some(rgb) => rgb_to_arr(rgb),
-            None => named_from_palette(name, palette).unwrap_or_else(|| match role {
+            None => named_from_palette(name, palette).unwrap_or(match role {
                 Role::Fg => palette.foreground,
                 Role::Bg => palette.background,
             }),
@@ -168,13 +187,11 @@ impl TerminalSession {
     pub fn spawn(
         cols: u16,
         lines: u16,
+        cell_width: u16,
+        cell_height: u16,
         proxy: EventLoopProxy<WakeEvent>,
         palette: ConfigColors,
     ) -> std::io::Result<Self> {
-        // Approximate cell size; the renderer will refine this when it knows
-        // the real per-cell pixel size and call `resize`.
-        let cell_width = 8;
-        let cell_height = 16;
         let window_size = WindowSize {
             num_lines: lines,
             num_cols: cols,
@@ -311,7 +328,6 @@ impl TerminalSession {
         let lines = term.screen_lines();
         let cursor_point = content.cursor.point;
         let cursor_visible = !matches!(content.cursor.shape, CursorShape::Hidden);
-        let reverse = content.mode.contains(TermMode::ALT_SCREEN); // unused; placeholder
         let selection = content.selection.and_then(|range| {
             // Convert to viewport coordinates and clamp to the visible grid so
             // selections that extend into scrollback off-screen render as a
@@ -366,8 +382,6 @@ impl TerminalSession {
                 italic: cell.flags.contains(Flags::ITALIC),
             };
         }
-        let _ = reverse;
-
         let cursor_vp = point_to_viewport(display_offset, cursor_point);
         GridSnapshot {
             cells,
@@ -396,10 +410,54 @@ impl TerminalSession {
                     self.exited = true;
                     wake = true;
                 }
-                _ => {}
+                other => log::trace!("unhandled terminal event: {other:?}"),
             }
         }
         wake
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_palette_first_8_match_normal() {
+        let p = ConfigColors::default();
+        assert_eq!(indexed_from_palette(0, &p), p.normal.black);
+        assert_eq!(indexed_from_palette(1, &p), p.normal.red);
+        assert_eq!(indexed_from_palette(7, &p), p.normal.white);
+    }
+
+    #[test]
+    fn indexed_palette_bright_block_match_bright() {
+        let p = ConfigColors::default();
+        assert_eq!(indexed_from_palette(8, &p), p.bright.black);
+        assert_eq!(indexed_from_palette(15, &p), p.bright.white);
+    }
+
+    #[test]
+    fn indexed_palette_color_cube_endpoints() {
+        let p = ConfigColors::default();
+        // idx 16 is the (0,0,0) corner of the 6x6x6 cube.
+        assert_eq!(indexed_from_palette(16, &p), [0, 0, 0]);
+        // idx 231 is (5,5,5): r=g=b = 55 + 40*5 = 255.
+        assert_eq!(indexed_from_palette(231, &p), [255, 255, 255]);
+    }
+
+    #[test]
+    fn indexed_palette_greyscale_endpoints() {
+        let p = ConfigColors::default();
+        // idx 232: 8 + 10*0 = 8.
+        assert_eq!(indexed_from_palette(232, &p), [8, 8, 8]);
+        // idx 255: 8 + 10*23 = 238.
+        assert_eq!(indexed_from_palette(255, &p), [238, 238, 238]);
+    }
+
+    #[test]
+    fn dim_reduces_intensity() {
+        assert_eq!(dim([100, 200, 0]), [66, 132, 0]);
+        assert_eq!(dim([0, 0, 0]), [0, 0, 0]);
     }
 }
 

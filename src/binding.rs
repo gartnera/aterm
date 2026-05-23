@@ -27,6 +27,9 @@ pub enum Action {
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
+    /// Suppress a default binding without doing anything — the keystroke
+    /// is passed through to the PTY. Mirrors alacritty's `ReceiveChar`.
+    ReceiveChar,
 }
 
 #[derive(Clone, Debug)]
@@ -78,11 +81,11 @@ pub fn merge(user: Vec<Keybinding>, mut defaults: Vec<Keybinding>) -> Vec<Keybin
     defaults
 }
 
-pub fn find<'a>(
-    bindings: &'a [Keybinding],
+pub fn find(
+    bindings: &[Keybinding],
     key: KeyCode,
     mods: ModifiersState,
-) -> Option<&'a Keybinding> {
+) -> Option<&Keybinding> {
     bindings.iter().find(|b| b.key == key && b.mods == mods)
 }
 
@@ -238,6 +241,113 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "IncreaseFontSize" | "ZoomIn" => Action::IncreaseFontSize,
         "DecreaseFontSize" | "ZoomOut" => Action::DecreaseFontSize,
         "ResetFontSize" | "ZoomReset" => Action::ResetFontSize,
+        "ReceiveChar" => Action::ReceiveChar,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_key_letters_case_insensitive() {
+        assert_eq!(parse_key("t"), Some(KeyCode::KeyT));
+        assert_eq!(parse_key("T"), Some(KeyCode::KeyT));
+    }
+
+    #[test]
+    fn parse_key_digits_and_punct() {
+        assert_eq!(parse_key("1"), Some(KeyCode::Digit1));
+        assert_eq!(parse_key("0"), Some(KeyCode::Digit0));
+        assert_eq!(parse_key("-"), Some(KeyCode::Minus));
+        assert_eq!(parse_key("="), Some(KeyCode::Equal));
+    }
+
+    #[test]
+    fn parse_key_named_aliases() {
+        assert_eq!(parse_key("Left"), Some(KeyCode::ArrowLeft));
+        assert_eq!(parse_key("ArrowLeft"), Some(KeyCode::ArrowLeft));
+        assert_eq!(parse_key("pageup"), Some(KeyCode::PageUp));
+        assert_eq!(parse_key("F5"), Some(KeyCode::F5));
+        assert_eq!(parse_key("Esc"), Some(KeyCode::Escape));
+        assert_eq!(parse_key("Return"), Some(KeyCode::Enter));
+    }
+
+    #[test]
+    fn parse_key_unknown() {
+        assert_eq!(parse_key(""), None);
+        assert_eq!(parse_key("Bogus"), None);
+        assert_eq!(parse_key("ab"), None);
+    }
+
+    #[test]
+    fn parse_mods_combinations() {
+        assert_eq!(parse_mods(""), ModifiersState::empty());
+        assert_eq!(parse_mods("Command"), ModifiersState::SUPER);
+        assert_eq!(parse_mods("Cmd|Shift"), ModifiersState::SUPER | ModifiersState::SHIFT);
+        assert_eq!(parse_mods("Ctrl+Alt"), ModifiersState::CONTROL | ModifiersState::ALT);
+        assert_eq!(parse_mods("super win cmd"), ModifiersState::SUPER);
+        assert_eq!(parse_mods("Option"), ModifiersState::ALT);
+    }
+
+    #[test]
+    fn parse_mods_unknown_token_does_not_drop_others() {
+        let got = parse_mods("Cmd|Bogus|Shift");
+        assert_eq!(got, ModifiersState::SUPER | ModifiersState::SHIFT);
+    }
+
+    #[test]
+    fn parse_action_known_and_aliases() {
+        assert_eq!(parse_action("CreateTab"), Some(Action::CreateTab));
+        assert_eq!(parse_action("PreviousTab"), Some(Action::PrevTab));
+        assert_eq!(parse_action("SelectPrevTab"), Some(Action::PrevTab));
+        assert_eq!(parse_action("ZoomIn"), Some(Action::IncreaseFontSize));
+        assert_eq!(parse_action("ReceiveChar"), Some(Action::ReceiveChar));
+        assert_eq!(parse_action("SelectTab3"), Some(Action::SelectTab(3)));
+    }
+
+    #[test]
+    fn parse_action_rejects_out_of_range_tabs() {
+        assert_eq!(parse_action("SelectTab0"), None);
+        assert_eq!(parse_action("SelectTab10"), None);
+        assert_eq!(parse_action("SelectTabX"), None);
+        assert_eq!(parse_action("Bogus"), None);
+    }
+
+    #[test]
+    fn merge_user_overrides_default() {
+        let defaults = defaults();
+        let default_t = defaults
+            .iter()
+            .find(|b| b.key == KeyCode::KeyT && b.mods == ModifiersState::SUPER)
+            .expect("default Cmd+T present");
+        assert_eq!(default_t.action, Action::CreateTab);
+
+        let user = vec![Keybinding {
+            key: KeyCode::KeyT,
+            mods: ModifiersState::SUPER,
+            action: Action::CloseTab,
+        }];
+        let merged = merge(user, defaults);
+        let hit = find(&merged, KeyCode::KeyT, ModifiersState::SUPER).unwrap();
+        assert_eq!(hit.action, Action::CloseTab);
+        let count = merged
+            .iter()
+            .filter(|b| b.key == KeyCode::KeyT && b.mods == ModifiersState::SUPER)
+            .count();
+        assert_eq!(count, 1, "default should be replaced, not duplicated");
+    }
+
+    #[test]
+    fn merge_receive_char_clears_default() {
+        let user = vec![Keybinding {
+            key: KeyCode::KeyT,
+            mods: ModifiersState::SUPER,
+            action: Action::ReceiveChar,
+        }];
+        let merged = merge(user, defaults());
+        let hit = find(&merged, KeyCode::KeyT, ModifiersState::SUPER).unwrap();
+        assert_eq!(hit.action, Action::ReceiveChar);
+    }
 }

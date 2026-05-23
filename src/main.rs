@@ -66,10 +66,14 @@ impl App {
 
     fn spawn_tab(&mut self) {
         let Some(gfx) = self.gfx.as_ref() else { return };
+        let Some(window) = self.window.as_ref() else { return };
         let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+        let (cell_w_px, cell_h_px) = cell_dims_px(gfx, window);
         match TerminalSession::spawn(
             cols,
             lines,
+            cell_w_px,
+            cell_h_px,
             self.proxy.clone(),
             self.config.colors.clone(),
         ) {
@@ -103,8 +107,20 @@ impl App {
     }
 
     fn copy_selection(&mut self) {
+        // Defensive cap on copied size. Anything larger than this is almost
+        // certainly a mis-drag across the entire scrollback; the limit keeps
+        // a runaway selection from pushing tens-of-MB onto the OS clipboard.
+        const MAX_COPY_BYTES: usize = 16 * 1024 * 1024;
         let Some(session) = self.tabs.get(self.active_tab) else { return };
         let Some(text) = session.selection_text() else { return };
+        if text.len() > MAX_COPY_BYTES {
+            log::warn!(
+                "selection is {} bytes; refusing to copy more than {} bytes to the clipboard",
+                text.len(),
+                MAX_COPY_BYTES
+            );
+            return;
+        }
         let Some(cb) = self.clipboard.as_mut() else { return };
         if let Err(e) = cb.set_text(text) {
             log::warn!("clipboard set_text: {e}");
@@ -125,7 +141,14 @@ impl App {
             return;
         }
         // Normalize line endings: terminals expect CR for newline-as-Enter.
-        let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+        // Also strip the bracketed-paste *end* marker from the payload — if an
+        // attacker can get text containing \x1b[201~ onto the clipboard, the
+        // receiving app would otherwise see paste-end mid-payload and treat
+        // the rest as typed input.
+        let normalized = text
+            .replace("\r\n", "\r")
+            .replace('\n', "\r")
+            .replace("\x1b[201~", "");
         session.scroll(alacritty_terminal::grid::Scroll::Bottom);
         if session.bracketed_paste() {
             session.send_input(b"\x1b[200~".to_vec());
@@ -162,9 +185,12 @@ impl ApplicationHandler<WakeEvent> for App {
 
         // Spawn an initial terminal tab sized to the current window.
         let (cols, lines) = gfx_ref(&self.gfx).grid_for_window(TAB_BAR_HEIGHT);
+        let (cell_w_px, cell_h_px) = cell_dims_px(gfx_ref(&self.gfx), &window);
         let session = TerminalSession::spawn(
             cols,
             lines,
+            cell_w_px,
+            cell_h_px,
             self.proxy.clone(),
             self.config.colors.clone(),
         )
@@ -187,10 +213,7 @@ impl ApplicationHandler<WakeEvent> for App {
             WindowEvent::Resized(size) => {
                 gfx.resize(size);
                 let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
-                let scale = window.scale_factor() as f32;
-                let (cw, ch) = gfx.cell_dims_logical();
-                let cell_w_px = (cw * scale).round().max(1.0) as u16;
-                let cell_h_px = (ch * scale).round().max(1.0) as u16;
+                let (cell_w_px, cell_h_px) = cell_dims_px(gfx, &window);
                 for tab in &mut self.tabs {
                     tab.resize(cols, lines, cell_w_px, cell_h_px);
                 }
@@ -222,12 +245,26 @@ impl ApplicationHandler<WakeEvent> for App {
                 // key, so e.g. Option+1 on macOS triggers SelectTab1
                 // regardless of the layout-derived character (which would be
                 // "¡" on a US layout with Alt held).
-                if let PhysicalKey::Code(code) = physical_key {
-                    if let Some(b) = binding::find(&self.config.bindings, code, self.mods) {
-                        let action = b.action;
+                let binding_action = if let PhysicalKey::Code(code) = physical_key {
+                    binding::find(&self.config.bindings, code, self.mods).map(|b| b.action)
+                } else {
+                    None
+                };
+                match binding_action {
+                    // Explicit pass-through: user mapped this key to
+                    // ReceiveChar to disable a default. Fall through to the
+                    // PTY input encoder.
+                    Some(Action::ReceiveChar) => {}
+                    Some(action) => {
                         self.run_action(action, event_loop);
                         return;
                     }
+                    None if self.mods.super_key() => {
+                        // Reserve Cmd-prefixed keys for the OS / app — don't
+                        // leak unbound combos (e.g., Cmd+Q) to the shell.
+                        return;
+                    }
+                    None => {}
                 }
                 let Some(session) = self.tabs.get(self.active_tab) else { return };
                 let term_mode = input::TermKeyMode {
@@ -364,6 +401,15 @@ fn gfx_ref(opt: &Option<Gfx>) -> &Gfx {
     opt.as_ref().expect("gfx initialized")
 }
 
+fn cell_dims_px(gfx: &Gfx, window: &Window) -> (u16, u16) {
+    let scale = window.scale_factor() as f32;
+    let (cw, ch) = gfx.cell_dims_logical();
+    (
+        (cw * scale).round().max(1.0) as u16,
+        (ch * scale).round().max(1.0) as u16,
+    )
+}
+
 impl App {
     fn run_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
         match action {
@@ -391,6 +437,9 @@ impl App {
             Action::IncreaseFontSize => self.adjust_font_size(1.0),
             Action::DecreaseFontSize => self.adjust_font_size(-1.0),
             Action::ResetFontSize => self.reset_font_size(),
+            // Handled at the dispatch site (key falls through to PTY); if
+            // we somehow get here, treat it as a no-op.
+            Action::ReceiveChar => {}
         }
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -409,13 +458,12 @@ impl App {
     }
 
     fn reset_font_size(&mut self) {
-        let base = config::Config::default().font_size;
-        // Preserve the user-configured size from their alacritty.toml — fall
-        // back to the built-in default only if no file was loaded.
+        // Restore the size the user set in alacritty.toml (captured at load
+        // time). If they didn't set one, fall back to the built-in default.
         let target = self
             .config
             .font_size_initial
-            .unwrap_or(base);
+            .unwrap_or_else(|| config::Config::default().font_size);
         self.set_font_size(target);
     }
 
@@ -423,16 +471,13 @@ impl App {
         if (self.config.font_size - size).abs() < f32::EPSILON {
             return;
         }
-        self.config.font_size = size;
         let Some(gfx) = self.gfx.as_mut() else { return };
         let Some(window) = self.window.as_ref() else { return };
+        self.config.font_size = size;
         let line_height = (size * 1.25).round();
         gfx.set_font_metrics(size, line_height);
         let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
-        let scale = window.scale_factor() as f32;
-        let (cw, ch) = gfx.cell_dims_logical();
-        let cell_w_px = (cw * scale).round().max(1.0) as u16;
-        let cell_h_px = (ch * scale).round().max(1.0) as u16;
+        let (cell_w_px, cell_h_px) = cell_dims_px(gfx, window);
         for tab in &mut self.tabs {
             tab.resize(cols, lines, cell_w_px, cell_h_px);
         }

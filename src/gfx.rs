@@ -91,6 +91,7 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     format!("{head}…")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_bg_quad(
     quads: &mut Vec<Quad>,
     scale: f32,
@@ -157,8 +158,10 @@ fn build_row_text<'a>(
         let fg = if on_cursor {
             cell.bg
         } else if selected {
-            // Render text against the selection highlight by swapping fg/bg.
-            cell.bg
+            // The selection highlight quad is drawn in snap.fg, so always
+            // render selected text in snap.bg for legibility — regardless of
+            // the cell's own bg (which may be a syntax-highlight color, etc.).
+            snap.bg
         } else {
             cell.fg
         };
@@ -187,32 +190,45 @@ fn measure_cell_width(
     line_height: f32,
     family_name: &str,
 ) -> f32 {
-    let metrics = Metrics::new(font_size, line_height);
-    let mut buf = Buffer::new(font_system, metrics);
-    buf.set_size(font_system, Some(1000.0), Some(line_height + 4.0));
     let family = if family_name.eq_ignore_ascii_case("monospace") {
         Family::Monospace
     } else {
         Family::Name(family_name)
     };
-    buf.set_text(
-        font_system,
-        "MMMMMMMMMM",
-        &Attrs::new().family(family),
-        Shaping::Advanced,
-        None,
-    );
-    buf.shape_until_scroll(font_system, false);
-    let max_x = buf
-        .layout_runs()
-        .flat_map(|run| run.glyphs.iter())
-        .map(|g| g.x + g.w)
-        .fold(0.0_f32, f32::max);
-    if max_x > 0.0 {
-        max_x / 10.0
+    let measure = |fs: &mut FontSystem, text: &str| -> f32 {
+        let metrics = Metrics::new(font_size, line_height);
+        let mut buf = Buffer::new(fs, metrics);
+        buf.set_size(fs, Some(1000.0), Some(line_height + 4.0));
+        buf.set_text(fs, text, &Attrs::new().family(family), Shaping::Advanced, None);
+        buf.shape_until_scroll(fs, false);
+        buf.layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .map(|g| g.x + g.w)
+            .fold(0.0_f32, f32::max)
+    };
+
+    let m_width = measure(font_system, "MMMMMMMMMM");
+    let cell = if m_width > 0.0 {
+        m_width / 10.0
     } else {
         font_size * 0.6
+    };
+
+    // Sanity check: a proportional font will measure 'i' and 'W' at very
+    // different widths, and the grid will look wrong. Warn so the user knows
+    // why their terminal looks off.
+    let i_width = measure(font_system, "iiiiiiiiii");
+    let w_width = measure(font_system, "WWWWWWWWWW");
+    if i_width > 0.0 && w_width > 0.0 {
+        let ratio = w_width / i_width;
+        if ratio > 1.15 {
+            log::warn!(
+                "font {family_name:?} appears to be proportional (W/i width ratio = {ratio:.2}); \
+                 the grid will not align correctly. Use a monospace font."
+            );
+        }
     }
+    cell
 }
 
 pub struct Gfx {
@@ -598,9 +614,7 @@ impl Gfx {
                     if row_len == 0 {
                         continue;
                     }
-                    let (s, e) = if sel.is_block {
-                        (sel.start_col, sel.end_col)
-                    } else if sel.start_line == sel.end_line {
+                    let (s, e) = if sel.is_block || sel.start_line == sel.end_line {
                         (sel.start_col, sel.end_col)
                     } else if row_idx == sel.start_line {
                         (sel.start_col, row_len - 1)
@@ -749,5 +763,96 @@ impl Gfx {
         frame.present();
         self.text_atlas.trim();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::{GridSnapshot, SelectionView, SnapCell};
+
+    #[test]
+    fn truncate_keeps_short_strings_intact() {
+        assert_eq!(truncate_with_ellipsis("abc", 10), "abc");
+        assert_eq!(truncate_with_ellipsis("abc", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_appends_ellipsis_when_over_budget() {
+        assert_eq!(truncate_with_ellipsis("abcdef", 4), "abc…");
+        assert_eq!(truncate_with_ellipsis("abcdef", 1), "…");
+        assert_eq!(truncate_with_ellipsis("abcdef", 0), "");
+    }
+
+    #[test]
+    fn truncate_handles_multibyte_chars() {
+        // chars(), not bytes — 4 chars of "αβγδεζ" should fit in budget 4.
+        assert_eq!(truncate_with_ellipsis("αβγδεζ", 4), "αβγ…");
+    }
+
+    fn snap_with_selection(sel: SelectionView) -> GridSnapshot {
+        GridSnapshot {
+            cells: vec![vec![SnapCell::default(); 10]; 5],
+            cursor_line: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            fg: [0; 3],
+            bg: [0; 3],
+            selection: Some(sel),
+        }
+    }
+
+    #[test]
+    fn cell_in_selection_single_line() {
+        let snap = snap_with_selection(SelectionView {
+            start_line: 1,
+            start_col: 2,
+            end_line: 1,
+            end_col: 5,
+            is_block: false,
+        });
+        assert!(!cell_in_selection(&snap, 1, 1));
+        assert!(cell_in_selection(&snap, 1, 2));
+        assert!(cell_in_selection(&snap, 1, 5));
+        assert!(!cell_in_selection(&snap, 1, 6));
+        assert!(!cell_in_selection(&snap, 0, 3));
+    }
+
+    #[test]
+    fn cell_in_selection_multi_line() {
+        let snap = snap_with_selection(SelectionView {
+            start_line: 1,
+            start_col: 3,
+            end_line: 3,
+            end_col: 2,
+            is_block: false,
+        });
+        // Row 1: from start_col to end of row.
+        assert!(!cell_in_selection(&snap, 1, 2));
+        assert!(cell_in_selection(&snap, 1, 3));
+        assert!(cell_in_selection(&snap, 1, 9));
+        // Middle row: entirely selected.
+        assert!(cell_in_selection(&snap, 2, 0));
+        assert!(cell_in_selection(&snap, 2, 9));
+        // Last row: up to end_col.
+        assert!(cell_in_selection(&snap, 3, 0));
+        assert!(cell_in_selection(&snap, 3, 2));
+        assert!(!cell_in_selection(&snap, 3, 3));
+    }
+
+    #[test]
+    fn cell_in_selection_block() {
+        let snap = snap_with_selection(SelectionView {
+            start_line: 0,
+            start_col: 2,
+            end_line: 2,
+            end_col: 4,
+            is_block: true,
+        });
+        assert!(cell_in_selection(&snap, 0, 2));
+        assert!(cell_in_selection(&snap, 2, 4));
+        assert!(!cell_in_selection(&snap, 1, 1));
+        assert!(!cell_in_selection(&snap, 1, 5));
+        assert!(!cell_in_selection(&snap, 3, 3));
     }
 }

@@ -67,9 +67,11 @@ fn prefix_alt(mut bytes: Vec<u8>, mods: ModifiersState) -> Vec<u8> {
     bytes
 }
 
-/// xterm-style modifier-encoded sequence for named keys. Returns None when
-/// no modifier (other than possibly Alt-only) is held, so the caller can
-/// fall back to the plain sequence + alt-prefix path.
+/// xterm-style modifier-encoded sequence for named keys. Returns None only
+/// when no Shift/Alt/Ctrl modifier is held — in that case the caller falls
+/// back to the plain sequence path. With any of those modifiers held
+/// (including Alt-only), we emit the `CSI 1;{m}…` / `CSI {key};{m}~` form,
+/// which is how xterm reports modified named keys.
 fn encode_named_modified(named: NamedKey, mods: ModifiersState) -> Option<Vec<u8>> {
     // bit 0 = shift, bit 1 = alt, bit 2 = ctrl. Result = 1 + that value.
     let mut bits = 0u8;

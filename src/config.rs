@@ -211,6 +211,10 @@ pub fn load() -> Config {
 /// current file so the current file's keys win.
 fn load_value(path: &std::path::Path, depth: usize) -> Option<toml::Value> {
     if depth > 4 {
+        log::warn!(
+            "config import depth limit (4) exceeded at {}; check for cycles",
+            path.display()
+        );
         return None;
     }
     let body = std::fs::read_to_string(path).ok()?;
@@ -379,7 +383,9 @@ fn apply_ansi(pal: &mut AnsiPalette, raw: Option<RawAnsi>) {
 fn parse_hex(s: &str) -> Option<[u8; 3]> {
     let s = s.trim();
     let s = s.strip_prefix("0x").or_else(|| s.strip_prefix('#')).unwrap_or(s);
-    if s.len() != 6 {
+    // Accept #RRGGBB and #RRGGBBAA; alpha is discarded since the renderer
+    // doesn't compose translucent colors.
+    if s.len() != 6 && s.len() != 8 {
         return None;
     }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -390,11 +396,17 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
 
 fn find_config_path() -> Option<PathBuf> {
     let home = dirs::home_dir();
-    // Alacritty's canonical search path: ~/.config/alacritty/alacritty.toml
-    // first, then platform-specific config_dir() variants as fallbacks. On
-    // macOS dirs::config_dir() returns ~/Library/Application Support which is
-    // not where alacritty looks, so the ~/.config check is required.
+    // Alacritty's canonical search path: $XDG_CONFIG_HOME (when set) and
+    // ~/.config/alacritty/alacritty.toml first, then platform-specific
+    // config_dir() variants as fallbacks. On macOS dirs::config_dir()
+    // returns ~/Library/Application Support which is not where alacritty
+    // looks, so the ~/.config check is required even there.
     let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            candidates.push(PathBuf::from(&xdg).join("alacritty/alacritty.toml"));
+        }
+    }
     if let Some(h) = home.as_ref() {
         candidates.push(h.join(".config/alacritty/alacritty.toml"));
         candidates.push(h.join(".alacritty.toml"));
@@ -404,4 +416,70 @@ fn find_config_path() -> Option<PathBuf> {
         candidates.push(cfg.join("alacritty.toml"));
     }
     candidates.into_iter().find(|p| p.exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_six_digits() {
+        assert_eq!(parse_hex("#1a2b3c"), Some([0x1a, 0x2b, 0x3c]));
+        assert_eq!(parse_hex("0x1A2B3C"), Some([0x1a, 0x2b, 0x3c]));
+        assert_eq!(parse_hex("1a2b3c"), Some([0x1a, 0x2b, 0x3c]));
+    }
+
+    #[test]
+    fn parse_hex_eight_digits_drops_alpha() {
+        assert_eq!(parse_hex("#1a2b3cff"), Some([0x1a, 0x2b, 0x3c]));
+        assert_eq!(parse_hex("0x1a2b3c80"), Some([0x1a, 0x2b, 0x3c]));
+    }
+
+    #[test]
+    fn parse_hex_rejects_other_lengths() {
+        assert_eq!(parse_hex("#abc"), None);
+        assert_eq!(parse_hex("#1a2b3"), None);
+        assert_eq!(parse_hex(""), None);
+        assert_eq!(parse_hex("zzzzzz"), None);
+    }
+
+    #[test]
+    fn merge_toml_overlays_keys() {
+        let mut base: toml::Value = toml::from_str("a = 1\nb = 2\n").unwrap();
+        let overlay: toml::Value = toml::from_str("b = 99\nc = 3\n").unwrap();
+        merge_toml(&mut base, overlay);
+        let table = base.as_table().unwrap();
+        assert_eq!(table.get("a").unwrap().as_integer(), Some(1));
+        assert_eq!(table.get("b").unwrap().as_integer(), Some(99));
+        assert_eq!(table.get("c").unwrap().as_integer(), Some(3));
+    }
+
+    #[test]
+    fn merge_toml_recurses_into_subtables() {
+        let mut base: toml::Value = toml::from_str("[t]\nx = 1\ny = 2\n").unwrap();
+        let overlay: toml::Value = toml::from_str("[t]\ny = 99\nz = 3\n").unwrap();
+        merge_toml(&mut base, overlay);
+        let t = base.get("t").unwrap().as_table().unwrap();
+        assert_eq!(t.get("x").unwrap().as_integer(), Some(1));
+        assert_eq!(t.get("y").unwrap().as_integer(), Some(99));
+        assert_eq!(t.get("z").unwrap().as_integer(), Some(3));
+    }
+
+    #[test]
+    fn take_imports_pulls_top_level_and_general() {
+        let mut v: toml::Value =
+            toml::from_str("import = [\"a.toml\"]\n[general]\nimport = [\"b.toml\"]\n").unwrap();
+        let mut got = take_imports(&mut v);
+        got.sort();
+        assert_eq!(got, vec!["a.toml".to_string(), "b.toml".to_string()]);
+        assert!(v.as_table().unwrap().get("import").is_none());
+        assert!(
+            v.get("general")
+                .unwrap()
+                .as_table()
+                .unwrap()
+                .get("import")
+                .is_none()
+        );
+    }
 }
