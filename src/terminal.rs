@@ -27,14 +27,11 @@ pub struct SnapCell {
 }
 
 pub struct GridSnapshot {
-    pub cols: usize,
-    pub lines: usize,
     pub cells: Vec<Vec<SnapCell>>,
     pub cursor_line: usize,
     pub cursor_col: usize,
     pub cursor_visible: bool,
     pub fg: [u8; 3],
-    pub bg: [u8; 3],
 }
 
 enum Role {
@@ -228,14 +225,11 @@ impl TerminalSession {
 
         let cursor_vp = point_to_viewport(display_offset, cursor_point);
         GridSnapshot {
-            cols,
-            lines,
             cells,
             cursor_line: cursor_vp.map(|p| p.line).unwrap_or(0),
             cursor_col: cursor_vp.map(|p| p.column.0).unwrap_or(0),
             cursor_visible,
             fg: rgb_to_arr(content.colors[NamedColor::Foreground].unwrap_or(default_fg())),
-            bg: rgb_to_arr(content.colors[NamedColor::Background].unwrap_or(default_bg())),
         }
     }
 

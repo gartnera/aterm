@@ -100,6 +100,8 @@ pub struct Gfx {
     line_height: f32,
     cell_width_logical: f32,
     font_family: String,
+    /// Physical-pixel x-ranges for each rendered tab, refreshed every frame.
+    tab_hit_regions: Vec<(usize, f32, f32)>,
 }
 
 impl Gfx {
@@ -180,7 +182,16 @@ impl Gfx {
             line_height,
             cell_width_logical,
             font_family,
+            tab_hit_regions: Vec::new(),
         }
+    }
+
+    /// Returns the tab index at the given physical-pixel x within the tab bar.
+    pub fn tab_at_x(&self, x_px: f32) -> Option<usize> {
+        self.tab_hit_regions
+            .iter()
+            .find(|(_, x0, x1)| x_px >= *x0 && x_px <= *x1)
+            .map(|(idx, _, _)| *idx)
     }
 
 
@@ -253,14 +264,21 @@ impl Gfx {
             }
         }
 
-        // Tab bar text.
+        // Tab bar: build the text and capture per-tab character ranges so we
+        // can hit-test mouse clicks back to a tab index.
+        self.tab_hit_regions.clear();
         let mut tab_text = String::new();
         for (i, t) in tabs.iter().enumerate() {
             if i > 0 {
                 tab_text.push_str("   ");
             }
+            let chars_before = tab_text.chars().count();
             let marker = if i == active_idx { "● " } else { "○ " };
             tab_text.push_str(&format!("{marker}{}", t.title()));
+            let chars_after = tab_text.chars().count();
+            let x0 = PAD_X * scale + chars_before as f32 * cell_w_px;
+            let x1 = PAD_X * scale + chars_after as f32 * cell_w_px;
+            self.tab_hit_regions.push((i, x0, x1));
         }
         if tab_text.is_empty() {
             tab_text.push_str("(no tabs)");

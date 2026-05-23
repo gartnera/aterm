@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 mod input;
@@ -25,6 +25,7 @@ struct App {
     tabs: Vec<TerminalSession>,
     active_tab: usize,
     mods: ModifiersState,
+    cursor_pos: (f64, f64),
 }
 
 impl App {
@@ -36,6 +37,40 @@ impl App {
             tabs: Vec::new(),
             active_tab: 0,
             mods: ModifiersState::empty(),
+            cursor_pos: (0.0, 0.0),
+        }
+    }
+
+    fn spawn_tab(&mut self) {
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+        match TerminalSession::spawn(cols, lines) {
+            Ok(s) => {
+                self.tabs.push(s);
+                self.active_tab = self.tabs.len() - 1;
+            }
+            Err(e) => log::error!("spawn tab: {e}"),
+        }
+    }
+
+    fn close_active_tab(&mut self, event_loop: &ActiveEventLoop) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let idx = self.active_tab.min(self.tabs.len() - 1);
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            event_loop.exit();
+            return;
+        }
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        }
+    }
+
+    fn select_tab(&mut self, idx: usize) {
+        if idx < self.tabs.len() {
+            self.active_tab = idx;
         }
     }
 }
@@ -73,7 +108,7 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(window) = self.window.as_ref() else { return };
+        let Some(window) = self.window.clone() else { return };
         let Some(gfx) = self.gfx.as_mut() else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -110,14 +145,38 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                // Cmd-prefixed shortcuts are app-level (tabs, copy, paste);
-                // let those fall through without reaching the PTY.
+                // Cmd-prefixed shortcuts are app-level; consume them here.
                 if self.mods.super_key() {
+                    if self.handle_app_shortcut(&logical_key, event_loop) {
+                        return;
+                    }
                     return;
                 }
                 let Some(session) = self.tabs.get(self.active_tab) else { return };
                 if let Some(bytes) = input::encode_key(&logical_key, text.as_deref(), self.mods) {
                     session.send_input(bytes);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = (position.x, position.y);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let scale = window.scale_factor();
+                let y_px = self.cursor_pos.1;
+                let tab_bar_h_px = TAB_BAR_HEIGHT as f64 * scale;
+                let x_px = self.cursor_pos.0;
+                let hit = if y_px <= tab_bar_h_px {
+                    gfx.tab_at_x(x_px as f32)
+                } else {
+                    None
+                };
+                if let Some(idx) = hit {
+                    self.select_tab(idx);
+                    window.request_redraw();
                 }
             }
             _ => {}
@@ -142,6 +201,53 @@ impl ApplicationHandler for App {
 
 fn gfx_ref(opt: &Option<Gfx>) -> &Gfx {
     opt.as_ref().expect("gfx initialized")
+}
+
+impl App {
+    /// Returns true if the shortcut was handled (caller should swallow it).
+    fn handle_app_shortcut(&mut self, key: &Key, event_loop: &ActiveEventLoop) -> bool {
+        match key {
+            Key::Character(s) => match s.as_str() {
+                "t" | "T" => {
+                    self.spawn_tab();
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    true
+                }
+                "w" | "W" => {
+                    self.close_active_tab(event_loop);
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    true
+                }
+                "1" => { self.select_tab(0); true }
+                "2" => { self.select_tab(1); true }
+                "3" => { self.select_tab(2); true }
+                "4" => { self.select_tab(3); true }
+                "5" => { self.select_tab(4); true }
+                "6" => { self.select_tab(5); true }
+                "7" => { self.select_tab(6); true }
+                "8" => { self.select_tab(7); true }
+                "9" => { self.select_tab(8); true }
+                _ => false,
+            },
+            Key::Named(NamedKey::ArrowLeft) => {
+                if self.active_tab > 0 {
+                    self.active_tab -= 1;
+                }
+                true
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                if self.active_tab + 1 < self.tabs.len() {
+                    self.active_tab += 1;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 fn main() {
