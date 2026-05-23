@@ -104,15 +104,10 @@ fn push_bg_quad(
 ) {
     let x = PAD_X * scale + start_col as f32 * cell_w_px;
     let w = (end_col - start_col) as f32 * cell_w_px;
-    quads.push(Quad {
-        rect: [x, y_px, w, cell_h_px],
-        color: [
-            bg[0] as f32 / 255.0,
-            bg[1] as f32 / 255.0,
-            bg[2] as f32 / 255.0,
-            1.0,
-        ],
-    });
+    // Linearize: the surface is sRGB, so the fragment shader output is
+    // treated as linear and gamma-corrected on store. Passing raw
+    // sRGB/255 values made cell backgrounds visibly over-saturated.
+    quads.push(Quad { rect: [x, y_px, w, cell_h_px], color: linear_rgba(bg) });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -128,15 +123,7 @@ fn push_underline_quad(
 ) {
     let x = PAD_X * scale + start_col as f32 * cell_w_px;
     let w = (end_col - start_col) as f32 * cell_w_px;
-    quads.push(Quad {
-        rect: [x, y_px, w, h_px],
-        color: [
-            fg[0] as f32 / 255.0,
-            fg[1] as f32 / 255.0,
-            fg[2] as f32 / 255.0,
-            1.0,
-        ],
-    });
+    quads.push(Quad { rect: [x, y_px, w, h_px], color: linear_rgba(fg) });
 }
 
 fn hover_url_covers(spans: &[UrlSpan], row: usize, col: usize) -> bool {
@@ -668,15 +655,9 @@ impl Gfx {
             if snap.cursor_visible {
                 let x = PAD_X * scale + snap.cursor_col as f32 * cell_w_px;
                 let y = top_offset_px + snap.cursor_line as f32 * cell_h_px;
-                let fg = snap.fg;
                 quads.push(Quad {
                     rect: [x, y, cell_w_px, cell_h_px],
-                    color: [
-                        fg[0] as f32 / 255.0,
-                        fg[1] as f32 / 255.0,
-                        fg[2] as f32 / 255.0,
-                        1.0,
-                    ],
+                    color: linear_rgba(snap.fg),
                 });
             }
 
