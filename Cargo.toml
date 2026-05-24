@@ -29,6 +29,11 @@ serde_json = "1"
 dirs = "5"
 arboard = "3"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# proc_pidinfo + PROC_PIDVNODEPATHINFO for cwd-of-PID lookup. Linux uses
+# /proc/<pid>/cwd via std::fs::read_link and needs no extra dep.
+libc = "0.2"
+
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"

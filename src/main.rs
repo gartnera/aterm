@@ -8,6 +8,7 @@ pub struct WakeEvent;
 mod app;
 mod binding;
 mod config;
+mod cwd;
 #[cfg(unix)]
 mod debug_ipc;
 mod gfx;

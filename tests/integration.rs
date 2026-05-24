@@ -116,6 +116,53 @@ fn url_regex_matches_printed_url() {
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn new_tab_inherits_cwd_from_active() {
+    require_display!();
+    use std::time::Duration;
+    let mut t = AtermTest::spawn();
+
+    // Pick a directory the active tab definitely isn't already in. We use
+    // /tmp + a unique suffix so two parallel test runs don't race.
+    let dir = format!("/tmp/aterm-cwd-{}-{}", std::process::id(), rand_suffix());
+    std::fs::create_dir_all(&dir).expect("mkdir target");
+
+    // cd in the active tab and confirm the shell has applied the change.
+    // Echoing a sentinel after `cd` lets us wait without racing on the
+    // prompt repaint, which on slow CI can lag the actual chdir.
+    t.type_line(&format!("cd {dir}"));
+    t.type_line("echo CWD_READY_TAG");
+    t.wait_for_text("CWD_READY_TAG");
+
+    // Spawn a new tab — it should be parented at `dir`.
+    t.create_tab();
+    t.type_line("pwd");
+    // Allow extra time on the very first PTY spawn in a CI container.
+    t.wait_for_text_within(&dir, Duration::from_secs(8));
+
+    let lines = t.snapshot_text();
+    assert!(
+        lines.iter().any(|l| l.contains(&dir)),
+        "new tab did not inherit cwd {dir:?}; grid was:\n{}",
+        lines.join("\n")
+    );
+
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rand_suffix() -> String {
+    // Tiny non-crypto entropy source: the low bits of the monotonic clock
+    // are plenty to avoid collisions inside one test run.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{nanos:08x}")
+}
+
+#[test]
 fn snapshot_reflects_typed_command_before_enter() {
     require_display!();
     let mut t = AtermTest::spawn();

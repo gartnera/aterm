@@ -336,6 +336,10 @@ pub struct TerminalSession {
     lines: u16,
     exited: bool,
     palette: ConfigColors,
+    /// PID of the shell process spawned for this tab. Used to resolve the
+    /// shell's current working directory when the user opens a new tab so
+    /// it inherits the cd'd-to location.
+    shell_pid: Option<u32>,
 }
 
 impl TerminalSession {
@@ -346,6 +350,7 @@ impl TerminalSession {
         cell_height: u16,
         proxy: EventLoopProxy<WakeEvent>,
         palette: ConfigColors,
+        working_directory: Option<std::path::PathBuf>,
     ) -> std::io::Result<Self> {
         let window_size = WindowSize {
             num_lines: lines,
@@ -375,20 +380,23 @@ impl TerminalSession {
         pty_options
             .env
             .insert("COLORTERM".into(), "truecolor".into());
-        // GUI launchers (launchd on macOS, the desktop session on Linux) start
-        // the .app in `/`. If our cwd looks like that default, start the shell
-        // in $HOME instead. When aterm was launched from a shell in a real
-        // directory, inherit that cwd as usual.
-        if std::env::current_dir()
-            .map(|p| p == std::path::Path::new("/"))
-            .unwrap_or(false)
+        // Caller-supplied working directory wins (used to inherit the cwd
+        // of the active tab on Cmd+T). Fall back to $HOME when aterm's
+        // own cwd looks like the launcher default (`/`).
+        pty_options.working_directory = working_directory.filter(|p| p.is_dir());
+        if pty_options.working_directory.is_none()
+            && std::env::current_dir()
+                .map(|p| p == std::path::Path::new("/"))
+                .unwrap_or(false)
         {
-            if let Some(home) = dirs::home_dir() {
-                pty_options.working_directory = Some(home);
-            }
+            pty_options.working_directory = dirs::home_dir();
         }
         // window_id is opaque metadata used by alacritty's PTY layer.
         let pty = tty::new(&pty_options, window_size, 0)?;
+        // Capture the child PID *before* the pty is moved into PtyLoop —
+        // we need it to look up the shell's cwd later via /proc on Linux
+        // or proc_pidinfo on macOS.
+        let shell_pid = pty.child().id();
 
         let (events_tx, events_rx) = unbounded();
         let listener = ChannelListener {
@@ -419,7 +427,16 @@ impl TerminalSession {
             lines,
             exited: false,
             palette,
+            shell_pid: Some(shell_pid),
         })
+    }
+
+    /// Best-effort lookup of the shell's current working directory.
+    /// Returns None if the platform isn't supported, the shell process
+    /// has exited, or the OS denied the read. Used to seed a new tab's
+    /// cwd from the active tab.
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        self.shell_pid.and_then(crate::cwd::cwd_of_pid)
     }
 
     pub fn is_exited(&self) -> bool {
