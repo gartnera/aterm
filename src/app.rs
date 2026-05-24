@@ -19,7 +19,7 @@ use crate::config::{self, Config};
 use crate::debug_ipc;
 use crate::gfx::Gfx;
 use crate::input;
-use crate::terminal::{self, TerminalSession, UrlMatch};
+use crate::terminal::{self, MouseReporting, TerminalSession, UrlMatch};
 use crate::WakeEvent;
 
 pub const TAB_BAR_HEIGHT: f32 = 28.0;
@@ -35,6 +35,14 @@ pub struct App {
     cursor_pos: (f64, f64),
     /// Whether a left-button drag is in progress over the grid.
     selecting: bool,
+    /// Bitmask of mouse buttons currently pressed and being reported to the
+    /// PTY (bit per `input::MouseButton`). Used to emit motion events with
+    /// the correct button code while a drag is in progress.
+    mouse_buttons_held: u8,
+    /// Last cell (row, col) we reported to the PTY in mouse-motion mode,
+    /// to suppress duplicate motion events that arrive faster than the
+    /// grid resolution.
+    last_mouse_cell: Option<(usize, usize)>,
     /// Accumulated wheel delta in lines (line-delta events arrive as i32;
     /// pixel-delta events get converted using the cell height).
     scroll_accum: f32,
@@ -73,6 +81,8 @@ impl App {
             mods: ModifiersState::empty(),
             cursor_pos: (0.0, 0.0),
             selecting: false,
+            mouse_buttons_held: 0,
+            last_mouse_cell: None,
             scroll_accum: 0.0,
             clipboard: Clipboard::new()
                 .map_err(|e| log::warn!("clipboard unavailable: {e}"))
@@ -266,15 +276,11 @@ impl App {
         if text.is_empty() {
             return;
         }
-        // Normalize line endings: terminals expect CR for newline-as-Enter.
-        // Also strip the bracketed-paste *end* marker from the payload — if an
-        // attacker can get text containing \x1b[201~ onto the clipboard, the
-        // receiving app would otherwise see paste-end mid-payload and treat
-        // the rest as typed input.
-        let normalized = text
-            .replace("\r\n", "\r")
-            .replace('\n', "\r")
-            .replace("\x1b[201~", "");
+        // CRLF → CR (terminals interpret CR as Enter) and strip embedded
+        // bracketed-paste end markers (\x1b[201~) so an attacker who can
+        // stage text on the clipboard can't break out of paste mode and
+        // have the rest of the payload re-interpreted as typed input.
+        let normalized = input::normalize_paste(&text);
         session.scroll(alacritty_terminal::grid::Scroll::Bottom);
         if session.bracketed_paste() {
             session.send_input(b"\x1b[200~".to_vec());
@@ -464,107 +470,13 @@ impl ApplicationHandler<WakeEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
-                if self.selecting {
-                    let Some(gfx) = self.gfx.as_ref() else { return };
-                    let Some(session) = self.tabs.get(self.active_tab) else {
-                        return;
-                    };
-                    let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
-                    if let Some((line, col, right)) = gfx.cell_at(
-                        position.x as f32,
-                        position.y as f32,
-                        TAB_BAR_HEIGHT,
-                        cols,
-                        lines,
-                    ) {
-                        session.selection_update(line, col, right);
-                        window.request_redraw();
-                    }
-                } else {
-                    // Sub-cell mouse movement is common (every winit cursor
-                    // event); skip the OSC 8 lookup / URL regex scan when the
-                    // cursor is still in the same grid cell as last time.
-                    let cell = self.gfx.as_ref().and_then(|gfx| {
-                        let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
-                        gfx.cell_at(
-                            position.x as f32,
-                            position.y as f32,
-                            TAB_BAR_HEIGHT,
-                            cols,
-                            lines,
-                        )
-                        .map(|(l, c, _)| (l, c))
-                    });
-                    if cell != self.last_hover_cell {
-                        self.refresh_hover_url(&window);
-                    }
-                }
+                self.handle_cursor_moved(position.x, position.y, &window);
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => {
-                let scale = window.scale_factor();
-                let y_px = self.cursor_pos.1;
-                let tab_bar_h_px = TAB_BAR_HEIGHT as f64 * scale;
-                let x_px = self.cursor_pos.0;
-                let Some(gfx) = self.gfx.as_ref() else { return };
-                if y_px <= tab_bar_h_px {
-                    if let Some(idx) = gfx.tab_at_x(x_px as f32) {
-                        self.select_tab(idx);
-                        self.sync_window_title(&window);
-                        window.request_redraw();
-                    }
-                    return;
-                }
-                // Modifier+click on a URL opens it instead of starting a
-                // selection. Hover state is the source of truth — if we
-                // underlined it, we'll open the same URL.
-                if url_modifier_held(self.mods) {
-                    if let Some(url) = self.hover_url.as_ref() {
-                        open_url(&url.uri);
-                        return;
-                    }
-                }
-                // Click inside the grid begins (or replaces) a selection.
-                if let Some(session) = self.tabs.get(self.active_tab) {
-                    let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
-                    if let Some((line, col, right)) =
-                        gfx.cell_at(x_px as f32, y_px as f32, TAB_BAR_HEIGHT, cols, lines)
-                    {
-                        session.selection_start(line, col, right);
-                        self.selecting = true;
-                        window.request_redraw();
-                    }
-                }
-            }
-            WindowEvent::MouseInput {
-                state: ElementState::Released,
-                button: MouseButton::Left,
-                ..
-            } => {
-                self.selecting = false;
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.handle_mouse_button(state, button, &window);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let Some(session) = self.tabs.get(self.active_tab) else {
-                    return;
-                };
-                let Some(gfx) = self.gfx.as_ref() else { return };
-                let scale = window.scale_factor() as f32;
-                let (_, cell_h) = gfx.cell_dims_logical();
-                let cell_h_px = (cell_h * scale).max(1.0);
-                let lines_delta = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / cell_h_px,
-                };
-                self.scroll_accum += lines_delta;
-                let whole = self.scroll_accum.trunc() as i32;
-                if whole != 0 {
-                    self.scroll_accum -= whole as f32;
-                    session.scroll(Scroll::Delta(whole));
-                    window.request_redraw();
-                }
+                self.handle_mouse_wheel(delta, &window);
             }
             _ => {}
         }
@@ -679,7 +591,316 @@ fn cell_dims_px(gfx: &Gfx, window: &Window) -> (u16, u16) {
     )
 }
 
+/// Translate a winit `MouseButton` to our reporting button, returning None
+/// for buttons xterm doesn't encode (Back/Forward/extra).
+fn mouse_button_for_report(button: MouseButton) -> Option<input::MouseButton> {
+    match button {
+        MouseButton::Left => Some(input::MouseButton::Left),
+        MouseButton::Middle => Some(input::MouseButton::Middle),
+        MouseButton::Right => Some(input::MouseButton::Right),
+        _ => None,
+    }
+}
+
 impl App {
+    /// Compute the (row, col) cell under the cursor, or None if the pointer
+    /// is over the tab bar / padding. Mouse-mode reporting needs this in
+    /// every event handler.
+    fn cell_under_cursor(&self) -> Option<(usize, usize)> {
+        let gfx = self.gfx.as_ref()?;
+        let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+        let (l, c, _) = gfx.cell_at(
+            self.cursor_pos.0 as f32,
+            self.cursor_pos.1 as f32,
+            TAB_BAR_HEIGHT,
+            cols,
+            lines,
+        )?;
+        Some((l, c))
+    }
+
+    fn pointer_in_tab_bar(&self, window: &Window) -> bool {
+        self.cursor_pos.1 <= TAB_BAR_HEIGHT as f64 * window.scale_factor()
+    }
+
+    fn handle_cursor_moved(&mut self, x: f64, y: f64, window: &Window) {
+        // Mouse-reporting motion takes priority over local drag/hover when
+        // an application has subscribed to drag or all-motion events.
+        if self.maybe_report_mouse_motion(window) {
+            return;
+        }
+        if self.selecting {
+            let Some(gfx) = self.gfx.as_ref() else { return };
+            let Some(session) = self.tabs.get(self.active_tab) else {
+                return;
+            };
+            let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+            if let Some((line, col, right)) =
+                gfx.cell_at(x as f32, y as f32, TAB_BAR_HEIGHT, cols, lines)
+            {
+                session.selection_update(line, col, right);
+                window.request_redraw();
+            }
+        } else {
+            // Sub-cell mouse movement is common (every winit cursor event);
+            // skip the OSC 8 lookup / URL regex scan when the cursor is
+            // still in the same grid cell as last time.
+            let cell = self.gfx.as_ref().and_then(|gfx| {
+                let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+                gfx.cell_at(x as f32, y as f32, TAB_BAR_HEIGHT, cols, lines)
+                    .map(|(l, c, _)| (l, c))
+            });
+            if cell != self.last_hover_cell {
+                self.refresh_hover_url(window);
+            }
+        }
+    }
+
+    /// If the active app has enabled drag-tracking (1002) or any-motion
+    /// (1003) reporting and we're inside the grid, emit a motion event to
+    /// the PTY and return true. Returns false otherwise so the caller falls
+    /// through to local handling (selection drag, hover URL).
+    fn maybe_report_mouse_motion(&mut self, _window: &Window) -> bool {
+        // Shift always bypasses mouse reporting so the user can still drag
+        // a selection over a full-screen app (xterm convention).
+        if self.mods.shift_key() {
+            return false;
+        }
+        let Some(session) = self.tabs.get(self.active_tab) else {
+            return false;
+        };
+        let mode = session.mouse_mode();
+        let wants_motion = match mode.reporting {
+            MouseReporting::AnyMotion => true,
+            MouseReporting::Drag => self.mouse_buttons_held != 0,
+            MouseReporting::Click | MouseReporting::None => false,
+        };
+        if !wants_motion {
+            return false;
+        }
+        let Some((row, col)) = self.cell_under_cursor() else {
+            return false;
+        };
+        if Some((row, col)) == self.last_mouse_cell {
+            return true;
+        }
+        self.last_mouse_cell = Some((row, col));
+        // Pick a representative held button (lowest bit) for the motion
+        // event. If nothing is held (AnyMotion mode) report as Left+motion;
+        // that's what xterm does — the receiver only cares about position.
+        let button = if self.mouse_buttons_held & (1 << 0) != 0 {
+            input::MouseButton::Left
+        } else if self.mouse_buttons_held & (1 << 1) != 0 {
+            input::MouseButton::Middle
+        } else if self.mouse_buttons_held & (1 << 2) != 0 {
+            input::MouseButton::Right
+        } else {
+            input::MouseButton::Left
+        };
+        if mode.sgr {
+            let bytes =
+                input::encode_mouse_sgr(button, input::MouseAction::Motion, col, row, self.mods);
+            session.send_input(bytes);
+        }
+        true
+    }
+
+    fn handle_mouse_button(&mut self, state: ElementState, button: MouseButton, window: &Window) {
+        // Tab-bar click — only left button picks tabs, and we never report
+        // tab-bar interactions to the PTY.
+        if state == ElementState::Pressed
+            && button == MouseButton::Left
+            && self.pointer_in_tab_bar(window)
+        {
+            let Some(gfx) = self.gfx.as_ref() else { return };
+            if let Some(idx) = gfx.tab_at_x(self.cursor_pos.0 as f32) {
+                self.select_tab(idx);
+                self.sync_window_title(window);
+                window.request_redraw();
+            }
+            return;
+        }
+
+        // Mouse-reporting path: forward to PTY if the app has subscribed
+        // and the user isn't holding Shift to bypass. Modifier+click on a
+        // hovered URL also bypasses reporting so click-to-open keeps
+        // working inside tmux / vim / etc.
+        let url_open_click =
+            button == MouseButton::Left && url_modifier_held(self.mods) && self.hover_url.is_some();
+        if !self.mods.shift_key() && !url_open_click {
+            if let Some(report_btn) = mouse_button_for_report(button) {
+                if self.try_report_mouse_button(state, report_btn) {
+                    return;
+                }
+            }
+        }
+
+        // Local behavior: left-click selects / opens URL; left-release
+        // ends a drag. Other buttons have no local meaning today.
+        if button != MouseButton::Left {
+            return;
+        }
+        match state {
+            ElementState::Pressed => {
+                // Modifier+click on a URL opens it instead of starting a
+                // selection. Hover state is the source of truth — if we
+                // underlined it, we'll open the same URL.
+                if url_modifier_held(self.mods) {
+                    if let Some(url) = self.hover_url.as_ref() {
+                        open_url(&url.uri);
+                        return;
+                    }
+                }
+                let Some(gfx) = self.gfx.as_ref() else { return };
+                let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+                if let Some(session) = self.tabs.get(self.active_tab) {
+                    if let Some((line, col, right)) = gfx.cell_at(
+                        self.cursor_pos.0 as f32,
+                        self.cursor_pos.1 as f32,
+                        TAB_BAR_HEIGHT,
+                        cols,
+                        lines,
+                    ) {
+                        session.selection_start(line, col, right);
+                        self.selecting = true;
+                        window.request_redraw();
+                    }
+                }
+            }
+            ElementState::Released => {
+                self.selecting = false;
+            }
+        }
+    }
+
+    /// Send an SGR press/release event for a button if the active app is
+    /// in any mouse-reporting mode. Returns true if the event was reported.
+    /// Tracks `mouse_buttons_held` so subsequent motion events know which
+    /// button to report.
+    fn try_report_mouse_button(&mut self, state: ElementState, button: input::MouseButton) -> bool {
+        let Some(session) = self.tabs.get(self.active_tab) else {
+            return false;
+        };
+        let mode = session.mouse_mode();
+        if matches!(mode.reporting, MouseReporting::None) {
+            return false;
+        }
+        let Some((row, col)) = self.cell_under_cursor() else {
+            return false;
+        };
+        let bit = match button {
+            input::MouseButton::Left => 1 << 0,
+            input::MouseButton::Middle => 1 << 1,
+            input::MouseButton::Right => 1 << 2,
+            // Wheel never goes through this path.
+            _ => return false,
+        };
+        let (action, bytes) = match state {
+            ElementState::Pressed => {
+                self.mouse_buttons_held |= bit;
+                self.last_mouse_cell = Some((row, col));
+                (
+                    input::MouseAction::Press,
+                    input::encode_mouse_sgr(button, input::MouseAction::Press, col, row, self.mods),
+                )
+            }
+            ElementState::Released => {
+                self.mouse_buttons_held &= !bit;
+                if self.mouse_buttons_held == 0 {
+                    self.last_mouse_cell = None;
+                }
+                (
+                    input::MouseAction::Release,
+                    input::encode_mouse_sgr(
+                        button,
+                        input::MouseAction::Release,
+                        col,
+                        row,
+                        self.mods,
+                    ),
+                )
+            }
+        };
+        let _ = action;
+        if mode.sgr {
+            session.send_input(bytes);
+            true
+        } else {
+            // Legacy X10 encoding isn't implemented — refuse to fall back
+            // to it so we don't garble coordinates past col 223. The app
+            // will retry with SGR if it cares (most modern apps request
+            // 1006 alongside 1000/1002/1003).
+            false
+        }
+    }
+
+    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta, window: &Window) {
+        let Some(session) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        let scale = window.scale_factor() as f32;
+        let (_, cell_h) = gfx.cell_dims_logical();
+        let cell_h_px = (cell_h * scale).max(1.0);
+        let lines_delta = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y,
+            MouseScrollDelta::PixelDelta(p) => p.y as f32 / cell_h_px,
+        };
+        self.scroll_accum += lines_delta;
+        let whole = self.scroll_accum.trunc() as i32;
+        if whole == 0 {
+            return;
+        }
+        self.scroll_accum -= whole as f32;
+
+        let mode = session.mouse_mode();
+        let mouse_reporting_active = !matches!(mode.reporting, MouseReporting::None);
+
+        // 1) App-driven mouse reporting — encode each notch as a wheel
+        // button press. Shift held bypasses reporting so the user can
+        // still scroll the local viewport over a full-screen app.
+        if mouse_reporting_active && mode.sgr && !self.mods.shift_key() {
+            let (row, col) = self.cell_under_cursor().unwrap_or((0, 0));
+            let button = if whole > 0 {
+                input::MouseButton::WheelUp
+            } else {
+                input::MouseButton::WheelDown
+            };
+            for _ in 0..whole.unsigned_abs() {
+                let bytes =
+                    input::encode_mouse_sgr(button, input::MouseAction::Press, col, row, self.mods);
+                session.send_input(bytes);
+            }
+            window.request_redraw();
+            return;
+        }
+
+        // 2) Alternate-scroll (DECSET 1007) on the alt screen — translate
+        // wheel ticks to arrow-key presses so less/man/vim respond.
+        if mode.alternate_scroll && mode.alt_screen && !self.mods.shift_key() {
+            let arrow: &[u8] = if session.app_cursor_mode() {
+                if whole > 0 {
+                    b"\x1bOA"
+                } else {
+                    b"\x1bOB"
+                }
+            } else if whole > 0 {
+                b"\x1b[A"
+            } else {
+                b"\x1b[B"
+            };
+            for _ in 0..whole.unsigned_abs() {
+                session.send_input(arrow.to_vec());
+            }
+            window.request_redraw();
+            return;
+        }
+
+        // 3) Default: scroll the local viewport.
+        session.scroll(Scroll::Delta(whole));
+        window.request_redraw();
+    }
+
     fn run_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
         match action {
             Action::CreateTab => self.spawn_tab(),

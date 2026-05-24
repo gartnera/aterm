@@ -79,6 +79,33 @@ pub struct UrlMatch {
     pub spans: Vec<UrlSpan>,
 }
 
+/// Application's mouse-reporting preference, sampled from TermMode at the
+/// moment of a winit mouse event. The input layer decides whether to
+/// forward to the PTY or handle locally (selection / scroll) based on this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MouseMode {
+    pub reporting: MouseReporting,
+    /// SGR encoding (DECSET 1006). When false, legacy X10 encoding applies.
+    /// We only emit SGR — the legacy encoding can't represent cells past
+    /// column 223 and is effectively obsolete.
+    pub sgr: bool,
+    /// DECSET 1007 — when true and no reporting mode is active, the app
+    /// wants wheel scrolls translated into arrow keys (tmux/less idiom).
+    pub alternate_scroll: bool,
+    pub alt_screen: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseReporting {
+    None,
+    /// Press + release only (DECSET 1000).
+    Click,
+    /// Press + release + motion while a button is held (DECSET 1002).
+    Drag,
+    /// Press + release + all motion (DECSET 1003).
+    AnyMotion,
+}
+
 #[cfg(target_os = "macos")]
 fn default_shell() -> &'static str {
     "/bin/zsh"
@@ -409,6 +436,31 @@ impl TerminalSession {
     /// When true, pasted text should be wrapped in `\x1b[200~ … \x1b[201~`.
     pub fn bracketed_paste(&self) -> bool {
         self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Snapshot of the application's mouse-reporting configuration. Used by
+    /// the input layer to decide between selection/scrolling (default) and
+    /// forwarding mouse events to the PTY (when the app has opted in).
+    pub fn mouse_mode(&self) -> MouseMode {
+        let mode = *self.term.lock().mode();
+        let reporting = if mode.contains(TermMode::MOUSE_MOTION) {
+            MouseReporting::AnyMotion
+        } else if mode.contains(TermMode::MOUSE_DRAG) {
+            MouseReporting::Drag
+        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            MouseReporting::Click
+        } else {
+            MouseReporting::None
+        };
+        MouseMode {
+            reporting,
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+            // ALTERNATE_SCROLL is set by tmux/less etc. to convert wheel
+            // events into arrow keys when reporting isn't active. Caller
+            // checks this when no real reporting mode is in effect.
+            alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
+            alt_screen: mode.contains(TermMode::ALT_SCREEN),
+        }
     }
 
     pub fn title(&self) -> &str {
