@@ -31,6 +31,14 @@ but the alpha is discarded (the renderer doesn't composite translucent
 content). The shell is taken from `$SHELL` (falling back to `/bin/zsh` on
 macOS and `/bin/sh` elsewhere); this is not configurable via the file.
 
+### New tabs inherit the active tab's cwd
+
+Cmd+T (or any binding mapped to `CreateTab`) opens a new tab in the
+working directory of the currently active shell. The lookup uses
+`/proc/<pid>/cwd` on Linux and `proc_pidinfo` on macOS — no shell
+configuration is required. On other platforms the new tab spawns
+wherever aterm itself was launched from.
+
 ### Keybindings
 
 User bindings layer on top of the defaults; a user entry whose

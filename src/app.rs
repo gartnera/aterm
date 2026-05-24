@@ -119,6 +119,11 @@ impl App {
         };
         let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
         let (cell_w_px, cell_h_px) = cell_dims_px(gfx, window);
+        // Inherit the active tab's cwd so e.g. `cd src; Cmd+T` opens the
+        // new tab in `src`. Falls back to None (i.e. let the shell start
+        // wherever it normally would) if the lookup fails or there is no
+        // active tab — Wayland/Windows etc.
+        let cwd = self.tabs.get(self.active_tab).and_then(|t| t.cwd());
         match TerminalSession::spawn(
             cols,
             lines,
@@ -126,6 +131,7 @@ impl App {
             cell_h_px,
             self.proxy.clone(),
             self.config.colors.clone(),
+            cwd,
         ) {
             Ok(s) => {
                 self.tabs.push(s);
@@ -333,6 +339,7 @@ impl ApplicationHandler<WakeEvent> for App {
             cell_h_px,
             self.proxy.clone(),
             self.config.colors.clone(),
+            None,
         ) {
             Ok(s) => {
                 self.tabs.push(s);
