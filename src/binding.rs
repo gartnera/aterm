@@ -43,24 +43,86 @@ pub fn defaults() -> Vec<Keybinding> {
     let cmd = ModifiersState::SUPER;
     let shift = ModifiersState::SHIFT;
     let mut v = vec![
-        Keybinding { key: KeyCode::KeyT, mods: cmd, action: Action::CreateTab },
-        Keybinding { key: KeyCode::KeyW, mods: cmd, action: Action::CloseTab },
-        Keybinding { key: KeyCode::KeyC, mods: cmd, action: Action::Copy },
-        Keybinding { key: KeyCode::KeyV, mods: cmd, action: Action::Paste },
-        Keybinding { key: KeyCode::ArrowLeft, mods: cmd, action: Action::PrevTab },
-        Keybinding { key: KeyCode::ArrowRight, mods: cmd, action: Action::NextTab },
-        Keybinding { key: KeyCode::PageUp, mods: shift, action: Action::ScrollPageUp },
-        Keybinding { key: KeyCode::PageDown, mods: shift, action: Action::ScrollPageDown },
-        Keybinding { key: KeyCode::Home, mods: shift, action: Action::ScrollToTop },
-        Keybinding { key: KeyCode::End, mods: shift, action: Action::ScrollToBottom },
-        Keybinding { key: KeyCode::Equal, mods: cmd, action: Action::IncreaseFontSize },
-        Keybinding { key: KeyCode::Equal, mods: cmd | shift, action: Action::IncreaseFontSize },
-        Keybinding { key: KeyCode::Minus, mods: cmd, action: Action::DecreaseFontSize },
-        Keybinding { key: KeyCode::Digit0, mods: cmd, action: Action::ResetFontSize },
+        Keybinding {
+            key: KeyCode::KeyT,
+            mods: cmd,
+            action: Action::CreateTab,
+        },
+        Keybinding {
+            key: KeyCode::KeyW,
+            mods: cmd,
+            action: Action::CloseTab,
+        },
+        Keybinding {
+            key: KeyCode::KeyC,
+            mods: cmd,
+            action: Action::Copy,
+        },
+        Keybinding {
+            key: KeyCode::KeyV,
+            mods: cmd,
+            action: Action::Paste,
+        },
+        Keybinding {
+            key: KeyCode::ArrowLeft,
+            mods: cmd,
+            action: Action::PrevTab,
+        },
+        Keybinding {
+            key: KeyCode::ArrowRight,
+            mods: cmd,
+            action: Action::NextTab,
+        },
+        Keybinding {
+            key: KeyCode::PageUp,
+            mods: shift,
+            action: Action::ScrollPageUp,
+        },
+        Keybinding {
+            key: KeyCode::PageDown,
+            mods: shift,
+            action: Action::ScrollPageDown,
+        },
+        Keybinding {
+            key: KeyCode::Home,
+            mods: shift,
+            action: Action::ScrollToTop,
+        },
+        Keybinding {
+            key: KeyCode::End,
+            mods: shift,
+            action: Action::ScrollToBottom,
+        },
+        Keybinding {
+            key: KeyCode::Equal,
+            mods: cmd,
+            action: Action::IncreaseFontSize,
+        },
+        Keybinding {
+            key: KeyCode::Equal,
+            mods: cmd | shift,
+            action: Action::IncreaseFontSize,
+        },
+        Keybinding {
+            key: KeyCode::Minus,
+            mods: cmd,
+            action: Action::DecreaseFontSize,
+        },
+        Keybinding {
+            key: KeyCode::Digit0,
+            mods: cmd,
+            action: Action::ResetFontSize,
+        },
     ];
     let digits = [
-        KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4,
-        KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8,
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
         KeyCode::Digit9,
     ];
     for (i, &k) in digits.iter().enumerate() {
@@ -81,11 +143,7 @@ pub fn merge(user: Vec<Keybinding>, mut defaults: Vec<Keybinding>) -> Vec<Keybin
     defaults
 }
 
-pub fn find(
-    bindings: &[Keybinding],
-    key: KeyCode,
-    mods: ModifiersState,
-) -> Option<&Keybinding> {
+pub fn find(bindings: &[Keybinding], key: KeyCode, mods: ModifiersState) -> Option<&Keybinding> {
     bindings.iter().find(|b| b.key == key && b.mods == mods)
 }
 
@@ -121,15 +179,32 @@ fn single_char(s: &str) -> Option<char> {
 
 fn ascii_letter_keycode(c: char) -> Option<KeyCode> {
     let kc = match c {
-        'A' => KeyCode::KeyA, 'B' => KeyCode::KeyB, 'C' => KeyCode::KeyC,
-        'D' => KeyCode::KeyD, 'E' => KeyCode::KeyE, 'F' => KeyCode::KeyF,
-        'G' => KeyCode::KeyG, 'H' => KeyCode::KeyH, 'I' => KeyCode::KeyI,
-        'J' => KeyCode::KeyJ, 'K' => KeyCode::KeyK, 'L' => KeyCode::KeyL,
-        'M' => KeyCode::KeyM, 'N' => KeyCode::KeyN, 'O' => KeyCode::KeyO,
-        'P' => KeyCode::KeyP, 'Q' => KeyCode::KeyQ, 'R' => KeyCode::KeyR,
-        'S' => KeyCode::KeyS, 'T' => KeyCode::KeyT, 'U' => KeyCode::KeyU,
-        'V' => KeyCode::KeyV, 'W' => KeyCode::KeyW, 'X' => KeyCode::KeyX,
-        'Y' => KeyCode::KeyY, 'Z' => KeyCode::KeyZ,
+        'A' => KeyCode::KeyA,
+        'B' => KeyCode::KeyB,
+        'C' => KeyCode::KeyC,
+        'D' => KeyCode::KeyD,
+        'E' => KeyCode::KeyE,
+        'F' => KeyCode::KeyF,
+        'G' => KeyCode::KeyG,
+        'H' => KeyCode::KeyH,
+        'I' => KeyCode::KeyI,
+        'J' => KeyCode::KeyJ,
+        'K' => KeyCode::KeyK,
+        'L' => KeyCode::KeyL,
+        'M' => KeyCode::KeyM,
+        'N' => KeyCode::KeyN,
+        'O' => KeyCode::KeyO,
+        'P' => KeyCode::KeyP,
+        'Q' => KeyCode::KeyQ,
+        'R' => KeyCode::KeyR,
+        'S' => KeyCode::KeyS,
+        'T' => KeyCode::KeyT,
+        'U' => KeyCode::KeyU,
+        'V' => KeyCode::KeyV,
+        'W' => KeyCode::KeyW,
+        'X' => KeyCode::KeyX,
+        'Y' => KeyCode::KeyY,
+        'Z' => KeyCode::KeyZ,
         _ => return None,
     };
     Some(kc)
@@ -185,10 +260,18 @@ fn named_keycode(name: &str) -> Option<KeyCode> {
         "enter" | "return" => KeyCode::Enter,
         "space" => KeyCode::Space,
         "escape" | "esc" => KeyCode::Escape,
-        "f1" => KeyCode::F1, "f2" => KeyCode::F2, "f3" => KeyCode::F3,
-        "f4" => KeyCode::F4, "f5" => KeyCode::F5, "f6" => KeyCode::F6,
-        "f7" => KeyCode::F7, "f8" => KeyCode::F8, "f9" => KeyCode::F9,
-        "f10" => KeyCode::F10, "f11" => KeyCode::F11, "f12" => KeyCode::F12,
+        "f1" => KeyCode::F1,
+        "f2" => KeyCode::F2,
+        "f3" => KeyCode::F3,
+        "f4" => KeyCode::F4,
+        "f5" => KeyCode::F5,
+        "f6" => KeyCode::F6,
+        "f7" => KeyCode::F7,
+        "f8" => KeyCode::F8,
+        "f9" => KeyCode::F9,
+        "f10" => KeyCode::F10,
+        "f11" => KeyCode::F11,
+        "f12" => KeyCode::F12,
         _ => return None,
     };
     Some(kc)
@@ -285,8 +368,14 @@ mod tests {
     fn parse_mods_combinations() {
         assert_eq!(parse_mods(""), ModifiersState::empty());
         assert_eq!(parse_mods("Command"), ModifiersState::SUPER);
-        assert_eq!(parse_mods("Cmd|Shift"), ModifiersState::SUPER | ModifiersState::SHIFT);
-        assert_eq!(parse_mods("Ctrl+Alt"), ModifiersState::CONTROL | ModifiersState::ALT);
+        assert_eq!(
+            parse_mods("Cmd|Shift"),
+            ModifiersState::SUPER | ModifiersState::SHIFT
+        );
+        assert_eq!(
+            parse_mods("Ctrl+Alt"),
+            ModifiersState::CONTROL | ModifiersState::ALT
+        );
         assert_eq!(parse_mods("super win cmd"), ModifiersState::SUPER);
         assert_eq!(parse_mods("Option"), ModifiersState::ALT);
     }

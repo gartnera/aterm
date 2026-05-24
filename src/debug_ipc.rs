@@ -73,13 +73,25 @@ pub struct Response {
 
 impl Response {
     pub fn ok_empty() -> Self {
-        Self { ok: true, data: None, error: None }
+        Self {
+            ok: true,
+            data: None,
+            error: None,
+        }
     }
     pub fn ok_data(data: serde_json::Value) -> Self {
-        Self { ok: true, data: Some(data), error: None }
+        Self {
+            ok: true,
+            data: Some(data),
+            error: None,
+        }
     }
     pub fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, data: None, error: Some(msg.into()) }
+        Self {
+            ok: false,
+            data: None,
+            error: Some(msg.into()),
+        }
     }
 }
 
@@ -95,7 +107,9 @@ pub struct PendingRequest {
 /// wake. Returns None if `ATERM_DEBUG_SOCK` is not set; that is the normal
 /// case for user-facing builds.
 pub fn start_if_enabled(proxy: EventLoopProxy<WakeEvent>) -> Option<Receiver<PendingRequest>> {
-    let path = std::env::var("ATERM_DEBUG_SOCK").ok().filter(|s| !s.is_empty())?;
+    let path = std::env::var("ATERM_DEBUG_SOCK")
+        .ok()
+        .filter(|s| !s.is_empty())?;
     // Best-effort cleanup of a stale socket from a previous run.
     let _ = std::fs::remove_file(&path);
     let listener = match UnixListener::bind(&path) {
@@ -157,9 +171,8 @@ fn handle_client(
             continue;
         }
         let resp = process_one(&line, &req_tx, &proxy);
-        let json = serde_json::to_string(&resp).unwrap_or_else(|_| {
-            r#"{"ok":false,"error":"failed to serialize response"}"#.into()
-        });
+        let json = serde_json::to_string(&resp)
+            .unwrap_or_else(|_| r#"{"ok":false,"error":"failed to serialize response"}"#.into());
         if writeln!(writer, "{json}").is_err() {
             break;
         }
@@ -177,7 +190,10 @@ fn process_one(
     };
     let (reply_tx, reply_rx) = bounded(1);
     if req_tx
-        .send(PendingRequest { request, reply: reply_tx })
+        .send(PendingRequest {
+            request,
+            reply: reply_tx,
+        })
         .is_err()
     {
         return Response::err("event loop is gone");

@@ -111,7 +111,9 @@ impl App {
 
     fn spawn_tab(&mut self) {
         let Some(gfx) = self.gfx.as_ref() else { return };
-        let Some(window) = self.window.as_ref() else { return };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
         let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
         let (cell_w_px, cell_h_px) = cell_dims_px(gfx, window);
         match TerminalSession::spawn(
@@ -156,8 +158,12 @@ impl App {
         // certainly a mis-drag across the entire scrollback; the limit keeps
         // a runaway selection from pushing tens-of-MB onto the OS clipboard.
         const MAX_COPY_BYTES: usize = 16 * 1024 * 1024;
-        let Some(session) = self.tabs.get(self.active_tab) else { return };
-        let Some(text) = session.selection_text() else { return };
+        let Some(session) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let Some(text) = session.selection_text() else {
+            return;
+        };
         if text.len() > MAX_COPY_BYTES {
             log::warn!(
                 "selection is {} bytes; refusing to copy more than {} bytes to the clipboard",
@@ -166,7 +172,9 @@ impl App {
             );
             return;
         }
-        let Some(cb) = self.clipboard.as_mut() else { return };
+        let Some(cb) = self.clipboard.as_mut() else {
+            return;
+        };
         if let Err(e) = cb.set_text(text) {
             log::warn!("clipboard set_text: {e}");
         }
@@ -222,7 +230,9 @@ impl App {
     /// cursor was over. The cell is returned so the caller can debounce: if it
     /// matches the last computed cell, the regex scan can be skipped.
     fn compute_hover_url(&mut self) -> (Option<UrlMatch>, Option<(usize, usize)>) {
-        let Some(gfx) = self.gfx.as_ref() else { return (None, None) };
+        let Some(gfx) = self.gfx.as_ref() else {
+            return (None, None);
+        };
         let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
         let Some((line, col, _)) = gfx.cell_at(
             self.cursor_pos.0 as f32,
@@ -247,8 +257,12 @@ impl App {
     }
 
     fn paste(&mut self) {
-        let Some(session) = self.tabs.get(self.active_tab) else { return };
-        let Some(cb) = self.clipboard.as_mut() else { return };
+        let Some(session) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let Some(cb) = self.clipboard.as_mut() else {
+            return;
+        };
         let text = match cb.get_text() {
             Ok(t) => t,
             Err(e) => {
@@ -334,7 +348,9 @@ impl ApplicationHandler<WakeEvent> for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(window) = self.window.clone() else { return };
+        let Some(window) = self.window.clone() else {
+            return;
+        };
         if self.gfx.is_none() {
             return;
         }
@@ -355,8 +371,7 @@ impl ApplicationHandler<WakeEvent> for App {
                 let term = self.tabs.get(active_tab);
                 let hover_url = self.hover_url.as_ref();
                 let Some(gfx) = self.gfx.as_mut() else { return };
-                if let Err(e) =
-                    gfx.render(term, &self.tabs, active_tab, TAB_BAR_HEIGHT, hover_url)
+                if let Err(e) = gfx.render(term, &self.tabs, active_tab, TAB_BAR_HEIGHT, hover_url)
                 {
                     log::error!("render error: {e}");
                 }
@@ -410,7 +425,9 @@ impl ApplicationHandler<WakeEvent> for App {
                     }
                     None => {}
                 }
-                let Some(session) = self.tabs.get(self.active_tab) else { return };
+                let Some(session) = self.tabs.get(self.active_tab) else {
+                    return;
+                };
                 let term_mode = input::TermKeyMode {
                     app_cursor: session.app_cursor_mode(),
                 };
@@ -429,7 +446,9 @@ impl ApplicationHandler<WakeEvent> for App {
                 self.cursor_pos = (position.x, position.y);
                 if self.selecting {
                     let Some(gfx) = self.gfx.as_ref() else { return };
-                    let Some(session) = self.tabs.get(self.active_tab) else { return };
+                    let Some(session) = self.tabs.get(self.active_tab) else {
+                        return;
+                    };
                     let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
                     if let Some((line, col, right)) = gfx.cell_at(
                         position.x as f32,
@@ -491,13 +510,9 @@ impl ApplicationHandler<WakeEvent> for App {
                 // Click inside the grid begins (or replaces) a selection.
                 if let Some(session) = self.tabs.get(self.active_tab) {
                     let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
-                    if let Some((line, col, right)) = gfx.cell_at(
-                        x_px as f32,
-                        y_px as f32,
-                        TAB_BAR_HEIGHT,
-                        cols,
-                        lines,
-                    ) {
+                    if let Some((line, col, right)) =
+                        gfx.cell_at(x_px as f32, y_px as f32, TAB_BAR_HEIGHT, cols, lines)
+                    {
                         session.selection_start(line, col, right);
                         self.selecting = true;
                         window.request_redraw();
@@ -512,7 +527,9 @@ impl ApplicationHandler<WakeEvent> for App {
                 self.selecting = false;
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let Some(session) = self.tabs.get(self.active_tab) else { return };
+                let Some(session) = self.tabs.get(self.active_tab) else {
+                    return;
+                };
                 let Some(gfx) = self.gfx.as_ref() else { return };
                 let scale = window.scale_factor() as f32;
                 let (_, cell_h) = gfx.cell_dims_logical();
@@ -705,7 +722,9 @@ impl App {
             return;
         }
         let Some(gfx) = self.gfx.as_mut() else { return };
-        let Some(window) = self.window.as_ref() else { return };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
         self.config.font_size = size;
         let line_height = (size * 1.25).round();
         gfx.set_font_metrics(size, line_height);
@@ -720,7 +739,9 @@ impl App {
 #[cfg(unix)]
 impl App {
     fn drain_debug_requests(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(rx) = self.debug_rx.as_ref() else { return };
+        let Some(rx) = self.debug_rx.as_ref() else {
+            return;
+        };
         // try_iter cuts off as soon as the channel is empty so we don't block.
         let pending: Vec<debug_ipc::PendingRequest> = rx.try_iter().collect();
         for req in pending {

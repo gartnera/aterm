@@ -236,9 +236,7 @@ fn load_value(path: &std::path::Path, depth: usize) -> Option<toml::Value> {
 
 fn take_imports(value: &mut toml::Value) -> Vec<String> {
     let mut out = Vec::new();
-    let top_level = value
-        .as_table_mut()
-        .and_then(|t| t.remove("import"));
+    let top_level = value.as_table_mut().and_then(|t| t.remove("import"));
     let nested = value
         .get_mut("general")
         .and_then(|g| g.as_table_mut())
@@ -382,7 +380,10 @@ fn apply_ansi(pal: &mut AnsiPalette, raw: Option<RawAnsi>) {
 
 fn parse_hex(s: &str) -> Option<[u8; 3]> {
     let s = s.trim();
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix('#')).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix('#'))
+        .unwrap_or(s);
     // Accept #RRGGBB and #RRGGBBAA; alpha is discarded since the renderer
     // doesn't compose translucent colors.
     if s.len() != 6 && s.len() != 8 {
@@ -473,13 +474,12 @@ mod tests {
         got.sort();
         assert_eq!(got, vec!["a.toml".to_string(), "b.toml".to_string()]);
         assert!(v.as_table().unwrap().get("import").is_none());
-        assert!(
-            v.get("general")
-                .unwrap()
-                .as_table()
-                .unwrap()
-                .get("import")
-                .is_none()
-        );
+        assert!(v
+            .get("general")
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .get("import")
+            .is_none());
     }
 }

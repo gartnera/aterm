@@ -107,7 +107,10 @@ fn push_bg_quad(
     // Linearize: the surface is sRGB, so the fragment shader output is
     // treated as linear and gamma-corrected on store. Passing raw
     // sRGB/255 values made cell backgrounds visibly over-saturated.
-    quads.push(Quad { rect: [x, y_px, w, cell_h_px], color: linear_rgba(bg) });
+    quads.push(Quad {
+        rect: [x, y_px, w, cell_h_px],
+        color: linear_rgba(bg),
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -123,7 +126,10 @@ fn push_underline_quad(
 ) {
     let x = PAD_X * scale + start_col as f32 * cell_w_px;
     let w = (end_col - start_col) as f32 * cell_w_px;
-    quads.push(Quad { rect: [x, y_px, w, h_px], color: linear_rgba(fg) });
+    quads.push(Quad {
+        rect: [x, y_px, w, h_px],
+        color: linear_rgba(fg),
+    });
 }
 
 fn hover_url_covers(spans: &[UrlSpan], row: usize, col: usize) -> bool {
@@ -133,7 +139,9 @@ fn hover_url_covers(spans: &[UrlSpan], row: usize, col: usize) -> bool {
 }
 
 fn cell_in_selection(snap: &GridSnapshot, row: usize, col: usize) -> bool {
-    let Some(sel) = snap.selection else { return false };
+    let Some(sel) = snap.selection else {
+        return false;
+    };
     if sel.is_block {
         return row >= sel.start_line
             && row <= sel.end_line
@@ -196,7 +204,10 @@ fn build_row_text<'a>(
         if cell.italic {
             attrs = attrs.style(glyphon::Style::Italic);
         }
-        spans.push(RowSpan { range: start..end, attrs });
+        spans.push(RowSpan {
+            range: start..end,
+            attrs,
+        });
     }
     (text, spans)
 }
@@ -216,7 +227,13 @@ fn measure_cell_width(
         let metrics = Metrics::new(font_size, line_height);
         let mut buf = Buffer::new(fs, metrics);
         buf.set_size(fs, Some(1000.0), Some(line_height + 4.0));
-        buf.set_text(fs, text, &Attrs::new().family(family), Shaping::Advanced, None);
+        buf.set_text(
+            fs,
+            text,
+            &Attrs::new().family(family),
+            Shaping::Advanced,
+            None,
+        );
         buf.shape_until_scroll(fs, false);
         buf.layout_runs()
             .flat_map(|run| run.glyphs.iter())
@@ -290,7 +307,9 @@ impl Gfx {
         let bg = colors.background;
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window.clone()).expect("create surface");
+        let surface = instance
+            .create_surface(window.clone())
+            .expect("create surface");
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
@@ -417,7 +436,6 @@ impl Gfx {
         let frac = col_f - col_floor;
         Some((line, col, frac >= 0.5))
     }
-
 
     /// Cell dimensions in *logical* pixels (pre-scale-factor).
     pub fn cell_dims_logical(&self) -> (f32, f32) {
@@ -593,9 +611,7 @@ impl Gfx {
         let bar_w_px = (width as f32 - 2.0 * bar_inset_x).max(0.0);
         let bar_x = bar_inset_x;
         let bar_y = (height as f32 - bar_h_px - bar_inset_bottom).max(0.0);
-        let usable_chars = ((bar_w_px - 2.0 * bar_pad_x) / cell_w_px)
-            .floor()
-            .max(1.0) as usize;
+        let usable_chars = ((bar_w_px - 2.0 * bar_pad_x) / cell_w_px).floor().max(1.0) as usize;
         let display = truncate_with_ellipsis(&url.uri, usable_chars);
 
         self.quad_scratch.push(Quad {
@@ -638,7 +654,8 @@ impl Gfx {
     ) -> Result<(), String> {
         let width = self.surface_config.width;
         let height = self.surface_config.height;
-        self.viewport.update(&self.queue, Resolution { width, height });
+        self.viewport
+            .update(&self.queue, Resolution { width, height });
 
         let scale = self.window.scale_factor() as f32;
         let cell_w_px = self.cell_width_logical * scale;
@@ -669,8 +686,8 @@ impl Gfx {
             let default_bg = snap.bg;
             for (row_idx, row) in snap.cells.iter().enumerate() {
                 let y = top_offset_px + row_idx as f32 * cell_h_px;
-                let cursor_col = (snap.cursor_visible && snap.cursor_line == row_idx)
-                    .then_some(snap.cursor_col);
+                let cursor_col =
+                    (snap.cursor_visible && snap.cursor_line == row_idx).then_some(snap.cursor_col);
                 let mut run: Option<(usize, [u8; 3])> = None;
                 for (col, cell) in row.iter().enumerate() {
                     let is_cursor = Some(col) == cursor_col;
@@ -876,7 +893,8 @@ impl Gfx {
             return Ok(());
         }
 
-        self.quads.upload(&self.device, &self.queue, width, height, &self.quad_scratch);
+        self.quads
+            .upload(&self.device, &self.queue, width, height, &self.quad_scratch);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -896,7 +914,9 @@ impl Gfx {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frame pass"),
@@ -1006,8 +1026,16 @@ mod tests {
     #[test]
     fn hover_url_covers_matches_only_inside_spans() {
         let spans = vec![
-            UrlSpan { line: 1, start_col: 2, end_col: 5 },
-            UrlSpan { line: 3, start_col: 0, end_col: 9 },
+            UrlSpan {
+                line: 1,
+                start_col: 2,
+                end_col: 5,
+            },
+            UrlSpan {
+                line: 3,
+                start_col: 0,
+                end_col: 9,
+            },
         ];
         assert!(!hover_url_covers(&spans, 0, 3));
         assert!(!hover_url_covers(&spans, 1, 1));
