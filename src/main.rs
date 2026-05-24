@@ -18,6 +18,8 @@ mod input;
 
 mod binding;
 mod config;
+#[cfg(unix)]
+mod debug_ipc;
 mod gfx;
 mod quad;
 mod terminal;
@@ -58,10 +60,16 @@ struct App {
     /// Current window title — we only call set_title when the active tab's
     /// title actually changes, to avoid waking the window server every frame.
     window_title: String,
+    /// Pending debug-IPC requests from the optional Unix socket. None unless
+    /// `ATERM_DEBUG_SOCK` was set at startup.
+    #[cfg(unix)]
+    debug_rx: Option<crossbeam_channel::Receiver<debug_ipc::PendingRequest>>,
 }
 
 impl App {
     fn new(config: Config, proxy: EventLoopProxy<WakeEvent>) -> Self {
+        #[cfg(unix)]
+        let debug_rx = debug_ipc::start_if_enabled(proxy.clone());
         Self {
             config,
             proxy,
@@ -81,6 +89,8 @@ impl App {
             cursor_icon: CursorIcon::Default,
             last_hover_cell: None,
             window_title: String::new(),
+            #[cfg(unix)]
+            debug_rx,
         }
     }
 
@@ -524,6 +534,10 @@ impl ApplicationHandler<WakeEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: WakeEvent) {
+        // Handle any debug-IPC requests first so tests see fresh state.
+        #[cfg(unix)]
+        self.drain_debug_requests(event_loop);
+
         // The PTY thread woke us; drain its events and ask for a redraw if
         // any tab actually produced new content.
         let mut wake = false;
@@ -699,6 +713,126 @@ impl App {
         let (cell_w_px, cell_h_px) = cell_dims_px(gfx, window);
         for tab in &mut self.tabs {
             tab.resize(cols, lines, cell_w_px, cell_h_px);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl App {
+    fn drain_debug_requests(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(rx) = self.debug_rx.as_ref() else { return };
+        // try_iter cuts off as soon as the channel is empty so we don't block.
+        let pending: Vec<debug_ipc::PendingRequest> = rx.try_iter().collect();
+        for req in pending {
+            let resp = self.handle_debug(event_loop, req.request);
+            let _ = req.reply.send(resp);
+        }
+    }
+
+    fn handle_debug(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        req: debug_ipc::Request,
+    ) -> debug_ipc::Response {
+        use debug_ipc::{Request, Response};
+        match req {
+            Request::SnapshotText => match self.tabs.get(self.active_tab) {
+                Some(t) => {
+                    let lines = t.snapshot_text();
+                    Response::ok_data(serde_json::json!({ "lines": lines }))
+                }
+                None => Response::err("no active tab"),
+            },
+            Request::Tabs => {
+                let tabs: Vec<_> = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        serde_json::json!({
+                            "index": i,
+                            "title": t.title(),
+                            "active": i == self.active_tab,
+                        })
+                    })
+                    .collect();
+                Response::ok_data(serde_json::json!({ "tabs": tabs }))
+            }
+            Request::Title => Response::ok_data(serde_json::json!({
+                "title": self.window_title,
+            })),
+            Request::TypeBytes { bytes } => match self.tabs.get(self.active_tab) {
+                Some(t) => {
+                    t.scroll(Scroll::Bottom);
+                    t.send_input(bytes);
+                    Response::ok_empty()
+                }
+                None => Response::err("no active tab"),
+            },
+            Request::CreateTab => {
+                let before = self.tabs.len();
+                self.spawn_tab();
+                if let Some(w) = self.window.clone() {
+                    self.sync_window_title(&w);
+                    w.request_redraw();
+                }
+                Response::ok_data(serde_json::json!({
+                    "created": self.tabs.len() > before,
+                    "active": self.active_tab,
+                }))
+            }
+            Request::CloseTab => {
+                self.close_active_tab(event_loop);
+                if let Some(w) = self.window.clone() {
+                    self.sync_window_title(&w);
+                    w.request_redraw();
+                }
+                Response::ok_data(serde_json::json!({
+                    "tabs_remaining": self.tabs.len(),
+                }))
+            }
+            Request::SelectTab { index } => {
+                if index >= self.tabs.len() {
+                    return Response::err(format!(
+                        "tab index {index} out of range (have {})",
+                        self.tabs.len()
+                    ));
+                }
+                self.select_tab(index);
+                if let Some(w) = self.window.clone() {
+                    self.sync_window_title(&w);
+                    w.request_redraw();
+                }
+                Response::ok_data(serde_json::json!({ "active": self.active_tab }))
+            }
+            Request::FontSize { delta } => {
+                self.adjust_font_size(delta);
+                Response::ok_data(serde_json::json!({
+                    "font_size": self.config.font_size,
+                }))
+            }
+            Request::FontSizeReset => {
+                self.reset_font_size();
+                Response::ok_data(serde_json::json!({
+                    "font_size": self.config.font_size,
+                }))
+            }
+            Request::HoverUrl { row, col, ctrl } => {
+                let Some(session) = self.tabs.get(self.active_tab) else {
+                    return Response::err("no active tab");
+                };
+                let url = if ctrl {
+                    self.url_regex
+                        .as_mut()
+                        .and_then(|re| session.url_at(re, row, col))
+                } else {
+                    session.osc8_at(row, col)
+                };
+                match url {
+                    Some(u) => Response::ok_data(serde_json::json!({ "uri": u.uri })),
+                    None => Response::ok_data(serde_json::Value::Null),
+                }
+            }
         }
     }
 }

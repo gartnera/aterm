@@ -589,6 +589,26 @@ impl TerminalSession {
         }
     }
 
+    /// Snapshot the visible viewport as plain text — one string per row, with
+    /// trailing spaces trimmed. Wide-char spacer slots are dropped so two-col
+    /// glyphs appear once. Used by the debug IPC for assertions in tests.
+    pub fn snapshot_text(&self) -> Vec<String> {
+        let snap = self.snapshot();
+        snap.cells
+            .iter()
+            .map(|row| {
+                let mut s: String = row
+                    .iter()
+                    .filter(|c| c.ch != '\0')
+                    .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+                    .collect();
+                let trimmed = s.trim_end().len();
+                s.truncate(trimmed);
+                s
+            })
+            .collect()
+    }
+
     /// Drain any pending alacritty events. Returns whether a redraw is needed.
     pub fn pump_events(&mut self) -> bool {
         let mut wake = false;
