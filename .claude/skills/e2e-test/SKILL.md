@@ -1,6 +1,6 @@
 ---
 name: e2e-test
-description: End-to-end testing for aterm. Primary path is Rust integration tests under tests/integration.rs that drive aterm through its debug IPC socket — use these for any assertion about behavior (PTY output, tab state, OSC titles, URL detection, font size, etc.). Use this skill when adding a new integration test, debugging a failing one, or doing ad-hoc poking via scripts/e2e.sh.
+description: End-to-end testing for aterm. Primary path is Rust integration tests under tests/integration.rs that drive aterm through its debug IPC socket — use these for any assertion about behavior (PTY output, tab state, OSC titles, URL detection, font size, etc.). INVOKE this skill BEFORE running `cargo test --test integration` or any aterm test under Xvfb — even if you only intend to run existing tests, not write new ones. It documents the prerequisites (Xvfb + libxkbcommon-x11 + Mesa, installable via `scripts/e2e.sh setup` or the Dockerfile), the canonical runner (`scripts/test-docker.sh`), and the native-Linux fallback (`DISPLAY=:99 cargo test --test integration`). If integration tests fail with "debug socket did not appear", "XOpenDisplayFailed", or a missing `libxkbcommon-x11.so.0`, the environment isn't set up — invoke this skill and follow the setup steps instead of declaring the failure environmental and skipping.
 ---
 
 # E2E testing for aterm
@@ -69,6 +69,31 @@ DISPLAY=:99 cargo test --test integration
 
 Without an X display the tests no-op via `require_display!()` so plain
 `cargo test` still passes on machines without Xvfb.
+
+### First-run setup on a fresh machine (or remote container)
+
+If `cargo test --test integration` panics with `XOpenDisplayFailed`,
+`libxkbcommon-x11.so.0: cannot open shared object file`, or
+`aterm debug socket did not appear` — the runtime deps aren't installed
+and/or Xvfb isn't running. This is **not** an environmental failure
+to skip past; do this instead:
+
+```
+# 1. Install Xvfb + libxkbcommon-x11 + Mesa software Vulkan (one-shot, needs root).
+sudo scripts/e2e.sh setup
+
+# 2. Boot Xvfb on :99 (background; openbox + a "ready" log come for free).
+scripts/e2e.sh start && scripts/e2e.sh stop   # leaves Xvfb running, kills the ad-hoc aterm
+
+# 3. Run the suite.
+DISPLAY=:99 cargo test --test integration --release
+```
+
+Inside a remote sandbox where Docker isn't available, the
+`scripts/e2e.sh setup` path is the supported way to install the same
+package list the Dockerfile uses. Don't skip the integration suite just
+because Docker isn't present — installing the apt packages takes ~30s
+and the tests run in well under a minute after that.
 
 ### CI
 
