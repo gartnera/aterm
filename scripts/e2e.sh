@@ -19,6 +19,8 @@
 #   scripts/e2e.sh title                      # print the current window title
 #   scripts/e2e.sh log [N]                    # tail aterm.log (default 30 lines)
 #   scripts/e2e.sh state                      # print stored runtime state
+#   scripts/e2e.sh ipc <cmd> [k=v ...]         # send a JSON request to the debug socket
+#   scripts/e2e.sh ipc raw '<json>'            # send a raw JSON request
 #   scripts/e2e.sh stop                       # tear down
 #   scripts/e2e.sh restart                    # stop + start
 
@@ -31,6 +33,7 @@ SCREEN_SIZE="${SCREEN_SIZE:-1280x800x24}"
 WIN_SIZE="${WIN_SIZE:-900x600}"
 ATERM_BIN_DEFAULT="$(cd "$(dirname "$0")/.." && pwd)/target/release/aterm"
 ATERM_BIN="${ATERM_BIN:-$ATERM_BIN_DEFAULT}"
+DEBUG_SOCK="${ATERM_DEBUG_SOCK:-$E2E_DIR/aterm.sock}"
 
 mkdir -p "$E2E_DIR"
 
@@ -118,8 +121,11 @@ cmd_start() {
         sleep 1
     fi
 
-    # aterm with verbose logs so we can grep for hover/url behavior.
+    # aterm with verbose logs and the debug IPC socket enabled so callers can
+    # use `e2e.sh ipc ...` for semantic queries instead of pixel-poking.
+    rm -f "$DEBUG_SOCK"
     RUST_LOG="${RUST_LOG:-info,wgpu_core=warn,wgpu_hal=warn}" \
+    ATERM_DEBUG_SOCK="$DEBUG_SOCK" \
         nohup "$ATERM_BIN" >"$E2E_DIR/aterm.log" 2>&1 &
     ATERM_PID=$!
 
@@ -245,6 +251,50 @@ cmd_state() {
     [[ -f "$STATE" ]] && cat "$STATE" || echo "not running"
 }
 
+# Send one JSON request to the debug socket and print the response. Requires
+# Python for the line-delimited request/response handshake — no extra crates,
+# no nc compatibility headaches.
+cmd_ipc() {
+    if [[ $# -lt 1 ]]; then
+        echo "usage: e2e.sh ipc <cmd> [key=value ...]" >&2
+        echo "   or: e2e.sh ipc raw '<json>'" >&2
+        exit 2
+    fi
+    [[ -S "$DEBUG_SOCK" ]] || { echo "no debug socket at $DEBUG_SOCK (is aterm running?)" >&2; exit 1; }
+    local payload
+    if [[ "$1" == "raw" ]]; then
+        payload="$2"
+    else
+        local cmd="$1"; shift
+        payload="{\"cmd\":\"$cmd\""
+        for kv in "$@"; do
+            local k="${kv%%=*}" v="${kv#*=}"
+            # Pass-through numbers/booleans/JSON values; everything else as a string.
+            if [[ "$v" =~ ^(true|false|null|-?[0-9]+(\.[0-9]+)?|\[.*\]|\{.*\})$ ]]; then
+                payload+=",\"$k\":$v"
+            else
+                payload+=",\"$k\":\"$v\""
+            fi
+        done
+        payload+="}"
+    fi
+    python3 - "$DEBUG_SOCK" "$payload" <<'PY'
+import json, socket, sys
+sock_path, payload = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(15)
+s.connect(sock_path)
+s.sendall(payload.encode() + b"\n")
+buf = b""
+while not buf.endswith(b"\n"):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    buf += chunk
+print(buf.decode().rstrip("\n"))
+PY
+}
+
 cmd_restart() { cmd_stop || true; cmd_start; }
 
 main() {
@@ -262,7 +312,8 @@ main() {
         title) cmd_title "$@" ;;
         log)   cmd_log "$@" ;;
         state) cmd_state "$@" ;;
-        help|--help|-h|"") sed -n '2,40p' "$0" ;;
+        ipc)   cmd_ipc "$@" ;;
+        help|--help|-h|"") sed -n '2,42p' "$0" ;;
         *) echo "unknown subcommand: $sub" >&2; exit 2 ;;
     esac
 }

@@ -1,14 +1,22 @@
 ---
 name: e2e-test
-description: Drive aterm in a real window under Xvfb on Linux, then capture screenshots for visual inspection. Use when verifying terminal behavior that needs an actual window — input handling, rendering, tab/title sync, URL hover, font zoom, scroll. Skip for pure logic changes that `cargo test` covers. This skill does NOT perform automated screenshot diffing; the user inspects the captured PNGs.
+description: Drive aterm in a real window under Xvfb on Linux. Two driving modes: (1) the debug IPC socket — semantic JSON commands for typing, tab control, snapshot-as-text, hover-url; use this for assertions and `cargo test --test integration`. (2) xdotool synthetic input — use this when you specifically need to verify rendering or the input-event path; pairs with screenshot inspection (no automated diffing). Prefer IPC when both work.
 ---
 
 # E2E testing for aterm
 
-A headless harness for exercising aterm with synthetic keyboard/mouse events
-and grabbing PNGs of the actual window. Useful any time a change might
-affect what the user sees or how the window reacts to input, but cannot be
-verified by `cargo test` alone.
+Two complementary harnesses sit on top of the same Xvfb + openbox + aterm
+stack:
+
+| Concern | Use |
+|---|---|
+| "Does the PTY/state/title/URL detection behave correctly?" | **Debug IPC** (`scripts/e2e.sh ipc …` or Rust integration tests) |
+| "Does the actual rendering look right?" | **xdotool + screenshot** (`scripts/e2e.sh type/key/snap`) |
+| "Does an input event flow through winit correctly?" | xdotool path |
+| "Did I break tab-switching logic?" | IPC — far less brittle than coord-based clicks |
+
+IPC is the default. Screenshots are reserved for changes that touch render
+or input dispatch.
 
 ## When to invoke
 
@@ -21,16 +29,23 @@ verified by `cargo test` alone.
 Don't invoke for: pure parser tweaks, config-loading-only changes, CI/doc
 changes. Run `cargo test` for those.
 
-## Setup (once per fresh container)
+## Setup
+
+For the **Rust integration tests** you don't need to install anything —
+just run `./scripts/test-docker.sh`. Docker handles every dependency.
+
+For the **screenshot/xdotool driver** on a Linux host (when you actually
+want to look at the rendered window during development), install the
+apt deps once:
 
 ```
 sudo scripts/e2e.sh setup
 ```
 
-Installs apt packages: `xvfb`, `xdotool`, `imagemagick`, `openbox`,
-`x11-utils`, `libxkbcommon-x11-0`, `mesa-vulkan-drivers`. Without
-`mesa-vulkan-drivers` wgpu fails to create a surface under Xvfb; without
-`openbox` xdotool key events have nowhere to deliver to.
+Installs: `xvfb`, `xdotool`, `imagemagick`, `openbox`, `x11-utils`,
+`libxkbcommon-x11-0`, `mesa-vulkan-drivers`. Without `mesa-vulkan-drivers`
+wgpu fails to create a surface under Xvfb; without `openbox` xdotool key
+events have nowhere to deliver to.
 
 ## Lifecycle
 
@@ -101,6 +116,107 @@ scripts/e2e.sh hover -m ctrl -l url_preview 150 55
 
 scripts/e2e.sh stop
 ```
+
+## Debug IPC (preferred for assertions)
+
+`start` exports `ATERM_DEBUG_SOCK=/tmp/aterm-e2e/aterm.sock` automatically.
+aterm binds that socket and accepts line-delimited JSON requests of the
+form `{"cmd": "...", ...args}` → `{"ok": true, "data": {...}}` or
+`{"ok": false, "error": "..."}`.
+
+Commands (all snake_case):
+
+| Cmd | Args | Returns |
+|---|---|---|
+| `snapshot_text` | – | `{lines: [string]}` |
+| `tabs` | – | `{tabs: [{index, title, active}]}` |
+| `title` | – | `{title}` |
+| `type_bytes` | `bytes: [u8]` | – |
+| `create_tab` | – | `{created, active}` |
+| `close_tab` | – | `{tabs_remaining}` |
+| `select_tab` | `index: usize` | `{active}` |
+| `font_size` | `delta: f32` | `{font_size}` |
+| `font_size_reset` | – | `{font_size}` |
+| `hover_url` | `row, col, ctrl` | `{uri}` or `null` |
+
+From the shell:
+
+```
+scripts/e2e.sh ipc snapshot_text
+scripts/e2e.sh ipc type_bytes bytes='[101,99,104,111,13]'   # "echo\r"
+scripts/e2e.sh ipc create_tab
+scripts/e2e.sh ipc select_tab index=0
+scripts/e2e.sh ipc hover_url row=2 col=10 ctrl=true
+scripts/e2e.sh ipc raw '{"cmd":"font_size","delta":2}'
+```
+
+The script auto-coerces args that look like numbers, booleans, or JSON
+arrays; everything else is sent as a string.
+
+## Rust integration tests
+
+`tests/integration.rs` drives the IPC from Rust. The **preferred** way to
+run them — and the only way that works on macOS — is in Docker:
+
+```
+./scripts/test-docker.sh                    # integration tests only (default)
+./scripts/test-docker.sh --                 # ALL tests (unit + integration)
+./scripts/test-docker.sh --test integration url_regex_matches_printed_url
+```
+
+The container ships Xvfb + Mesa's software Vulkan driver, so it doesn't
+need any GPU passthrough. Cargo caches are kept in named Docker volumes
+(`aterm-cargo-cache`, `aterm-cargo-target`) so repeated runs are fast.
+Failure screenshots are bind-mounted out to `./target/test-artifacts/`.
+
+To run directly on a Linux host with an existing X server:
+
+```
+DISPLAY=:99 cargo test --test integration
+```
+
+Without an X display the tests no-op via `require_display!()` so a plain
+`cargo test` still passes on machines without Xvfb.
+
+### Failure screenshots
+
+When an integration test panics, `AtermTest::drop` snapshots the X root
+window via `import` and writes it to
+`$ATERM_TEST_ARTIFACTS/<test_name>_failure.png` (default
+`target/test-artifacts/`). The path is printed to stderr right above the
+panic message, so CI logs surface it. In Docker the artifacts directory
+is bind-mounted to the host so you can open the PNGs after the run.
+
+You can also screenshot mid-test from a successful path:
+
+```rust
+let path = t.screenshot("after_typing");
+// returns Option<PathBuf>; useful for visually verifying a scenario
+```
+
+The scaffolding in `tests/common/mod.rs` exposes an `AtermTest` helper
+that spawns a fresh aterm with its own socket, exposes `snapshot_text()`,
+`type_line()`, `tabs()`, `create_tab()`, `wait_for_text(needle)`, etc.,
+and kills the child on drop. Each test gets a clean process — no shared
+scrollback or tab state across tests.
+
+Write a new test by copying the pattern in `tests/integration.rs`:
+
+```rust
+#[test]
+fn my_scenario() {
+    require_display!();
+    let mut t = AtermTest::spawn();
+    t.type_line("echo specific-output");
+    t.wait_for_text("specific-output");
+    let lines = t.snapshot_text();
+    assert!(lines.iter().any(|l| l.contains("specific-output")));
+}
+```
+
+Prefer `wait_for_text` over `thread::sleep` — it polls the IPC up to a
+5s deadline and panics with the visible grid attached if the text never
+appears.
 
 ## Grid coordinates cheat-sheet
 

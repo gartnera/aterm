@@ -1,0 +1,32 @@
+# Image for running aterm's integration tests headlessly.
+#
+# Built and invoked by scripts/test-docker.sh. The image ships Xvfb +
+# openbox + Mesa's software Vulkan driver so the test binary can create a
+# real wgpu surface without any GPU passthrough — works the same on a
+# macOS host, a Linux dev machine, or CI.
+
+FROM rust:1.85-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        xvfb xdotool imagemagick openbox x11-utils \
+        libxkbcommon-x11-0 libxkbcommon0 \
+        mesa-vulkan-drivers libvulkan1 \
+        ca-certificates pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+
+# Defaults for inside-container test invocations. The host wrapper bind-
+# mounts /artifacts to a path on the host so failure screenshots survive
+# the container.
+ENV DISPLAY=:99
+ENV ATERM_TEST_ARTIFACTS=/artifacts
+ENV RUST_BACKTRACE=1
+
+COPY scripts/test-entrypoint.sh /usr/local/bin/test-entrypoint
+RUN chmod +x /usr/local/bin/test-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/test-entrypoint"]
+CMD ["--test", "integration"]
