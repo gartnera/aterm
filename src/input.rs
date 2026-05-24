@@ -2,8 +2,11 @@
 //!
 //! This intentionally covers the common case (printable text, named editor
 //! keys, Ctrl-letter, Alt-as-meta). It does not yet handle: keypad numeric
-//! mode, application cursor mode, mouse reporting, vt220 function keys with
-//! modifier encoding. Those can be added as needed.
+//! mode, vt220 function keys with modifier encoding. Those can be added as
+//! needed.
+//!
+//! Mouse-reporting encoding (DECSET 1000/1002/1003 with SGR 1006) lives at
+//! the bottom of this module.
 
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -195,6 +198,87 @@ fn encode_named(named: NamedKey, mode: TermKeyMode) -> Option<&'static [u8]> {
         NamedKey::F12 => b"\x1b[24~",
         _ => return None,
     })
+}
+
+/// One of the buttons the terminal will report. Wheel events are encoded
+/// as buttons too, so this enum covers both press/release and wheel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    /// Wheel up / scroll backward.
+    WheelUp,
+    /// Wheel down / scroll forward.
+    WheelDown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseAction {
+    /// Button has just been pressed.
+    Press,
+    /// Button has just been released.
+    Release,
+    /// Mouse moved while one or more buttons are held; encoded with the
+    /// motion bit set. Wheel buttons never produce Motion.
+    Motion,
+}
+
+/// Encode a mouse event in xterm's SGR (1006) format.
+///
+/// Layout: `CSI < Cb ; Cx ; Cy ; M` for press / motion, `m` for release.
+/// `Cb` is the base button code plus modifier flags plus the motion bit.
+/// `Cx`/`Cy` are 1-based cell coordinates clamped to `u16::MAX`.
+///
+/// Shift held during a press is intentionally *not* encoded — callers are
+/// expected to bypass mouse reporting entirely when Shift is down so the
+/// user can still select text out of a full-screen app. Ctrl and Alt are
+/// passed through as the conventional modifier bits.
+pub fn encode_mouse_sgr(
+    button: MouseButton,
+    action: MouseAction,
+    col: usize,
+    row: usize,
+    mods: ModifiersState,
+) -> Vec<u8> {
+    let base: u32 = match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+        MouseButton::WheelUp => 64,
+        MouseButton::WheelDown => 65,
+    };
+    let mut cb = base;
+    if action == MouseAction::Motion {
+        cb += 32;
+    }
+    if mods.alt_key() {
+        cb += 8;
+    }
+    if mods.control_key() {
+        cb += 16;
+    }
+    // SGR uses 1-based cells; cap at u16::MAX so we don't emit absurd ints
+    // for an out-of-grid pointer (it should already be clamped by caller).
+    let cx = (col.saturating_add(1)).min(u16::MAX as usize);
+    let cy = (row.saturating_add(1)).min(u16::MAX as usize);
+    let trailer = if action == MouseAction::Release {
+        'm'
+    } else {
+        'M'
+    };
+    format!("\x1b[<{cb};{cx};{cy}{trailer}").into_bytes()
+}
+
+/// Normalize text for paste delivery to a PTY. Converts CRLF/LF to CR
+/// (since terminals interpret CR as Enter) and strips any embedded
+/// bracketed-paste end markers — an attacker who can stage text on the
+/// clipboard would otherwise be able to break out of paste mode and have
+/// the rest of the payload treated as typed input by the receiving shell.
+pub fn normalize_paste(text: &str) -> String {
+    text.replace("\r\n", "\r")
+        .replace('\n', "\r")
+        .replace("\x1b[201~", "")
 }
 
 #[cfg(test)]
@@ -446,5 +530,103 @@ mod tests {
             no_app(),
         );
         assert_eq!(got, None);
+    }
+
+    #[test]
+    fn sgr_mouse_left_press_at_origin() {
+        // 1-based coords: cell (0,0) is reported as ;1;1.
+        let got = encode_mouse_sgr(
+            MouseButton::Left,
+            MouseAction::Press,
+            0,
+            0,
+            ModifiersState::empty(),
+        );
+        assert_eq!(got, b"\x1b[<0;1;1M");
+    }
+
+    #[test]
+    fn sgr_mouse_release_uses_lowercase_m() {
+        let got = encode_mouse_sgr(
+            MouseButton::Left,
+            MouseAction::Release,
+            10,
+            5,
+            ModifiersState::empty(),
+        );
+        assert_eq!(got, b"\x1b[<0;11;6m");
+    }
+
+    #[test]
+    fn sgr_mouse_motion_sets_motion_bit() {
+        // Motion adds 32 to the button code. Left + motion -> 32.
+        let got = encode_mouse_sgr(
+            MouseButton::Left,
+            MouseAction::Motion,
+            4,
+            4,
+            ModifiersState::empty(),
+        );
+        assert_eq!(got, b"\x1b[<32;5;5M");
+    }
+
+    #[test]
+    fn sgr_mouse_wheel_uses_64_and_65() {
+        let up = encode_mouse_sgr(
+            MouseButton::WheelUp,
+            MouseAction::Press,
+            0,
+            0,
+            ModifiersState::empty(),
+        );
+        assert_eq!(up, b"\x1b[<64;1;1M");
+        let down = encode_mouse_sgr(
+            MouseButton::WheelDown,
+            MouseAction::Press,
+            0,
+            0,
+            ModifiersState::empty(),
+        );
+        assert_eq!(down, b"\x1b[<65;1;1M");
+    }
+
+    #[test]
+    fn sgr_mouse_modifiers_add_bits() {
+        // Ctrl-click on left = base 0 + 16 = 16.
+        let got = encode_mouse_sgr(
+            MouseButton::Left,
+            MouseAction::Press,
+            0,
+            0,
+            ModifiersState::CONTROL,
+        );
+        assert_eq!(got, b"\x1b[<16;1;1M");
+        // Alt-click on right = base 2 + 8 = 10.
+        let got = encode_mouse_sgr(
+            MouseButton::Right,
+            MouseAction::Press,
+            2,
+            3,
+            ModifiersState::ALT,
+        );
+        assert_eq!(got, b"\x1b[<10;3;4M");
+    }
+
+    #[test]
+    fn normalize_paste_converts_line_endings() {
+        // CRLF and bare LF both collapse to CR (terminals interpret CR as Enter).
+        assert_eq!(normalize_paste("a\nb"), "a\rb");
+        assert_eq!(normalize_paste("a\r\nb"), "a\rb");
+        // Existing CRs pass through.
+        assert_eq!(normalize_paste("a\rb"), "a\rb");
+    }
+
+    #[test]
+    fn normalize_paste_strips_embedded_end_marker() {
+        // \x1b[201~ in clipboard contents would break out of bracketed-paste
+        // mode on the receiving side. The normalizer must remove it so the
+        // remaining bytes can't be reinterpreted as typed input.
+        let payload = "harmless\x1b[201~rm -rf /";
+        assert_eq!(normalize_paste(payload), "harmlessrm -rf /");
     }
 }
