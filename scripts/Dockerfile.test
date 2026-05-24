@@ -10,7 +10,7 @@ FROM rust:1.85-slim-bookworm
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        xvfb xdotool imagemagick openbox x11-utils \
+        xvfb imagemagick openbox x11-utils \
         libxkbcommon-x11-0 libxkbcommon0 \
         mesa-vulkan-drivers libvulkan1 \
         ca-certificates pkg-config \

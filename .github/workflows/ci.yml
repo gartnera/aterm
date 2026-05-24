@@ -65,11 +65,11 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
-      - name: Install X / Vulkan / xdotool deps
+      - name: Install X / Vulkan deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            xvfb xdotool imagemagick openbox x11-utils \
+            xvfb imagemagick openbox x11-utils \
             libxkbcommon-x11-0 libxkbcommon0 \
             mesa-vulkan-drivers libvulkan1
 
