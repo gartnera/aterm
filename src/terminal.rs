@@ -79,6 +79,17 @@ pub struct UrlMatch {
     pub spans: Vec<UrlSpan>,
 }
 
+#[cfg(target_os = "macos")]
+fn default_shell() -> &'static str {
+    "/bin/zsh"
+}
+#[cfg(not(target_os = "macos"))]
+fn default_shell() -> &'static str {
+    // /bin/sh is mandated by POSIX and present on every Linux distro and BSD.
+    // We avoid hardcoding bash/zsh because not every minimal install has them.
+    "/bin/sh"
+}
+
 /// URL regex borrowed from alacritty's hint mode defaults.
 const URL_REGEX_PATTERN: &str =
     "(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)\
@@ -299,19 +310,24 @@ impl TerminalSession {
 
         let mut pty_options = PtyOptions::default();
         // On macOS, alacritty defaults to `/usr/bin/login`, which the harness
-        // sandbox blocks. Explicitly use $SHELL (with a /bin/zsh fallback) so
-        // we spawn the shell directly without `login`.
-        let shell_path =
-            std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        // sandbox blocks. Explicitly use $SHELL so we spawn the shell directly
+        // without `login`. Fall back to a platform-appropriate shell that is
+        // virtually always present.
+        let shell_path = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default_shell().to_string());
         pty_options.shell = Some(Shell::new(shell_path, Vec::new()));
-        // Launchd-spawned processes (Finder/Spotlight/.app) inherit an empty
-        // TERM, leaving ncurses programs unable to initialize. Set it here so
-        // the shell works regardless of how aterm itself was launched.
+        // GUI-spawned processes (Finder/Spotlight/.app, .desktop launchers)
+        // inherit an empty TERM, leaving ncurses programs unable to initialize.
+        // Set it here so the shell works regardless of how aterm itself was
+        // launched.
         pty_options.env.insert("TERM".into(), "xterm-256color".into());
         pty_options.env.insert("COLORTERM".into(), "truecolor".into());
-        // Launchd starts the .app in `/`. If our cwd looks like a launchd
-        // default, start the shell in $HOME instead. When aterm was launched
-        // from a shell in a real directory, inherit that cwd as usual.
+        // GUI launchers (launchd on macOS, the desktop session on Linux) start
+        // the .app in `/`. If our cwd looks like that default, start the shell
+        // in $HOME instead. When aterm was launched from a shell in a real
+        // directory, inherit that cwd as usual.
         if std::env::current_dir().map(|p| p == std::path::Path::new("/")).unwrap_or(false) {
             if let Some(home) = dirs::home_dir() {
                 pty_options.working_directory = Some(home);
@@ -484,7 +500,9 @@ impl TerminalSession {
             cell_height,
         };
         let size = TermSize::new(cols as usize, lines as usize);
-        let _ = self.notifier.0.send(Msg::Resize(window_size));
+        if let Err(e) = self.notifier.0.send(Msg::Resize(window_size)) {
+            log::warn!("failed to notify PTY of resize: {e}");
+        }
         self.term.lock().resize(size);
     }
 

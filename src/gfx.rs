@@ -466,40 +466,20 @@ impl Gfx {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    pub fn render(
+    /// Build the tab strip: per-tab text segments, hit regions, and the
+    /// active-tab background quad. Returns the (x, baseline_y, default_color)
+    /// at which the tab text buffer should be drawn.
+    fn prepare_tab_bar(
         &mut self,
-        active: Option<&TerminalSession>,
         tabs: &[TerminalSession],
         active_idx: usize,
         tab_bar_height: f32,
-        hover_url: Option<&UrlMatch>,
-    ) -> Result<(), String> {
+        metrics: Metrics,
+    ) -> (f32, f32, Color) {
         let width = self.surface_config.width;
-        let height = self.surface_config.height;
-        self.viewport.update(&self.queue, Resolution { width, height });
-
         let scale = self.window.scale_factor() as f32;
         let cell_w_px = self.cell_width_logical * scale;
-        let cell_h_px = self.line_height * scale;
-        let metrics = Metrics::new(self.font_size * scale, self.line_height * scale);
 
-        // Snapshot the active terminal once outside the prepare call.
-        let snapshot = active.map(|t| t.snapshot());
-        let default_fg = snapshot
-            .as_ref()
-            .map(|s| Color::rgb(s.fg[0], s.fg[1], s.fg[2]))
-            .unwrap_or_else(|| Color::rgb(0xd0, 0xd0, 0xd0));
-
-        let quads = &mut self.quad_scratch;
-        quads.clear();
-        quads.push(Quad {
-            rect: [0.0, 0.0, width as f32, tab_bar_height * scale],
-            color: self.tab_theme.bar_bg,
-        });
-
-        let family_name = self.font_family.clone();
-
-        // ===== Tab bar text + hit regions + active-tab quad. =====
         // Distribute available width across tabs and truncate titles that
         // exceed their share. Each tab uses 2 chars for the marker plus the
         // title, separated by 3 spaces between tabs.
@@ -540,7 +520,7 @@ impl Gfx {
             let x1 = PAD_X * scale + chars_after as f32 * cell_w_px;
             self.tab_hit_regions.push((i, x0, x1));
             if i == active_idx {
-                quads.push(Quad {
+                self.quad_scratch.push(Quad {
                     rect: [x0 - 4.0, 0.0, (x1 - x0) + 8.0, tab_bar_height * scale],
                     color: self.tab_theme.active_bg,
                 });
@@ -551,44 +531,136 @@ impl Gfx {
             segments.push(("(no tabs)".into(), false));
         }
 
-        // Reuse the cached tab buffer.
-        if self.tab_buffer.is_none() {
-            self.tab_buffer = Some(Buffer::new(&mut self.font_system, metrics));
-        }
+        let buf = self
+            .tab_buffer
+            .get_or_insert_with(|| Buffer::new(&mut self.font_system, metrics));
+        buf.set_metrics(&mut self.font_system, metrics);
+        buf.set_size(
+            &mut self.font_system,
+            Some(width as f32),
+            Some(tab_bar_height * scale),
+        );
+        let family = family_of(&self.font_family);
         let active_fg = self.tab_theme.active_fg;
         let inactive_fg = self.tab_theme.inactive_fg;
-        {
-            let buf = self.tab_buffer.as_mut().unwrap();
-            buf.set_metrics(&mut self.font_system, metrics);
-            buf.set_size(
-                &mut self.font_system,
-                Some(width as f32),
-                Some(tab_bar_height * scale),
-            );
-            let family = family_of(&family_name);
-            let spans = segments.iter().map(|(text, active)| {
-                let fg = if *active { active_fg } else { inactive_fg };
-                (
-                    text.as_str(),
-                    Attrs::new()
-                        .family(family)
-                        .color(Color::rgb(fg[0], fg[1], fg[2])),
-                )
-            });
-            buf.set_rich_text(
-                &mut self.font_system,
-                spans,
-                &Attrs::new().family(family),
-                Shaping::Advanced,
-                None,
-            );
-            buf.shape_until_scroll(&mut self.font_system, false);
-        }
-        let tab_pos = (
+        let spans = segments.iter().map(|(text, active)| {
+            let fg = if *active { active_fg } else { inactive_fg };
+            (
+                text.as_str(),
+                Attrs::new()
+                    .family(family)
+                    .color(Color::rgb(fg[0], fg[1], fg[2])),
+            )
+        });
+        buf.set_rich_text(
+            &mut self.font_system,
+            spans,
+            &Attrs::new().family(family),
+            Shaping::Advanced,
+            None,
+        );
+        buf.shape_until_scroll(&mut self.font_system, false);
+
+        (
             PAD_X * scale,
             (tab_bar_height - self.line_height) * 0.5 * scale,
             Color::rgb(inactive_fg[0], inactive_fg[1], inactive_fg[2]),
+        )
+    }
+
+    /// Push the URL preview bar's background quad and prepare its text buffer.
+    /// Mirrors alacritty's hint-mode UX: while a URL is hovered we show the
+    /// full URI in a strip near the bottom of the window. Insets on the sides
+    /// and bottom keep the bar clear of the macOS rounded window corners and
+    /// any system shadow on the bottom edge.
+    fn prepare_url_bar(
+        &mut self,
+        hover_url: Option<&UrlMatch>,
+        width: u32,
+        height: u32,
+        metrics: Metrics,
+    ) -> Option<(f32, f32, Color)> {
+        let url = hover_url?;
+        let scale = self.window.scale_factor() as f32;
+        let cell_w_px = self.cell_width_logical * scale;
+        let cell_h_px = self.line_height * scale;
+
+        let bar_inset_x = 12.0 * scale;
+        let bar_inset_bottom = 8.0 * scale;
+        let bar_pad_x = 8.0 * scale;
+        let bar_pad_y = 3.0 * scale;
+        let bar_h_px = cell_h_px + 2.0 * bar_pad_y;
+        let bar_w_px = (width as f32 - 2.0 * bar_inset_x).max(0.0);
+        let bar_x = bar_inset_x;
+        let bar_y = (height as f32 - bar_h_px - bar_inset_bottom).max(0.0);
+        let usable_chars = ((bar_w_px - 2.0 * bar_pad_x) / cell_w_px)
+            .floor()
+            .max(1.0) as usize;
+        let display = truncate_with_ellipsis(&url.uri, usable_chars);
+
+        self.quad_scratch.push(Quad {
+            rect: [bar_x, bar_y, bar_w_px, bar_h_px],
+            color: self.tab_theme.bar_bg,
+        });
+
+        let buf = self
+            .url_bar_buffer
+            .get_or_insert_with(|| Buffer::new(&mut self.font_system, metrics));
+        buf.set_metrics(&mut self.font_system, metrics);
+        buf.set_size(&mut self.font_system, Some(bar_w_px), Some(bar_h_px));
+        let fg = self.tab_theme.active_fg;
+        let family = family_of(&self.font_family);
+        buf.set_text(
+            &mut self.font_system,
+            &display,
+            &Attrs::new()
+                .family(family)
+                .color(Color::rgb(fg[0], fg[1], fg[2])),
+            Shaping::Advanced,
+            None,
         );
+        buf.shape_until_scroll(&mut self.font_system, false);
+
+        Some((
+            bar_x + bar_pad_x,
+            bar_y + bar_pad_y,
+            Color::rgb(fg[0], fg[1], fg[2]),
+        ))
+    }
+
+    pub fn render(
+        &mut self,
+        active: Option<&TerminalSession>,
+        tabs: &[TerminalSession],
+        active_idx: usize,
+        tab_bar_height: f32,
+        hover_url: Option<&UrlMatch>,
+    ) -> Result<(), String> {
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        self.viewport.update(&self.queue, Resolution { width, height });
+
+        let scale = self.window.scale_factor() as f32;
+        let cell_w_px = self.cell_width_logical * scale;
+        let cell_h_px = self.line_height * scale;
+        let metrics = Metrics::new(self.font_size * scale, self.line_height * scale);
+
+        // Snapshot the active terminal once outside the prepare call.
+        let snapshot = active.map(|t| t.snapshot());
+        let default_fg = snapshot
+            .as_ref()
+            .map(|s| Color::rgb(s.fg[0], s.fg[1], s.fg[2]))
+            .unwrap_or_else(|| Color::rgb(0xd0, 0xd0, 0xd0));
+
+        self.quad_scratch.clear();
+        self.quad_scratch.push(Quad {
+            rect: [0.0, 0.0, width as f32, tab_bar_height * scale],
+            color: self.tab_theme.bar_bg,
+        });
+
+        let tab_pos = self.prepare_tab_bar(tabs, active_idx, tab_bar_height, metrics);
+        let family_name = self.font_family.clone();
+        let quads = &mut self.quad_scratch;
 
         // ===== Grid: background quads, cursor quad, row text buffers. =====
         let top_offset_px = (tab_bar_height + PAD_Y) * scale;
@@ -637,17 +709,18 @@ impl Gfx {
                     if row_len == 0 {
                         continue;
                     }
+                    let last = row_len.saturating_sub(1);
                     let (s, e) = if sel.is_block || sel.start_line == sel.end_line {
                         (sel.start_col, sel.end_col)
                     } else if row_idx == sel.start_line {
-                        (sel.start_col, row_len - 1)
+                        (sel.start_col, last)
                     } else if row_idx == sel.end_line {
                         (0, sel.end_col)
                     } else {
-                        (0, row_len - 1)
+                        (0, last)
                     };
-                    let s = s.min(row_len - 1);
-                    let e = e.min(row_len - 1);
+                    let s = s.min(last);
+                    let e = e.min(last);
                     let y = top_offset_px + row_idx as f32 * cell_h_px;
                     push_bg_quad(quads, scale, cell_w_px, cell_h_px, s, e + 1, y, snap.fg);
                 }
@@ -704,10 +777,16 @@ impl Gfx {
                 }
             }
 
-            // Grow the row-buffer pool as needed; reuse what we have.
-            while self.row_buffers.len() < snap.cells.len() {
-                self.row_buffers
-                    .push(Buffer::new(&mut self.font_system, metrics));
+            // Grow the row-buffer pool as needed; reuse what we have. Reserve
+            // up-front so a large jump (e.g. window maximize) doesn't trigger
+            // repeated Vec reallocations.
+            if self.row_buffers.len() < snap.cells.len() {
+                let extra = snap.cells.len() - self.row_buffers.len();
+                self.row_buffers.reserve_exact(extra);
+                for _ in 0..extra {
+                    self.row_buffers
+                        .push(Buffer::new(&mut self.font_system, metrics));
+                }
             }
             for (row_idx, row) in snap.cells.iter().enumerate() {
                 let buf = &mut self.row_buffers[row_idx];
@@ -735,55 +814,7 @@ impl Gfx {
         }
 
         // ===== Bottom URL preview bar. =====
-        // Mirrors alacritty's hint-mode UX: while a URL is hovered we show
-        // the full URI in a strip near the bottom of the window. Insets on
-        // the sides and bottom keep the bar clear of the macOS rounded
-        // window corners and any system shadow on the bottom edge.
-        let mut url_bar_pos: Option<(f32, f32, Color)> = None;
-        if let Some(url) = hover_url {
-            let bar_inset_x = 12.0 * scale;
-            let bar_inset_bottom = 8.0 * scale;
-            let bar_pad_x = 8.0 * scale;
-            let bar_pad_y = 3.0 * scale;
-            let bar_h_px = cell_h_px + 2.0 * bar_pad_y;
-            let bar_w_px = (width as f32 - 2.0 * bar_inset_x).max(0.0);
-            let bar_x = bar_inset_x;
-            let bar_y = (height as f32 - bar_h_px - bar_inset_bottom).max(0.0);
-            let usable_chars = ((bar_w_px - 2.0 * bar_pad_x) / cell_w_px)
-                .floor()
-                .max(1.0) as usize;
-            let display = truncate_with_ellipsis(&url.uri, usable_chars);
-
-            quads.push(Quad {
-                rect: [bar_x, bar_y, bar_w_px, bar_h_px],
-                color: self.tab_theme.bar_bg,
-            });
-
-            if self.url_bar_buffer.is_none() {
-                self.url_bar_buffer =
-                    Some(Buffer::new(&mut self.font_system, metrics));
-            }
-            let buf = self.url_bar_buffer.as_mut().unwrap();
-            buf.set_metrics(&mut self.font_system, metrics);
-            buf.set_size(&mut self.font_system, Some(bar_w_px), Some(bar_h_px));
-            let fg = self.tab_theme.active_fg;
-            let family = family_of(&family_name);
-            buf.set_text(
-                &mut self.font_system,
-                &display,
-                &Attrs::new()
-                    .family(family)
-                    .color(Color::rgb(fg[0], fg[1], fg[2])),
-                Shaping::Advanced,
-                None,
-            );
-            buf.shape_until_scroll(&mut self.font_system, false);
-            url_bar_pos = Some((
-                bar_x + bar_pad_x,
-                bar_y + bar_pad_y,
-                Color::rgb(fg[0], fg[1], fg[2]),
-            ));
-        }
+        let url_bar_pos = self.prepare_url_bar(hover_url, width, height, metrics);
 
         // ===== Build TextAreas borrowing from the cached buffers. =====
         let bounds = TextBounds {
@@ -830,17 +861,20 @@ impl Gfx {
             .chain(url_bar_area)
             .collect();
 
-        self.text_renderer
-            .prepare(
-                &self.device,
-                &self.queue,
-                &mut self.font_system,
-                &mut self.text_atlas,
-                &self.viewport,
-                text_areas,
-                &mut self.swash_cache,
-            )
-            .expect("prepare text");
+        if let Err(e) = self.text_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &mut self.font_system,
+            &mut self.text_atlas,
+            &self.viewport,
+            text_areas,
+            &mut self.swash_cache,
+        ) {
+            // PrepareError is non-fatal (typically "atlas full" when the
+            // viewport is enormous). Skip this frame and try again.
+            log::warn!("text prepare failed: {e:?}");
+            return Ok(());
+        }
 
         self.quads.upload(&self.device, &self.queue, width, height, &self.quad_scratch);
 
@@ -881,9 +915,12 @@ impl Gfx {
                 multiview_mask: None,
             });
             self.quads.render(&mut pass);
-            self.text_renderer
+            if let Err(e) = self
+                .text_renderer
                 .render(&self.text_atlas, &self.viewport, &mut pass)
-                .expect("render text");
+            {
+                log::warn!("text render failed: {e:?}");
+            }
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();

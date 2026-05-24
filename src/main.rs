@@ -52,6 +52,12 @@ struct App {
     hover_url: Option<UrlMatch>,
     /// Last cursor icon we set on the window, so we don't ask winit to repeat.
     cursor_icon: CursorIcon,
+    /// Last cell (line, col) the cursor was over when we computed `hover_url`.
+    /// Used to skip the URL regex scan on sub-cell mouse movement.
+    last_hover_cell: Option<(usize, usize)>,
+    /// Current window title — we only call set_title when the active tab's
+    /// title actually changes, to avoid waking the window server every frame.
+    window_title: String,
 }
 
 impl App {
@@ -73,6 +79,23 @@ impl App {
             url_regex: terminal::compile_url_regex(),
             hover_url: None,
             cursor_icon: CursorIcon::Default,
+            last_hover_cell: None,
+            window_title: String::new(),
+        }
+    }
+
+    /// Update the OS window title to match the active tab, if it differs from
+    /// what we last set. Called from any code path that may change which tab
+    /// is active or what its title is.
+    fn sync_window_title(&mut self, window: &Window) {
+        let new_title = self
+            .tabs
+            .get(self.active_tab)
+            .map(|t| t.title())
+            .unwrap_or("aterm");
+        if new_title != self.window_title {
+            window.set_title(new_title);
+            self.window_title = new_title.to_string();
         }
     }
 
@@ -148,7 +171,8 @@ impl App {
         let prev_uri = self.hover_url.as_ref().map(|u| u.uri.clone());
         let prev_spans = self.hover_url.as_ref().map(|u| u.spans.clone());
 
-        let new_url = self.compute_hover_url();
+        let (new_url, cell) = self.compute_hover_url();
+        self.last_hover_cell = cell;
 
         let icon = if new_url.is_some() && url_modifier_held(self.mods) {
             CursorIcon::Pointer
@@ -174,6 +198,7 @@ impl App {
     fn clear_hover_url(&mut self, window: &Window) {
         let had_url = self.hover_url.is_some();
         self.hover_url = None;
+        self.last_hover_cell = None;
         if self.cursor_icon != CursorIcon::Default {
             window.set_cursor(CursorIcon::Default);
             self.cursor_icon = CursorIcon::Default;
@@ -183,23 +208,32 @@ impl App {
         }
     }
 
-    fn compute_hover_url(&mut self) -> Option<UrlMatch> {
-        let gfx = self.gfx.as_ref()?;
+    /// Compute the URL under the cursor, along with the (line, col) cell the
+    /// cursor was over. The cell is returned so the caller can debounce: if it
+    /// matches the last computed cell, the regex scan can be skipped.
+    fn compute_hover_url(&mut self) -> (Option<UrlMatch>, Option<(usize, usize)>) {
+        let Some(gfx) = self.gfx.as_ref() else { return (None, None) };
         let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
-        let (line, col, _) = gfx.cell_at(
+        let Some((line, col, _)) = gfx.cell_at(
             self.cursor_pos.0 as f32,
             self.cursor_pos.1 as f32,
             TAB_BAR_HEIGHT,
             cols,
             lines,
-        )?;
-        let session = self.tabs.get(self.active_tab)?;
-        if url_modifier_held(self.mods) {
-            let regex = self.url_regex.as_mut()?;
-            session.url_at(regex, line, col)
+        ) else {
+            return (None, None);
+        };
+        let Some(session) = self.tabs.get(self.active_tab) else {
+            return (None, Some((line, col)));
+        };
+        let url = if url_modifier_held(self.mods) {
+            self.url_regex
+                .as_mut()
+                .and_then(|regex| session.url_at(regex, line, col))
         } else {
             session.osc8_at(line, col)
-        }
+        };
+        (url, Some((line, col)))
     }
 
     fn paste(&mut self) {
@@ -259,19 +293,28 @@ impl ApplicationHandler<WakeEvent> for App {
         self.gfx = Some(gfx);
 
         // Spawn an initial terminal tab sized to the current window.
-        let (cols, lines) = gfx_ref(&self.gfx).grid_for_window(TAB_BAR_HEIGHT);
-        let (cell_w_px, cell_h_px) = cell_dims_px(gfx_ref(&self.gfx), &window);
-        let session = TerminalSession::spawn(
+        let gfx = self.gfx.as_ref().expect("gfx just initialized");
+        let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+        let (cell_w_px, cell_h_px) = cell_dims_px(gfx, &window);
+        match TerminalSession::spawn(
             cols,
             lines,
             cell_w_px,
             cell_h_px,
             self.proxy.clone(),
             self.config.colors.clone(),
-        )
-        .expect("spawn terminal");
-        self.tabs.push(session);
-        self.active_tab = 0;
+        ) {
+            Ok(s) => {
+                self.tabs.push(s);
+                self.active_tab = 0;
+            }
+            Err(e) => {
+                log::error!("failed to spawn initial terminal: {e}");
+                event_loop.exit();
+                return;
+            }
+        }
+        self.sync_window_title(&window);
         window.request_redraw();
     }
 
@@ -288,7 +331,7 @@ impl ApplicationHandler<WakeEvent> for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                let gfx = self.gfx.as_mut().unwrap();
+                let Some(gfx) = self.gfx.as_mut() else { return };
                 gfx.resize(size);
                 let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
                 let (cell_w_px, cell_h_px) = cell_dims_px(gfx, &window);
@@ -301,7 +344,7 @@ impl ApplicationHandler<WakeEvent> for App {
                 let active_tab = self.active_tab;
                 let term = self.tabs.get(active_tab);
                 let hover_url = self.hover_url.as_ref();
-                let gfx = self.gfx.as_mut().unwrap();
+                let Some(gfx) = self.gfx.as_mut() else { return };
                 if let Err(e) =
                     gfx.render(term, &self.tabs, active_tab, TAB_BAR_HEIGHT, hover_url)
                 {
@@ -375,22 +418,37 @@ impl ApplicationHandler<WakeEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
                 if self.selecting {
-                    if let Some(session) = self.tabs.get(self.active_tab) {
-                        let gfx = self.gfx.as_ref().unwrap();
+                    let Some(gfx) = self.gfx.as_ref() else { return };
+                    let Some(session) = self.tabs.get(self.active_tab) else { return };
+                    let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+                    if let Some((line, col, right)) = gfx.cell_at(
+                        position.x as f32,
+                        position.y as f32,
+                        TAB_BAR_HEIGHT,
+                        cols,
+                        lines,
+                    ) {
+                        session.selection_update(line, col, right);
+                        window.request_redraw();
+                    }
+                } else {
+                    // Sub-cell mouse movement is common (every winit cursor
+                    // event); skip the OSC 8 lookup / URL regex scan when the
+                    // cursor is still in the same grid cell as last time.
+                    let cell = self.gfx.as_ref().and_then(|gfx| {
                         let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
-                        if let Some((line, col, right)) = gfx.cell_at(
+                        gfx.cell_at(
                             position.x as f32,
                             position.y as f32,
                             TAB_BAR_HEIGHT,
                             cols,
                             lines,
-                        ) {
-                            session.selection_update(line, col, right);
-                            window.request_redraw();
-                        }
+                        )
+                        .map(|(l, c, _)| (l, c))
+                    });
+                    if cell != self.last_hover_cell {
+                        self.refresh_hover_url(&window);
                     }
-                } else {
-                    self.refresh_hover_url(&window);
                 }
             }
             WindowEvent::MouseInput {
@@ -402,10 +460,11 @@ impl ApplicationHandler<WakeEvent> for App {
                 let y_px = self.cursor_pos.1;
                 let tab_bar_h_px = TAB_BAR_HEIGHT as f64 * scale;
                 let x_px = self.cursor_pos.0;
-                let gfx = self.gfx.as_ref().unwrap();
+                let Some(gfx) = self.gfx.as_ref() else { return };
                 if y_px <= tab_bar_h_px {
                     if let Some(idx) = gfx.tab_at_x(x_px as f32) {
                         self.select_tab(idx);
+                        self.sync_window_title(&window);
                         window.request_redraw();
                     }
                     return;
@@ -444,8 +503,8 @@ impl ApplicationHandler<WakeEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let Some(session) = self.tabs.get(self.active_tab) else { return };
+                let Some(gfx) = self.gfx.as_ref() else { return };
                 let scale = window.scale_factor() as f32;
-                let gfx = self.gfx.as_ref().unwrap();
                 let (_, cell_h) = gfx.cell_dims_logical();
                 let cell_h_px = (cell_h * scale).max(1.0);
                 let lines_delta = match delta {
@@ -494,16 +553,15 @@ impl ApplicationHandler<WakeEvent> for App {
             self.active_tab = self.tabs.len() - 1;
         }
 
-        if wake {
-            if let Some(w) = &self.window {
+        if let Some(w) = self.window.clone() {
+            // Mirror the active tab's title (set via OSC 0/2) to the OS
+            // window title so it appears in window-list switchers.
+            self.sync_window_title(&w);
+            if wake {
                 w.request_redraw();
             }
         }
     }
-}
-
-fn gfx_ref(opt: &Option<Gfx>) -> &Gfx {
-    opt.as_ref().expect("gfx initialized")
 }
 
 /// Modifier that turns the cursor into a link-opener. Cmd on macOS, Ctrl
@@ -601,7 +659,8 @@ impl App {
             // we somehow get here, treat it as a no-op.
             Action::ReceiveChar => {}
         }
-        if let Some(w) = &self.window {
+        if let Some(w) = self.window.clone() {
+            self.sync_window_title(&w);
             w.request_redraw();
         }
     }
