@@ -16,12 +16,40 @@ themselves.
 2. **Make the change** (edit `src/gfx.rs` or whichever file).
 3. **Snapshot the new state** with the *same* scene, same window size, same
    IPC calls — anything that drifts makes the diff non-comparable.
-4. **Verify:** `cargo fmt --check`, `cargo clippy --release --bin aterm`, and
-   `DISPLAY=:99 cargo test --release --test integration`. The e2e-test
-   skill is the source of truth for the harness.
-5. **Host the screenshots** on a `pr-assets/<topic>` orphan branch — see
+4. **Run the integration tests.** `DISPLAY=:99 cargo test --release --test
+   integration` from `/home/user/aterm`. UI code paths are exercised by
+   tests in `tests/integration.rs` (tab create/close/select, font-size
+   clamp, snapshot grid, URL hover) — a render-layer regression usually
+   surfaces here first, and CI runs the same command on every push so
+   green locally before pushing saves a round-trip. The e2e-test skill
+   is the source of truth for the harness.
+5. **Update or add an integration test** if the change introduces
+   observable behavior — see "Updating tests" below.
+6. **Lint:** `cargo fmt --check` and `cargo clippy --release --bin aterm`.
+7. **Host the screenshots** on a `pr-assets/<topic>` orphan branch — see
    below. Do NOT commit PNGs to the PR branch.
-6. **Open the PR**, embedding both screenshots via raw GitHub URLs.
+8. **Open the PR**, embedding both screenshots via raw GitHub URLs.
+
+## Updating tests
+
+A UI change that adds something observable through the debug IPC should
+grow an assertion in `tests/integration.rs`. Rough guide:
+
+| Change | Test it with |
+|---|---|
+| New tab marker / title format / truncation | `tabs()` (titles + active flag) |
+| Hover, click region, URL detection | `hover_url(row, col, ctrl)` |
+| Color / cursor / cell state | `snapshot_text()` and/or specific `wait_for_text` |
+| Window/OSC title | `title()` |
+| Font-size step or default | `font_size(delta)` / `font_size_reset()` |
+
+Pure restyling that doesn't change anything observable over IPC (a color
+swap, a quad offset, a stripe under the active tab) doesn't need a new
+test — but the existing tests should still pass unchanged. If you find
+yourself needing to *loosen* an assertion to make the test pass, stop
+and reconsider whether the visual change broke a contract.
+
+See the e2e-test skill for the `AtermTest` helper API.
 
 ## Capturing a scene
 
