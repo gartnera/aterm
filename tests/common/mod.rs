@@ -8,10 +8,13 @@
 
 #![allow(dead_code)]
 
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -65,6 +68,15 @@ pub struct AtermTest {
     /// Filled in by `spawn()` so Drop can name the artifact after the test
     /// that owned this handle.
     test_name: String,
+    /// Path where the child's stderr is being tee'd. Surface this in failure
+    /// messages so crash logs are one `cat` away.
+    log_path: PathBuf,
+    /// Buffer the log thread keeps appending stderr lines into. We can read
+    /// from it on demand to embed recent lines in panic messages without
+    /// reopening the log file.
+    log_buf: Arc<Mutex<String>>,
+    /// Handle for the background stderr-pump thread so Drop can join it.
+    log_thread: Option<JoinHandle<()>>,
 }
 
 impl AtermTest {
@@ -85,12 +97,59 @@ impl AtermTest {
         // the socket file explicitly.
         let _ = dir.keep();
 
+        let log_path = artifacts_dir().join(format!("{test_name}.log"));
+        // Truncate any log from a previous run so we don't read stale output
+        // if this test crashes during startup.
+        let _ = std::fs::write(&log_path, "");
+
         let mut cmd = Command::new(aterm_binary());
         cmd.env("ATERM_DEBUG_SOCK", &sock_path);
-        cmd.env("RUST_LOG", "warn"); // quiet, but surface errors
+        // Verbose by default — these logs are what you read when a test
+        // fails. Override with ATERM_LOG to e.g. trim to "warn" if a noisy
+        // test floods the file.
+        // Info-level is detailed enough to debug a real failure (it shows
+        // PTY exits, surface errors, config loading) but quiet enough not to
+        // bury the interesting lines under glyphon/cosmic-text trace spam.
+        // Override per-run with ATERM_LOG=debug if you need verbose detail.
+        cmd.env(
+            "RUST_LOG",
+            std::env::var("ATERM_LOG").unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn".into()),
+        );
+        cmd.env("RUST_BACKTRACE", "1");
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
-        let child = cmd.spawn().expect("spawn aterm");
+        let mut child = cmd.spawn().expect("spawn aterm");
+
+        // Tee the child's stderr into both the on-disk log and an in-memory
+        // buffer, so panic messages can quote the last N lines without
+        // needing to reopen the file from a panic handler.
+        let stderr = child.stderr.take().expect("piped stderr");
+        let log_buf = Arc::new(Mutex::new(String::new()));
+        let log_path_thread = log_path.clone();
+        let log_buf_thread = log_buf.clone();
+        let log_thread = std::thread::Builder::new()
+            .name(format!("aterm-log-{test_name}"))
+            .spawn(move || {
+                let mut file = File::create(&log_path_thread).ok();
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    if let Some(f) = file.as_mut() {
+                        let _ = writeln!(f, "{line}");
+                    }
+                    if let Ok(mut buf) = log_buf_thread.lock() {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                        // Keep memory bounded — anything beyond the last
+                        // ~64 KiB is unlikely to help debug a recent crash.
+                        if buf.len() > 64 * 1024 {
+                            let trim = buf.len() - 64 * 1024;
+                            buf.drain(..trim);
+                        }
+                    }
+                }
+            })
+            .expect("spawn log thread");
 
         // Poll for the socket to appear and accept connections.
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -99,18 +158,16 @@ impl AtermTest {
                 break s;
             }
             if Instant::now() > deadline {
-                let mut child = child;
                 let _ = child.kill();
-                let stderr = child
-                    .stderr
-                    .take()
-                    .and_then(|mut s| {
-                        let mut buf = String::new();
-                        std::io::Read::read_to_string(&mut s, &mut buf).ok().map(|_| buf)
-                    })
-                    .unwrap_or_default();
+                // Give the stderr pump a moment to flush before we read
+                // what it captured.
+                std::thread::sleep(Duration::from_millis(100));
+                let captured = log_buf.lock().map(|s| s.clone()).unwrap_or_default();
                 panic!(
-                    "aterm debug socket did not appear at {sock_path:?}\naterm stderr:\n{stderr}"
+                    "aterm debug socket did not appear at {sock_path:?}\n\
+                     full log: {}\n\
+                     last stderr:\n{captured}",
+                    log_path.display()
                 );
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -121,12 +178,32 @@ impl AtermTest {
         let reader_stream = stream.try_clone().expect("clone stream");
         let reader = BufReader::new(reader_stream);
 
-        let mut t = AtermTest { child, sock_path, stream, reader, test_name };
+        let mut t = AtermTest {
+            child,
+            sock_path,
+            stream,
+            reader,
+            test_name,
+            log_path,
+            log_buf,
+            log_thread: Some(log_thread),
+        };
         // Wait for the shell to print its initial prompt before handing back
         // control. Tests can then issue commands and trust that the PTY is
         // alive.
         t.wait_for_prompt();
         t
+    }
+
+    /// Recent stderr from the aterm child. Useful when a test's expected
+    /// state never materializes and you want to see what aterm logged.
+    pub fn recent_log(&self) -> String {
+        self.log_buf.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// Path where the full stderr log is being written for this test.
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
     }
 
     /// Save a screenshot of the X root window — most useful when a test fails
@@ -152,12 +229,40 @@ impl AtermTest {
         }
     }
 
-    /// Send a JSON request and parse the response. Panics on transport error.
+    /// Send a JSON request and parse the response. Panics on transport
+    /// error, including the recent log in the message so a crashed child is
+    /// easy to diagnose.
     pub fn request(&mut self, req: Value) -> Value {
         let line = serde_json::to_string(&req).expect("serialize");
-        writeln!(self.stream, "{line}").expect("write request");
+        if let Err(e) = writeln!(self.stream, "{line}") {
+            panic!(
+                "writing to aterm debug socket failed: {e}\n\
+                 log: {}\n\
+                 recent stderr:\n{}",
+                self.log_path.display(),
+                self.recent_log()
+            );
+        }
         let mut buf = String::new();
-        self.reader.read_line(&mut buf).expect("read response");
+        if let Err(e) = self.reader.read_line(&mut buf) {
+            panic!(
+                "reading from aterm debug socket failed: {e}\n\
+                 log: {}\n\
+                 recent stderr:\n{}",
+                self.log_path.display(),
+                self.recent_log()
+            );
+        }
+        if buf.is_empty() {
+            // EOF — the child likely died.
+            panic!(
+                "aterm closed the debug socket (child likely crashed)\n\
+                 log: {}\n\
+                 recent stderr:\n{}",
+                self.log_path.display(),
+                self.recent_log()
+            );
+        }
         let resp: Value = serde_json::from_str(buf.trim()).expect("parse response");
         if !resp.get("ok").and_then(Value::as_bool).unwrap_or(false) {
             panic!(
@@ -299,24 +404,40 @@ impl AtermTest {
 
 impl Drop for AtermTest {
     fn drop(&mut self) {
-        // If the test is unwinding from a panic, grab a screenshot first —
-        // the assertion failure will print a path to it so the CI artifact
-        // viewer (or the developer on macOS pulling from Docker) can see
-        // what the terminal actually looked like at the time of failure.
+        // If the test is unwinding from a panic, capture a screenshot and
+        // surface the log path before tearing things down. The assertion
+        // failure has already printed by this point, but eprintln! gets
+        // captured by cargo's test runner and shown together with the
+        // failure body, so it's easy to follow the links from CI output.
         if std::thread::panicking() {
             if let Some(p) = self.screenshot("failure") {
-                eprintln!("aterm failure screenshot saved: {}", p.display());
+                eprintln!("aterm failure screenshot: {}", p.display());
             } else {
                 eprintln!(
                     "aterm failure: screenshot capture failed (no `import` on PATH \
                      or DISPLAY unset?)"
                 );
             }
+            eprintln!("aterm log: {}", self.log_path.display());
+            // Inline tail of the log so a quick scroll-back sees the crash
+            // without leaving the test output.
+            let tail = self.recent_log();
+            if !tail.is_empty() {
+                let tail_lines: Vec<&str> = tail.lines().rev().take(20).collect();
+                eprintln!("--- last 20 lines of aterm stderr ---");
+                for l in tail_lines.into_iter().rev() {
+                    eprintln!("{l}");
+                }
+                eprintln!("--- end log tail ---");
+            }
         }
         // SIGKILL keeps teardown fast; aterm doesn't write any state that
-        // needs a graceful shutdown.
+        // needs a graceful shutdown. Closing stderr unblocks the log thread.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(h) = self.log_thread.take() {
+            let _ = h.join();
+        }
         let _ = std::fs::remove_file(&self.sock_path);
         // Best-effort: remove the parent tempdir we kept earlier.
         if let Some(parent) = Path::new(&self.sock_path).parent() {

@@ -178,20 +178,32 @@ DISPLAY=:99 cargo test --test integration
 Without an X display the tests no-op via `require_display!()` so a plain
 `cargo test` still passes on machines without Xvfb.
 
-### Failure screenshots
+### Failure artifacts
 
-When an integration test panics, `AtermTest::drop` snapshots the X root
-window via `import` and writes it to
-`$ATERM_TEST_ARTIFACTS/<test_name>_failure.png` (default
-`target/test-artifacts/`). The path is printed to stderr right above the
-panic message, so CI logs surface it. In Docker the artifacts directory
-is bind-mounted to the host so you can open the PNGs after the run.
+On a panicking test, `AtermTest::drop` saves three things to
+`$ATERM_TEST_ARTIFACTS/` (default `target/test-artifacts/`, bind-mounted
+out of Docker):
 
-You can also screenshot mid-test from a successful path:
+1. **`<test_name>_failure.png`** — screenshot of the X root captured via
+   `import` at the moment of failure.
+2. **`<test_name>.log`** — the full aterm child's stderr, tee'd in real
+   time while the test runs.
+3. **Inline tail** — the last 20 lines of stderr are also printed under
+   `--- last 20 lines of aterm stderr ---` inside the cargo test output,
+   so a quick scroll-back is enough for most diagnosis without leaving
+   the terminal.
+
+Default log level is `info,wgpu_core=warn,wgpu_hal=warn` — quiet enough
+that the relevant lines aren't buried, verbose enough to catch surface
+errors, PTY exits, debug-socket lifecycle. Set `ATERM_LOG=debug` (or any
+env_logger spec) before running tests to get more detail.
+
+You can also pull the log mid-test:
 
 ```rust
-let path = t.screenshot("after_typing");
-// returns Option<PathBuf>; useful for visually verifying a scenario
+let recent = t.recent_log();         // last ~64 KiB of stderr (String)
+let path = t.log_path();             // &Path to the on-disk log
+let snap = t.screenshot("after_x");  // Option<PathBuf>, useful for happy-path captures
 ```
 
 The scaffolding in `tests/common/mod.rs` exposes an `AtermTest` helper
