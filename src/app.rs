@@ -8,7 +8,7 @@ use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::search::RegexSearch;
 use arboard::Clipboard;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
@@ -298,6 +298,13 @@ impl ApplicationHandler<WakeEvent> for App {
             .with_title("aterm")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 600.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        // Enable IME events so dead keys and CJK composition flow through
+        // WindowEvent::Ime. Without this, pressing e.g. Option+e on a US
+        // layout (acute accent dead key) produces no character at all, and
+        // CJK input methods can't compose. With it, the platform IME
+        // produces Ime::Commit(s) once composition finishes; we forward the
+        // committed bytes to the PTY just like typed input.
+        window.set_ime_allowed(true);
         let line_height = (self.config.font_size * 1.25).round();
         let gfx = pollster::block_on(Gfx::new(
             window.clone(),
@@ -373,6 +380,26 @@ impl ApplicationHandler<WakeEvent> for App {
                 self.mods = mods.state();
                 self.refresh_hover_url(&window);
             }
+            // IME composition output. Preedit/Enabled/Disabled don't write
+            // to the PTY — the platform IME handles its own preview popup,
+            // and we only commit bytes once composition is complete. This
+            // covers dead keys (Option+e then e → "é" on macOS) and CJK
+            // input as a single uniform path.
+            WindowEvent::Ime(ime) => match ime {
+                Ime::Commit(text) => {
+                    if text.is_empty() {
+                        return;
+                    }
+                    let Some(session) = self.tabs.get(self.active_tab) else {
+                        return;
+                    };
+                    session.scroll(Scroll::Bottom);
+                    session.clear_selection();
+                    session.send_input(text.into_bytes());
+                    window.request_redraw();
+                }
+                Ime::Enabled | Ime::Disabled | Ime::Preedit(..) => {}
+            },
             // Focus loss / cursor leaving the window strands the modifier
             // state — we won't see the key release that happens in another
             // app's context. Reset so the pointer-cursor and underline don't
