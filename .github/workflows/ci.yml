@@ -34,7 +34,9 @@ jobs:
         run: cargo clippy --all-targets --no-deps -- -W clippy::all
 
       - name: Unit tests
-        run: cargo test --lib --bins
+        # aterm is a binary-only crate (no [lib] target). `--bins` picks up
+        # the #[cfg(test)] modules compiled into the bin's test build.
+        run: cargo test --bins
 
   # Format check. Non-blocking because the existing tree predates a fmt
   # convention. Fail the run only when new code introduces *additional* drift
