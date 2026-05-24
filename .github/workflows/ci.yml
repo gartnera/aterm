@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Allow a newer commit to a PR to cancel the previous run for the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Unit tests + clippy. No X server needed; integration tests live in their
+  # own job below so the heavier apt install only runs there.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (warnings)
+        run: cargo clippy --all-targets --no-deps -- -W clippy::all
+
+      - name: Unit tests
+        run: cargo test --lib --bins
+
+  # Format check. Non-blocking because the existing tree predates a fmt
+  # convention. Fail the run only when new code introduces *additional* drift
+  # — until then the diff is informational.
+  fmt:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # End-to-end integration tests. Installs Xvfb + Mesa software Vulkan +
+  # ImageMagick, mirrors scripts/Dockerfile.test, then runs the integration
+  # suite. On failure, uploads target/test-artifacts/ (screenshots + per-test
+  # aterm stderr logs) as a workflow artifact so the failure can be inspected
+  # without re-running.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install X / Vulkan / xdotool deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb xdotool imagemagick openbox x11-utils \
+            libxkbcommon-x11-0 libxkbcommon0 \
+            mesa-vulkan-drivers libvulkan1
+
+      - name: Start Xvfb + openbox
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 -ac >/tmp/xvfb.log 2>&1 &
+          sleep 1
+          # Sanity-check the X server actually came up before we run anything
+          # that depends on it.
+          DISPLAY=:99 xdpyinfo >/dev/null
+          openbox >/tmp/openbox.log 2>&1 &
+          sleep 1
+
+      - name: Run integration tests
+        env:
+          DISPLAY: ":99"
+          ATERM_TEST_ARTIFACTS: ${{ github.workspace }}/target/test-artifacts
+        run: cargo test --test integration
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aterm-test-artifacts
+          path: target/test-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14

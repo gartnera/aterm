@@ -178,6 +178,15 @@ DISPLAY=:99 cargo test --test integration
 Without an X display the tests no-op via `require_display!()` so a plain
 `cargo test` still passes on machines without Xvfb.
 
+### CI
+
+`.github/workflows/ci.yml` runs the integration suite on every push and PR.
+It uses the same package list as `scripts/Dockerfile.test`, starts Xvfb +
+openbox natively on the ubuntu-latest runner (no Docker layer needed in
+CI), and uploads `target/test-artifacts/` as a workflow artifact when any
+test fails. Pull the artifact from the failing workflow run to see the
+PNGs and per-test stderr logs.
+
 ### Failure artifacts
 
 On a panicking test, `AtermTest::drop` saves three things to
