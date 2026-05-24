@@ -75,9 +75,15 @@ fn prefix_alt(mut bytes: Vec<u8>, mods: ModifiersState) -> Vec<u8> {
 fn encode_named_modified(named: NamedKey, mods: ModifiersState) -> Option<Vec<u8>> {
     // bit 0 = shift, bit 1 = alt, bit 2 = ctrl. Result = 1 + that value.
     let mut bits = 0u8;
-    if mods.shift_key() { bits |= 1; }
-    if mods.alt_key() { bits |= 2; }
-    if mods.control_key() { bits |= 4; }
+    if mods.shift_key() {
+        bits |= 1;
+    }
+    if mods.alt_key() {
+        bits |= 2;
+    }
+    if mods.control_key() {
+        bits |= 4;
+    }
     if bits == 0 {
         return None;
     }
@@ -129,12 +135,48 @@ fn encode_named(named: NamedKey, mode: TermKeyMode) -> Option<&'static [u8]> {
         NamedKey::Backspace => b"\x7f",
         NamedKey::Escape => b"\x1b",
         NamedKey::Space => b" ",
-        NamedKey::ArrowUp => if app { b"\x1bOA" } else { b"\x1b[A" },
-        NamedKey::ArrowDown => if app { b"\x1bOB" } else { b"\x1b[B" },
-        NamedKey::ArrowRight => if app { b"\x1bOC" } else { b"\x1b[C" },
-        NamedKey::ArrowLeft => if app { b"\x1bOD" } else { b"\x1b[D" },
-        NamedKey::Home => if app { b"\x1bOH" } else { b"\x1b[H" },
-        NamedKey::End => if app { b"\x1bOF" } else { b"\x1b[F" },
+        NamedKey::ArrowUp => {
+            if app {
+                b"\x1bOA"
+            } else {
+                b"\x1b[A"
+            }
+        }
+        NamedKey::ArrowDown => {
+            if app {
+                b"\x1bOB"
+            } else {
+                b"\x1b[B"
+            }
+        }
+        NamedKey::ArrowRight => {
+            if app {
+                b"\x1bOC"
+            } else {
+                b"\x1b[C"
+            }
+        }
+        NamedKey::ArrowLeft => {
+            if app {
+                b"\x1bOD"
+            } else {
+                b"\x1b[D"
+            }
+        }
+        NamedKey::Home => {
+            if app {
+                b"\x1bOH"
+            } else {
+                b"\x1b[H"
+            }
+        }
+        NamedKey::End => {
+            if app {
+                b"\x1bOF"
+            } else {
+                b"\x1b[F"
+            }
+        }
         NamedKey::PageUp => b"\x1b[5~",
         NamedKey::PageDown => b"\x1b[6~",
         NamedKey::Insert => b"\x1b[2~",
@@ -201,11 +243,21 @@ mod tests {
     #[test]
     fn tab_and_escape() {
         assert_eq!(
-            encode_key(&Key::Named(NamedKey::Tab), None, ModifiersState::empty(), no_app()),
+            encode_key(
+                &Key::Named(NamedKey::Tab),
+                None,
+                ModifiersState::empty(),
+                no_app()
+            ),
             Some(b"\t".to_vec())
         );
         assert_eq!(
-            encode_key(&Key::Named(NamedKey::Escape), None, ModifiersState::empty(), no_app()),
+            encode_key(
+                &Key::Named(NamedKey::Escape),
+                None,
+                ModifiersState::empty(),
+                no_app()
+            ),
             Some(b"\x1b".to_vec())
         );
     }
@@ -357,12 +409,7 @@ mod tests {
     fn text_wins_over_logical_character_when_present() {
         // On a shifted layout the text reflects the shifted glyph; ensure we
         // pass `text` through rather than the unshifted Key::Character.
-        let got = encode_key(
-            &key_char("2"),
-            Some("@"),
-            ModifiersState::SHIFT,
-            no_app(),
-        );
+        let got = encode_key(&key_char("2"), Some("@"), ModifiersState::SHIFT, no_app());
         assert_eq!(got, Some(b"@".to_vec()));
     }
 

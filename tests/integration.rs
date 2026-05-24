@@ -16,8 +16,9 @@ fn boots_and_shows_prompt() {
     // exposes a non-empty grid that contains a prompt-looking line.
     let lines = t.snapshot_text();
     assert!(
-        lines.iter().any(|l| l.trim_end().ends_with('$')
-            || l.trim_end().ends_with('#')),
+        lines
+            .iter()
+            .any(|l| l.trim_end().ends_with('$') || l.trim_end().ends_with('#')),
         "no shell prompt in initial grid:\n{}",
         lines.join("\n")
     );
@@ -83,7 +84,10 @@ fn font_size_clamped_and_resettable() {
     assert!(huge <= 72.0, "font size must clamp to 72.0, got {huge}");
 
     let reset = t.font_size_reset();
-    assert!((reset - initial).abs() < 0.001, "reset should restore initial");
+    assert!(
+        (reset - initial).abs() < 0.001,
+        "reset should restore initial"
+    );
 }
 
 #[test]

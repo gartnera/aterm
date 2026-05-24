@@ -22,7 +22,9 @@ use serde_json::{json, Value};
 /// Check whether the test environment has an X display available. Tests
 /// requiring a window should early-return when this is false.
 pub fn has_display() -> bool {
-    std::env::var("DISPLAY").map(|s| !s.is_empty()).unwrap_or(false)
+    std::env::var("DISPLAY")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
 }
 
 /// Macro that turns a test into a no-op (with a printed reason) if no display
@@ -84,7 +86,12 @@ impl AtermTest {
     /// timeout or spawn failure.
     #[track_caller]
     pub fn spawn() -> Self {
-        Self::spawn_named(std::thread::current().name().unwrap_or("aterm_test").to_string())
+        Self::spawn_named(
+            std::thread::current()
+                .name()
+                .unwrap_or("aterm_test")
+                .to_string(),
+        )
     }
 
     /// Same as `spawn`, but lets the caller pick the test name used in
@@ -113,7 +120,8 @@ impl AtermTest {
         // Override per-run with ATERM_LOG=debug if you need verbose detail.
         cmd.env(
             "RUST_LOG",
-            std::env::var("ATERM_LOG").unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn".into()),
+            std::env::var("ATERM_LOG")
+                .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn".into()),
         );
         cmd.env("RUST_BACKTRACE", "1");
         cmd.stdout(Stdio::null());

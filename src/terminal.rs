@@ -12,14 +12,14 @@ use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::{point_to_viewport, viewport_to_point, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use alacritty_terminal::Term;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 
 #[derive(Clone)]
 pub struct ChannelListener {
@@ -169,7 +169,11 @@ fn indexed_from_palette(idx: u8, palette: &ConfigColors) -> [u8; 3] {
     // 0..16: configured normal / bright palette.
     if idx < 16 {
         let bright = idx >= 8;
-        let pal = if bright { &palette.bright } else { &palette.normal };
+        let pal = if bright {
+            &palette.bright
+        } else {
+            &palette.normal
+        };
         return match idx % 8 {
             0 => pal.black,
             1 => pal.red,
@@ -243,7 +247,11 @@ fn osc8_spans<T>(
             _ => break,
         }
     }
-    vec![UrlSpan { line: vp_line, start_col, end_col }]
+    vec![UrlSpan {
+        line: vp_line,
+        start_col,
+        end_col,
+    }]
 }
 
 /// Convert a regex `Match` (inclusive grid-line range) into per-row viewport
@@ -266,9 +274,21 @@ fn match_to_spans(
     let hi = end_line.min(vp_lines as i32 - 1);
     let mut spans = Vec::with_capacity((hi - lo + 1) as usize);
     for line in lo..=hi {
-        let s = if line == start_line { start.column.0.min(max_col) } else { 0 };
-        let e = if line == end_line { end.column.0.min(max_col) } else { max_col };
-        spans.push(UrlSpan { line: line as usize, start_col: s, end_col: e });
+        let s = if line == start_line {
+            start.column.0.min(max_col)
+        } else {
+            0
+        };
+        let e = if line == end_line {
+            end.column.0.min(max_col)
+        } else {
+            max_col
+        };
+        spans.push(UrlSpan {
+            line: line as usize,
+            start_col: s,
+            end_col: e,
+        });
     }
     spans
 }
@@ -322,13 +342,20 @@ impl TerminalSession {
         // inherit an empty TERM, leaving ncurses programs unable to initialize.
         // Set it here so the shell works regardless of how aterm itself was
         // launched.
-        pty_options.env.insert("TERM".into(), "xterm-256color".into());
-        pty_options.env.insert("COLORTERM".into(), "truecolor".into());
+        pty_options
+            .env
+            .insert("TERM".into(), "xterm-256color".into());
+        pty_options
+            .env
+            .insert("COLORTERM".into(), "truecolor".into());
         // GUI launchers (launchd on macOS, the desktop session on Linux) start
         // the .app in `/`. If our cwd looks like that default, start the shell
         // in $HOME instead. When aterm was launched from a shell in a real
         // directory, inherit that cwd as usual.
-        if std::env::current_dir().map(|p| p == std::path::Path::new("/")).unwrap_or(false) {
+        if std::env::current_dir()
+            .map(|p| p == std::path::Path::new("/"))
+            .unwrap_or(false)
+        {
             if let Some(home) = dirs::home_dir() {
                 pty_options.working_directory = Some(home);
             }
@@ -337,13 +364,22 @@ impl TerminalSession {
         let pty = tty::new(&pty_options, window_size, 0)?;
 
         let (events_tx, events_rx) = unbounded();
-        let listener = ChannelListener { tx: events_tx, proxy };
+        let listener = ChannelListener {
+            tx: events_tx,
+            proxy,
+        };
 
         let term_config = TermConfig::default();
         let term = Term::new(term_config, &term_size, listener.clone());
         let term = Arc::new(FairMutex::new(term));
 
-        let pty_loop = PtyLoop::new(term.clone(), listener, pty, pty_options.drain_on_exit, false)?;
+        let pty_loop = PtyLoop::new(
+            term.clone(),
+            listener,
+            pty,
+            pty_options.drain_on_exit,
+            false,
+        )?;
         let notifier = Notifier(pty_loop.channel());
         let _io_thread = pty_loop.spawn();
 
@@ -396,10 +432,7 @@ impl TerminalSession {
         let vp_line = vp_line.min(lines.saturating_sub(1));
         let vp_col = vp_col.min(cols.saturating_sub(1));
         let display_offset = term.grid().display_offset();
-        let point = viewport_to_point(
-            display_offset,
-            Point::new(vp_line, Column(vp_col)),
-        );
+        let point = viewport_to_point(display_offset, Point::new(vp_line, Column(vp_col)));
         let side = if right_half { Side::Right } else { Side::Left };
         term.selection = Some(Selection::new(SelectionType::Simple, point, side));
     }
@@ -412,10 +445,7 @@ impl TerminalSession {
         let vp_line = vp_line.min(lines.saturating_sub(1));
         let vp_col = vp_col.min(cols.saturating_sub(1));
         let display_offset = term.grid().display_offset();
-        let point = viewport_to_point(
-            display_offset,
-            Point::new(vp_line, Column(vp_col)),
-        );
+        let point = viewport_to_point(display_offset, Point::new(vp_line, Column(vp_col)));
         let side = if right_half { Side::Right } else { Side::Left };
         if let Some(sel) = term.selection.as_mut() {
             sel.update(point, side);
@@ -471,8 +501,8 @@ impl TerminalSession {
         let viewport_start = Line(-(display_offset as i32));
         let viewport_end = viewport_start + (lines as i32 - 1);
         let mut start = term.line_search_left(Point::new(viewport_start, Column(0)));
-        let mut end = term
-            .line_search_right(Point::new(viewport_end, Column(cols.saturating_sub(1))));
+        let mut end =
+            term.line_search_right(Point::new(viewport_end, Column(cols.saturating_sub(1))));
         start.line = start.line.max(viewport_start - URL_MAX_SEARCH_LINES);
         end.line = end.line.min(viewport_end + URL_MAX_SEARCH_LINES);
 
@@ -487,7 +517,10 @@ impl TerminalSession {
     }
 
     pub fn selection_text(&self) -> Option<String> {
-        self.term.lock().selection_to_string().filter(|s| !s.is_empty())
+        self.term
+            .lock()
+            .selection_to_string()
+            .filter(|s| !s.is_empty())
     }
 
     pub fn resize(&mut self, cols: u16, lines: u16, cell_width: u16, cell_height: u16) {
@@ -537,11 +570,7 @@ impl TerminalSession {
         });
 
         let mut cells: Vec<Vec<SnapCell>> = (0..lines)
-            .map(|_| {
-                (0..cols)
-                    .map(|_| SnapCell::default())
-                    .collect()
-            })
+            .map(|_| (0..cols).map(|_| SnapCell::default()).collect())
             .collect();
 
         for indexed in content.display_iter {
@@ -562,8 +591,8 @@ impl TerminalSession {
             } else {
                 cell.c
             };
-            let underline = cell.hyperlink().is_some()
-                || cell.flags.intersects(Flags::ALL_UNDERLINES);
+            let underline =
+                cell.hyperlink().is_some() || cell.flags.intersects(Flags::ALL_UNDERLINES);
             cells[vp.line][vp.column.0] = SnapCell {
                 ch,
                 fg,
@@ -689,7 +718,11 @@ mod tests {
         let spans = match_to_spans(pt(-3, 4), pt(-3, 10), 5, 10, 80);
         assert_eq!(
             spans,
-            vec![UrlSpan { line: 2, start_col: 4, end_col: 10 }]
+            vec![UrlSpan {
+                line: 2,
+                start_col: 4,
+                end_col: 10
+            }]
         );
     }
 
@@ -701,9 +734,21 @@ mod tests {
         assert_eq!(
             spans,
             vec![
-                UrlSpan { line: 1, start_col: 70, end_col: 79 },
-                UrlSpan { line: 2, start_col: 0, end_col: 79 },
-                UrlSpan { line: 3, start_col: 0, end_col: 5 },
+                UrlSpan {
+                    line: 1,
+                    start_col: 70,
+                    end_col: 79
+                },
+                UrlSpan {
+                    line: 2,
+                    start_col: 0,
+                    end_col: 79
+                },
+                UrlSpan {
+                    line: 3,
+                    start_col: 0,
+                    end_col: 5
+                },
             ]
         );
     }
@@ -728,4 +773,3 @@ mod tests {
         assert!(spans.is_empty());
     }
 }
-
