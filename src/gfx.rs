@@ -16,17 +16,25 @@ struct TabBarTheme {
     /// Background of the active tab — matches the terminal content bg so the
     /// active tab visually merges into the page.
     active_bg: [f32; 4],
+    /// Thin accent stripe along the bottom of the active tab.
+    accent: [f32; 4],
+    /// 1px separator drawn between adjacent inactive tabs.
+    separator: [f32; 4],
     /// Text color for the active tab (sRGB; glyphon uses sRGB).
     active_fg: [u8; 3],
-    /// Text color for inactive tabs and separators.
+    /// Text color for inactive tabs.
     inactive_fg: [u8; 3],
 }
 
 impl TabBarTheme {
     fn derive(colors: &ConfigColors) -> Self {
         Self {
-            bar_bg: linear_rgba(darken(colors.background, 0.7)),
+            // A bit darker than before (0.55 vs 0.7) so the active tab visibly
+            // "lifts" off the bar without needing per-tab borders.
+            bar_bg: linear_rgba(darken(colors.background, 0.55)),
             active_bg: linear_rgba(colors.background),
+            accent: linear_rgba(colors.bright.blue),
+            separator: linear_rgba(darken(colors.background, 0.85)),
             active_fg: colors.foreground,
             inactive_fg: colors.bright.black,
         }
@@ -498,52 +506,113 @@ impl Gfx {
         let scale = self.window.scale_factor() as f32;
         let cell_w_px = self.cell_width_logical * scale;
 
-        // Distribute available width across tabs and truncate titles that
-        // exceed their share. Each tab uses 2 chars for the marker plus the
-        // title, separated by 3 spaces between tabs.
-        const SEP: &str = "   ";
-        const MARKER_CHARS: usize = 2;
+        // Variable-width tabs: each tab gets either its natural width
+        // (title length in cells) or a fair share of what's available,
+        // whichever is smaller. Slack from short titles is redistributed
+        // round-robin to tabs that still want more room.
+        const SEP_CHARS: usize = 2;
+        const MIN_TITLE_CHARS: usize = 4;
         let usable_chars = ((width as f32 - 2.0 * PAD_X * scale) / cell_w_px)
             .floor()
             .max(0.0) as usize;
-        let per_tab_budget = if tabs.is_empty() {
-            0
-        } else {
-            let total_seps = tabs.len().saturating_sub(1) * SEP.chars().count();
-            usable_chars
-                .saturating_sub(total_seps)
-                .checked_div(tabs.len())
-                .unwrap_or(0)
-                .max(MARKER_CHARS + 1)
-        };
+
+        let mut budgets: Vec<usize> = Vec::with_capacity(tabs.len());
+        if !tabs.is_empty() {
+            let total_seps = tabs.len().saturating_sub(1) * SEP_CHARS;
+            let mut pool = usable_chars.saturating_sub(total_seps);
+            let natural: Vec<usize> = tabs.iter().map(|t| t.title().chars().count()).collect();
+            // Start by giving each tab MIN_TITLE_CHARS (or its natural width
+            // if smaller). This guarantees a usable rendering even when the
+            // bar is very narrow.
+            for &n in &natural {
+                let initial = n.min(MIN_TITLE_CHARS);
+                let take = initial.min(pool);
+                budgets.push(take);
+                pool -= take;
+            }
+            // Fill any remaining want round-robin until the pool is empty or
+            // no tab wants more.
+            loop {
+                if pool == 0 {
+                    break;
+                }
+                let mut progressed = false;
+                for i in 0..budgets.len() {
+                    if pool == 0 {
+                        break;
+                    }
+                    if budgets[i] < natural[i] {
+                        budgets[i] += 1;
+                        pool -= 1;
+                        progressed = true;
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+            }
+            // Any unclaimed budget (every tab already at natural width) goes
+            // back to padding around each title — but cap so we don't end up
+            // with absurd amounts of whitespace on a near-empty bar.
+        }
 
         self.tab_hit_regions.clear();
-        // Build the tab strip as (text segment, is_active) pairs so we can
-        // emit each with the correct fg color via set_rich_text.
+        let bar_h_px = tab_bar_height * scale;
+        let accent_h_px = (2.0 * scale).round().max(1.0);
+        let sep_w_px = (scale).round().max(1.0);
         let mut segments: Vec<(String, bool)> = Vec::new();
         let mut tab_text = String::new();
+        let mut chars_cursor: usize = 0;
         for (i, t) in tabs.iter().enumerate() {
             if i > 0 {
-                segments.push((SEP.into(), false));
-                tab_text.push_str(SEP);
+                let sep_pad = " ".repeat(SEP_CHARS);
+                segments.push((sep_pad.clone(), false));
+                tab_text.push_str(&sep_pad);
+                let sep_mid_x =
+                    PAD_X * scale + (chars_cursor as f32 + SEP_CHARS as f32 * 0.5) * cell_w_px;
+                let prev_active = i - 1 == active_idx;
+                let next_active = i == active_idx;
+                // Only draw the dividing line between two inactive tabs.
+                if !prev_active && !next_active {
+                    let inset_y = (bar_h_px * 0.25).round();
+                    self.quad_scratch.push(Quad {
+                        rect: [
+                            sep_mid_x - sep_w_px * 0.5,
+                            inset_y,
+                            sep_w_px,
+                            bar_h_px - 2.0 * inset_y,
+                        ],
+                        color: self.tab_theme.separator,
+                    });
+                }
+                chars_cursor += SEP_CHARS;
             }
-            let chars_before = tab_text.chars().count();
-            let marker = if i == active_idx { "● " } else { "○ " };
-            let max_title_chars = per_tab_budget.saturating_sub(MARKER_CHARS);
-            let title = truncate_with_ellipsis(t.title(), max_title_chars);
-            let seg = format!("{marker}{title}");
-            tab_text.push_str(&seg);
-            let chars_after = tab_text.chars().count();
-            let x0 = PAD_X * scale + chars_before as f32 * cell_w_px;
-            let x1 = PAD_X * scale + chars_after as f32 * cell_w_px;
-            self.tab_hit_regions.push((i, x0, x1));
+            let title = truncate_with_ellipsis(t.title(), budgets.get(i).copied().unwrap_or(0));
+            let title_chars = title.chars().count();
+            let x0 = PAD_X * scale + chars_cursor as f32 * cell_w_px;
+            let x1 = x0 + title_chars as f32 * cell_w_px;
+            self.tab_hit_regions.push((i, x0 - 4.0, x1 + 4.0));
             if i == active_idx {
+                // Background quad merges the active tab into the terminal
+                // page below.
                 self.quad_scratch.push(Quad {
-                    rect: [x0 - 4.0, 0.0, (x1 - x0) + 8.0, tab_bar_height * scale],
+                    rect: [x0 - 4.0, 0.0, (x1 - x0) + 8.0, bar_h_px],
                     color: self.tab_theme.active_bg,
                 });
+                // Accent stripe along the bottom of the active tab.
+                self.quad_scratch.push(Quad {
+                    rect: [
+                        x0 - 4.0,
+                        bar_h_px - accent_h_px,
+                        (x1 - x0) + 8.0,
+                        accent_h_px,
+                    ],
+                    color: self.tab_theme.accent,
+                });
             }
-            segments.push((seg, i == active_idx));
+            tab_text.push_str(&title);
+            chars_cursor += title_chars;
+            segments.push((title, i == active_idx));
         }
         if segments.is_empty() {
             segments.push(("(no tabs)".into(), false));
@@ -553,22 +622,19 @@ impl Gfx {
             .tab_buffer
             .get_or_insert_with(|| Buffer::new(&mut self.font_system, metrics));
         buf.set_metrics(&mut self.font_system, metrics);
-        buf.set_size(
-            &mut self.font_system,
-            Some(width as f32),
-            Some(tab_bar_height * scale),
-        );
+        buf.set_size(&mut self.font_system, Some(width as f32), Some(bar_h_px));
         let family = family_of(&self.font_family);
         let active_fg = self.tab_theme.active_fg;
         let inactive_fg = self.tab_theme.inactive_fg;
         let spans = segments.iter().map(|(text, active)| {
             let fg = if *active { active_fg } else { inactive_fg };
-            (
-                text.as_str(),
-                Attrs::new()
-                    .family(family)
-                    .color(Color::rgb(fg[0], fg[1], fg[2])),
-            )
+            let mut attrs = Attrs::new()
+                .family(family)
+                .color(Color::rgb(fg[0], fg[1], fg[2]));
+            if *active {
+                attrs = attrs.weight(glyphon::Weight::BOLD);
+            }
+            (text.as_str(), attrs)
         });
         buf.set_rich_text(
             &mut self.font_system,
