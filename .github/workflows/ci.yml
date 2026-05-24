@@ -33,9 +33,14 @@ jobs:
       - name: Clippy (warnings)
         run: cargo clippy --all-targets --no-deps -- -W clippy::all
 
-      - name: Unit tests
+      # Build and run in separate steps so the test step's log is just test
+      # output — no interleaved "Compiling X" lines.
+      - name: Build unit tests
         # aterm is a binary-only crate (no [lib] target). `--bins` picks up
         # the #[cfg(test)] modules compiled into the bin's test build.
+        run: cargo test --bins --no-run
+
+      - name: Run unit tests
         run: cargo test --bins
 
   # Format check. Non-blocking because the existing tree predates a fmt
@@ -67,23 +72,29 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
+      # Reuse the same package list scripts/e2e.sh uses for local Linux dev
+      # so the three install paths (CI, Dockerfile.test, e2e.sh) don't drift.
       - name: Install X / Vulkan deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            xvfb imagemagick openbox x11-utils \
-            libxkbcommon-x11-0 libxkbcommon0 \
-            mesa-vulkan-drivers libvulkan1
+        run: sudo scripts/e2e.sh setup
 
+      # We deliberately don't call `scripts/e2e.sh start` here. That helper
+      # also launches an aterm instance for interactive poking; the Rust
+      # integration tests spawn their own per-test child processes, so the
+      # only thing CI needs from the harness is Xvfb + openbox.
       - name: Start Xvfb + openbox
         run: |
           Xvfb :99 -screen 0 1280x800x24 -ac >/tmp/xvfb.log 2>&1 &
           sleep 1
-          # Sanity-check the X server actually came up before we run anything
-          # that depends on it.
           DISPLAY=:99 xdpyinfo >/dev/null
-          openbox >/tmp/openbox.log 2>&1 &
+          DISPLAY=:99 openbox >/tmp/openbox.log 2>&1 &
           sleep 1
+
+      # Build and run in separate steps so the test step's log shows only
+      # test results — all the "Compiling wgpu / glyphon / ..." noise lives
+      # in the build step and can be skipped past when investigating a test
+      # failure.
+      - name: Build integration tests
+        run: cargo test --test integration --no-run
 
       - name: Run integration tests
         env:

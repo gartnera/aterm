@@ -9,12 +9,13 @@ FROM rust:1.85-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        xvfb imagemagick openbox x11-utils \
-        libxkbcommon-x11-0 libxkbcommon0 \
-        mesa-vulkan-drivers libvulkan1 \
-        ca-certificates pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+# Reuse the same package list scripts/e2e.sh uses on Linux hosts. ca-certs
+# + pkg-config are container-only (the host script assumes a developer
+# machine already has them), so they're appended here.
+COPY scripts/e2e.sh /tmp/e2e.sh
+RUN /tmp/e2e.sh setup \
+    && apt-get install -y --no-install-recommends ca-certificates pkg-config \
+    && rm -rf /var/lib/apt/lists/* /tmp/e2e.sh
 
 WORKDIR /work
 
