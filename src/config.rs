@@ -20,6 +20,10 @@ pub struct Config {
     pub padding_x: f32,
     pub padding_y: f32,
     pub bindings: Vec<Keybinding>,
+    /// When false, OSC 0/1/2 sequences from the shell are ignored and the
+    /// window/tab title stays at its initial value. Mirrors alacritty's
+    /// `[window].dynamic_title` option.
+    pub dynamic_title: bool,
 }
 
 impl Default for Config {
@@ -32,6 +36,7 @@ impl Default for Config {
             padding_x: 6.0,
             padding_y: 6.0,
             bindings: binding::defaults(),
+            dynamic_title: true,
         }
     }
 }
@@ -176,6 +181,8 @@ struct RawAnsi {
 struct RawWindow {
     #[serde(default)]
     padding: Option<RawPadding>,
+    #[serde(default)]
+    dynamic_title: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -307,6 +314,9 @@ fn apply_raw(cfg: &mut Config, raw: RawConfig) {
             if let Some(y) = pad.y {
                 cfg.padding_y = y;
             }
+        }
+        if let Some(dt) = window.dynamic_title {
+            cfg.dynamic_title = dt;
         }
     }
     if let Some(colors) = raw.colors {
@@ -464,6 +474,15 @@ mod tests {
         assert_eq!(t.get("x").unwrap().as_integer(), Some(1));
         assert_eq!(t.get("y").unwrap().as_integer(), Some(99));
         assert_eq!(t.get("z").unwrap().as_integer(), Some(3));
+    }
+
+    #[test]
+    fn dynamic_title_defaults_true_and_can_be_disabled() {
+        let mut cfg = Config::default();
+        assert!(cfg.dynamic_title);
+        let raw: RawConfig = toml::from_str("[window]\ndynamic_title = false\n").unwrap();
+        apply_raw(&mut cfg, raw);
+        assert!(!cfg.dynamic_title);
     }
 
     #[test]
