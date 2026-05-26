@@ -541,7 +541,14 @@ impl TerminalSession {
             if self.shell_pid == Some(fg_pid) {
                 return base.to_string();
             }
-            let name = crate::cwd::process_name(fg_pid);
+            // Prefer the name as invoked (argv[0]) over the kernel's comm: a
+            // tool installed as a version-named binary behind a symlink
+            // (…/versions/2.1.150 with a `claude` symlink) reports "2.1.150"
+            // from comm but "claude" from argv[0] — the latter is what the
+            // user typed and recognises. Fall back to comm when argv is
+            // unreadable (e.g. a setuid program owned by another user).
+            let name =
+                crate::cwd::invoked_name(fg_pid).or_else(|| crate::cwd::process_name(fg_pid));
             // ssh is the one program whose own title we keep verbatim: its
             // *local* cwd (~ or wherever you launched it) says nothing useful,
             // while the remote shell's title — forwarded through ssh as OSC
