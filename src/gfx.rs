@@ -533,7 +533,7 @@ impl Gfx {
         if !tabs.is_empty() {
             let total_seps = tabs.len().saturating_sub(1) * SEP_CHARS;
             let mut pool = usable_chars.saturating_sub(total_seps);
-            let natural: Vec<usize> = tabs.iter().map(|t| t.title().chars().count()).collect();
+            let natural: Vec<usize> = tabs.iter().map(|t| t.tab_label().chars().count()).collect();
             // Start by giving each tab MIN_TITLE_CHARS (or its natural width
             // if smaller). This guarantees a usable rendering even when the
             // bar is very narrow.
@@ -584,7 +584,8 @@ impl Gfx {
                 tab_text.push_str(&sep_pad);
                 chars_cursor += SEP_CHARS;
             }
-            let title = truncate_with_ellipsis(t.title(), budgets.get(i).copied().unwrap_or(0));
+            let label = t.tab_label();
+            let title = truncate_with_ellipsis(&label, budgets.get(i).copied().unwrap_or(0));
             let title_chars = title.chars().count();
             let x0 = strip_left_px + chars_cursor as f32 * cell_w_px;
             let x1 = x0 + title_chars as f32 * cell_w_px;

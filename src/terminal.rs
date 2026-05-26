@@ -117,6 +117,20 @@ fn default_shell() -> &'static str {
     "/bin/sh"
 }
 
+/// Render a path with `$HOME` collapsed to `~`, falling back to the
+/// lossy display form when the path isn't UTF-8.
+fn abbreviate_home(path: &std::path::Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
 /// URL regex borrowed from alacritty's hint mode defaults.
 const URL_REGEX_PATTERN: &str =
     "(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)\
@@ -343,6 +357,12 @@ pub struct TerminalSession {
     /// shell's current working directory when the user opens a new tab so
     /// it inherits the cd'd-to location.
     shell_pid: Option<u32>,
+    /// A dup of the pty master fd, kept so we can call tcgetpgrp() to find
+    /// the tty's foreground process for the tab title. The pty's own Drop
+    /// sends SIGHUP explicitly (it doesn't rely on the master fd closing),
+    /// so holding this extra fd doesn't change shutdown behaviour.
+    #[cfg(unix)]
+    tty_fd: Option<std::os::fd::OwnedFd>,
 }
 
 impl TerminalSession {
@@ -401,6 +421,13 @@ impl TerminalSession {
         // we need it to look up the shell's cwd later via /proc on Linux
         // or proc_pidinfo on macOS.
         let shell_pid = pty.child().id();
+        // Dup the master fd while we still hold the pty, so we can poll the
+        // tty's foreground process group later (tcgetpgrp) for the title.
+        #[cfg(unix)]
+        let tty_fd = {
+            use std::os::fd::AsFd;
+            pty.file().as_fd().try_clone_to_owned().ok()
+        };
 
         let (events_tx, events_rx) = unbounded();
         let listener = ChannelListener {
@@ -433,6 +460,8 @@ impl TerminalSession {
             palette,
             dynamic_title,
             shell_pid: Some(shell_pid),
+            #[cfg(unix)]
+            tty_fd,
         })
     }
 
@@ -487,6 +516,69 @@ impl TerminalSession {
 
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// Title to display in the tab strip / OS window. When a child program
+    /// (htop, vim, claude, …) is running in the foreground we show its name
+    /// and cwd as `name (cwd)`, since the shell stops updating its own OSC
+    /// title while a foreground job runs. When the shell itself is in the
+    /// foreground we return its bare title — the prompt already shows the
+    /// cwd, so there's nothing useful to add.
+    pub fn tab_label(&self) -> String {
+        let base = self.title();
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let Some(tty_fd) = self.tty_fd.as_ref() else {
+                return base.to_string();
+            };
+            let Some(fg_pid) = crate::cwd::foreground_pid(tty_fd.as_raw_fd()) else {
+                return base.to_string();
+            };
+            // tcgetpgrp returns the shell's pgid while it's at the prompt;
+            // that equals the shell pid for our interactive shell, so skip
+            // the suffix in that case — the prompt already shows the cwd.
+            if self.shell_pid == Some(fg_pid) {
+                return base.to_string();
+            }
+            // Prefer the name as invoked (argv[0]) over the kernel's comm: a
+            // tool installed as a version-named binary behind a symlink
+            // (…/versions/2.1.150 with a `claude` symlink) reports "2.1.150"
+            // from comm but "claude" from argv[0] — the latter is what the
+            // user typed and recognises. Fall back to comm when argv is
+            // unreadable (e.g. a setuid program owned by another user).
+            let name =
+                crate::cwd::invoked_name(fg_pid).or_else(|| crate::cwd::process_name(fg_pid));
+            // ssh is the one program whose own title we keep verbatim: its
+            // *local* cwd (~ or wherever you launched it) says nothing useful,
+            // while the remote shell's title — forwarded through ssh as OSC
+            // 0/2 — names the host/path you actually care about. Every other
+            // program gets `name (cwd)`; we can't honour a program's own title
+            // by attribution because the shell's preexec title (zsh sets one
+            // per command) races the tcsetpgrp handoff and gets misattributed
+            // to the job, which is why this used to suppress the cwd for *all*
+            // commands.
+            if name.as_deref() == Some("ssh") {
+                return base.to_string();
+            }
+            // The foreground program's own cwd can be unreadable even though it
+            // exists — on macOS proc_pidinfo denies PROC_PIDVNODEPATHINFO for a
+            // process whose euid differs from ours, which is the case for
+            // setuid-root tools like /usr/bin/top. Fall back to the shell's
+            // cwd: the program inherited it on launch and almost never chdirs
+            // away, and the shell runs as us so its cwd is always readable.
+            let cwd = crate::cwd::cwd_of_pid(fg_pid)
+                .or_else(|| self.shell_pid.and_then(crate::cwd::cwd_of_pid))
+                .map(|p| abbreviate_home(&p));
+            match (name, cwd) {
+                (Some(name), Some(cwd)) => format!("{name} ({cwd})"),
+                (Some(name), None) => name,
+                (None, Some(cwd)) => format!("{base} ({cwd})"),
+                (None, None) => base.to_string(),
+            }
+        }
+        #[cfg(not(unix))]
+        base.to_string()
     }
 
     pub fn send_input<B: Into<std::borrow::Cow<'static, [u8]>>>(&self, bytes: B) {

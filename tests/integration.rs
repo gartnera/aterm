@@ -150,6 +150,177 @@ fn new_tab_inherits_cwd_from_active() {
     let _ = std::fs::remove_dir(&dir);
 }
 
+#[test]
+#[cfg(target_os = "linux")]
+fn tab_title_shows_cwd_of_foreground_process() {
+    require_display!();
+    use std::time::{Duration, Instant};
+    let mut t = AtermTest::spawn();
+
+    let dir = format!("/tmp/aterm-fgcwd-{}-{}", std::process::id(), rand_suffix());
+    std::fs::create_dir_all(&dir).expect("mkdir target");
+
+    // cd into the target dir, then launch a foreground process that just
+    // blocks (cat with no args reads stdin forever). Its cwd is `dir`, so
+    // the tab label should become "cat (<dir>)" while it runs.
+    t.type_line(&format!("cd {dir}"));
+    t.type_line("echo FG_READY_TAG");
+    t.wait_for_text("FG_READY_TAG");
+    t.type_line("cat");
+
+    // We match on the parenthesised cwd specifically because the shell's
+    // own OSC-set title may also include the cwd path (bash sets
+    // "user@host: <cwd>"); we only want to assert on what *we* add for the
+    // foreground process.
+    let suffix = format!("({dir})");
+
+    // tabs() recomputes the label live (reads /proc), so poll it directly.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut last = String::new();
+    let mut seen = false;
+    while Instant::now() < deadline {
+        last = t.tabs()[0].title.clone();
+        if last.contains(&suffix) {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        seen,
+        "tab title did not show foreground cwd suffix {suffix:?}; last title was {last:?}"
+    );
+
+    // Quit the foreground process; the label should drop the cwd suffix
+    // once the shell is back in the foreground.
+    t.type_bytes(&[0x04]); // Ctrl-D closes cat's stdin
+    t.type_line("echo FG_DONE_TAG");
+    t.wait_for_text("FG_DONE_TAG");
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut cleared = false;
+    while Instant::now() < deadline {
+        if !t.tabs()[0].title.contains(&suffix) {
+            cleared = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        cleared,
+        "tab title kept cwd suffix after foreground process exited"
+    );
+
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn foreground_cwd_overrides_program_osc_title() {
+    // A program setting its own OSC title must NOT suppress the synthesised
+    // "name (cwd)". We can't attribute a title to the program that set it: a
+    // shell's preexec title (zsh sets one per command) is written just before
+    // it hands the tty to the job, so it races the handoff and looks identical
+    // to a title the job set itself. So every non-ssh foreground program shows
+    // name (cwd) regardless of any title it (or the shell) emitted. This is the
+    // regression test for the bug where the cwd suffix vanished for all
+    // commands under a title-setting shell.
+    require_display!();
+    use std::time::Duration;
+    let mut t = AtermTest::spawn();
+
+    let dir = format!("/tmp/aterm-osc-{}-{}", std::process::id(), rand_suffix());
+    std::fs::create_dir_all(&dir).expect("mkdir target");
+
+    t.type_line(&format!("cd {dir}"));
+    t.type_line("echo OSC_READY_TAG");
+    t.wait_for_text("OSC_READY_TAG");
+
+    // Launch a foreground subprocess that sets an OSC 0 title and then blocks.
+    // Despite the title, tab_label should show "sh (<dir>)".
+    t.type_line("sh -c 'printf \"\\033]0;OSC_TITLE_TAG\\007\"; sleep 60'");
+
+    let suffix = format!("({dir})");
+    let seen = wait_until(Duration::from_secs(8), || {
+        t.tabs()[0].title.contains(&suffix)
+    });
+    let last = t.tabs()[0].title.clone();
+    assert!(
+        seen,
+        "foreground cwd suffix {suffix:?} should override the program's OSC \
+         title; last title was {last:?}"
+    );
+    assert!(
+        last != "OSC_TITLE_TAG",
+        "the program's OSC title should not win for a non-ssh program: {last:?}"
+    );
+
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn ssh_keeps_its_own_title() {
+    // ssh is the one exception: its local cwd is meaningless, so we honour the
+    // title forwarded from the remote shell verbatim instead of annotating it
+    // with the local cwd. We stand in for the ssh binary with a copy of /bin/sh
+    // named "ssh" so process_name() reports "ssh".
+    require_display!();
+    use std::time::Duration;
+    let mut t = AtermTest::spawn();
+
+    let dir = format!("/tmp/aterm-ssh-{}-{}", std::process::id(), rand_suffix());
+    std::fs::create_dir_all(&dir).expect("mkdir target");
+    let fake_ssh = format!("{dir}/ssh");
+    std::fs::copy("/bin/sh", &fake_ssh).expect("copy sh -> ssh");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod ssh");
+    }
+
+    t.type_line(&format!("cd {dir}"));
+    t.type_line("echo SSH_READY_TAG");
+    t.wait_for_text("SSH_READY_TAG");
+
+    // Run our "ssh" so it sets a title (as a remote shell would, forwarded
+    // through ssh) and then blocks while in the foreground.
+    t.type_line("./ssh -c 'printf \"\\033]0;user@remote:~/proj\\007\"; sleep 60'");
+
+    let seen = wait_until(Duration::from_secs(8), || {
+        t.tabs()[0].title == "user@remote:~/proj"
+    });
+    let last = t.tabs()[0].title.clone();
+    assert!(
+        seen,
+        "ssh's forwarded title should be shown verbatim, got {last:?}"
+    );
+    // The local cwd must not be appended for ssh.
+    assert!(
+        !last.contains(&dir) && !last.contains('('),
+        "ssh title should not be annotated with the local cwd: {last:?}"
+    );
+
+    let _ = std::fs::remove_file(&fake_ssh);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// Poll `cond` every 100ms until it returns true or `timeout` elapses.
+/// Returns whether the condition was observed true.
+#[cfg(target_os = "linux")]
+fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rand_suffix() -> String {
     // Tiny non-crypto entropy source: the low bits of the monotonic clock
