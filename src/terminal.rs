@@ -363,6 +363,13 @@ pub struct TerminalSession {
     /// so holding this extra fd doesn't change shutdown behaviour.
     #[cfg(unix)]
     tty_fd: Option<std::os::fd::OwnedFd>,
+    /// Memoised result of [`tab_label`](Self::tab_label) with the instant it
+    /// was computed. The label resolution polls the foreground process, which
+    /// is heavy on macOS (sysctl(KERN_PROCARGS2) copies the target's whole
+    /// args+env blob), and tab_label() is called several times per frame.
+    /// Caching it for a short window keeps fast-output repaints cheap.
+    #[cfg(unix)]
+    label_cache: std::cell::RefCell<Option<(std::time::Instant, String)>>,
 }
 
 impl TerminalSession {
@@ -462,6 +469,8 @@ impl TerminalSession {
             shell_pid: Some(shell_pid),
             #[cfg(unix)]
             tty_fd,
+            #[cfg(unix)]
+            label_cache: std::cell::RefCell::new(None),
         })
     }
 
@@ -518,13 +527,37 @@ impl TerminalSession {
         &self.title
     }
 
-    /// Title to display in the tab strip / OS window. When a child program
-    /// (htop, vim, claude, …) is running in the foreground we show its name
-    /// and cwd as `name (cwd)`, since the shell stops updating its own OSC
-    /// title while a foreground job runs. When the shell itself is in the
-    /// foreground we return its bare title — the prompt already shows the
-    /// cwd, so there's nothing useful to add.
+    /// Title to display in the tab strip / OS window, memoised for a short
+    /// window. [`compute_tab_label`](Self::compute_tab_label) polls the tty's
+    /// foreground process, which is heavy on macOS, and we call this several
+    /// times per frame (twice per tab in the layout pass, once for the OS
+    /// window title). The foreground job and its cwd change far slower than we
+    /// repaint, so serving a label that's up to `TTL` stale is invisible while
+    /// it keeps fast-output redraws off the syscall path.
     pub fn tab_label(&self) -> String {
+        #[cfg(unix)]
+        {
+            const TTL: std::time::Duration = std::time::Duration::from_millis(250);
+            if let Some((at, label)) = self.label_cache.borrow().as_ref() {
+                if at.elapsed() < TTL {
+                    return label.clone();
+                }
+            }
+            let label = self.compute_tab_label();
+            *self.label_cache.borrow_mut() = Some((std::time::Instant::now(), label.clone()));
+            label
+        }
+        #[cfg(not(unix))]
+        self.compute_tab_label()
+    }
+
+    /// Resolve the tab label from scratch. When a child program (htop, vim,
+    /// claude, …) is running in the foreground we show its name and cwd as
+    /// `name (cwd)`, since the shell stops updating its own OSC title while a
+    /// foreground job runs. When the shell itself is in the foreground we
+    /// return its bare title — the prompt already shows the cwd, so there's
+    /// nothing useful to add.
+    fn compute_tab_label(&self) -> String {
         let base = self.title();
         #[cfg(unix)]
         {
