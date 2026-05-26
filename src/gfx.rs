@@ -16,10 +16,11 @@ struct TabBarTheme {
     /// Background of the active tab — matches the terminal content bg so the
     /// active tab visually merges into the page.
     active_bg: [f32; 4],
+    /// Background of each inactive tab. Lighter than `bar_bg` so the strip
+    /// between adjacent inactive tabs reads as a visible gap.
+    inactive_bg: [f32; 4],
     /// Thin accent stripe along the bottom of the active tab.
     accent: [f32; 4],
-    /// 1px separator drawn between adjacent inactive tabs.
-    separator: [f32; 4],
     /// Text color for the active tab (sRGB; glyphon uses sRGB).
     active_fg: [u8; 3],
     /// Text color for inactive tabs.
@@ -29,12 +30,10 @@ struct TabBarTheme {
 impl TabBarTheme {
     fn derive(colors: &ConfigColors) -> Self {
         Self {
-            // A bit darker than before (0.55 vs 0.7) so the active tab visibly
-            // "lifts" off the bar without needing per-tab borders.
             bar_bg: linear_rgba(darken(colors.background, 0.55)),
             active_bg: linear_rgba(colors.background),
+            inactive_bg: linear_rgba(darken(colors.background, 0.82)),
             accent: linear_rgba(colors.bright.blue),
-            separator: linear_rgba(darken(colors.background, 0.85)),
             active_fg: colors.foreground,
             inactive_fg: colors.bright.black,
         }
@@ -564,7 +563,8 @@ impl Gfx {
         self.tab_hit_regions.clear();
         let bar_h_px = tab_bar_height * scale;
         let accent_h_px = (2.0 * scale).round().max(1.0);
-        let sep_w_px = (scale).round().max(1.0);
+        let tab_pad_x_px = (4.0 * scale).round();
+        let inactive_inset_y = (bar_h_px * 0.18).round();
         let mut segments: Vec<(String, bool)> = Vec::new();
         let mut tab_text = String::new();
         let mut chars_cursor: usize = 0;
@@ -573,46 +573,47 @@ impl Gfx {
                 let sep_pad = " ".repeat(SEP_CHARS);
                 segments.push((sep_pad.clone(), false));
                 tab_text.push_str(&sep_pad);
-                let sep_mid_x =
-                    strip_left_px + (chars_cursor as f32 + SEP_CHARS as f32 * 0.5) * cell_w_px;
-                let prev_active = i - 1 == active_idx;
-                let next_active = i == active_idx;
-                // Only draw the dividing line between two inactive tabs.
-                if !prev_active && !next_active {
-                    let inset_y = (bar_h_px * 0.25).round();
-                    self.quad_scratch.push(Quad {
-                        rect: [
-                            sep_mid_x - sep_w_px * 0.5,
-                            inset_y,
-                            sep_w_px,
-                            bar_h_px - 2.0 * inset_y,
-                        ],
-                        color: self.tab_theme.separator,
-                    });
-                }
                 chars_cursor += SEP_CHARS;
             }
             let title = truncate_with_ellipsis(t.title(), budgets.get(i).copied().unwrap_or(0));
             let title_chars = title.chars().count();
             let x0 = strip_left_px + chars_cursor as f32 * cell_w_px;
             let x1 = x0 + title_chars as f32 * cell_w_px;
-            self.tab_hit_regions.push((i, x0 - 4.0, x1 + 4.0));
+            self.tab_hit_regions
+                .push((i, x0 - tab_pad_x_px, x1 + tab_pad_x_px));
             if i == active_idx {
                 // Background quad merges the active tab into the terminal
                 // page below.
                 self.quad_scratch.push(Quad {
-                    rect: [x0 - 4.0, 0.0, (x1 - x0) + 8.0, bar_h_px],
+                    rect: [
+                        x0 - tab_pad_x_px,
+                        0.0,
+                        (x1 - x0) + 2.0 * tab_pad_x_px,
+                        bar_h_px,
+                    ],
                     color: self.tab_theme.active_bg,
                 });
                 // Accent stripe along the bottom of the active tab.
                 self.quad_scratch.push(Quad {
                     rect: [
-                        x0 - 4.0,
+                        x0 - tab_pad_x_px,
                         bar_h_px - accent_h_px,
-                        (x1 - x0) + 8.0,
+                        (x1 - x0) + 2.0 * tab_pad_x_px,
                         accent_h_px,
                     ],
                     color: self.tab_theme.accent,
+                });
+            } else {
+                // Inactive tabs get a lighter pill so the darker bar_bg
+                // shows through between adjacent tabs as a visible gap.
+                self.quad_scratch.push(Quad {
+                    rect: [
+                        x0 - tab_pad_x_px,
+                        inactive_inset_y,
+                        (x1 - x0) + 2.0 * tab_pad_x_px,
+                        bar_h_px - 2.0 * inactive_inset_y,
+                    ],
+                    color: self.tab_theme.inactive_bg,
                 });
             }
             tab_text.push_str(&title);
