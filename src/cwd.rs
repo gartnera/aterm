@@ -62,7 +62,7 @@ fn cwd_of_pid_impl(pid: u32) -> Option<PathBuf> {
     let raw = info.pvi_cdir.vip_path;
     // vip_path is a fixed-size NUL-terminated UTF-8 path. CStr::from_ptr
     // stops at the first NUL.
-    let cstr = unsafe { CStr::from_ptr(raw.as_ptr()) };
+    let cstr = unsafe { CStr::from_ptr(raw.as_ptr().cast::<libc::c_char>()) };
     let bytes = cstr.to_bytes();
     if bytes.is_empty() {
         return None;
