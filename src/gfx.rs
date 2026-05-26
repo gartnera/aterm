@@ -198,10 +198,19 @@ fn build_row_text<'a>(
             cell.fg
         };
         let start = text.len();
-        // Push the actual char; pad with a NBSP if the cell is empty (cosmic-text
-        // collapses runs of spaces in some shaping paths, which can drift the
-        // column grid).
-        text.push(if ch == ' ' { '\u{00A0}' } else { ch });
+        // Box-drawing / block / braille chars are drawn procedurally as
+        // quads in render(), so replace them with NBSP in the text buffer to
+        // avoid double-drawing (and the font's gappy version).
+        let render_ch = if crate::box_drawing::is_handled(ch) {
+            '\u{00A0}'
+        } else if ch == ' ' {
+            // cosmic-text collapses runs of spaces in some shaping paths,
+            // which can drift the column grid.
+            '\u{00A0}'
+        } else {
+            ch
+        };
+        text.push(render_ch);
         let end = text.len();
         let mut attrs = Attrs::new().family(family);
         attrs = attrs.color(Color::rgb(fg[0], fg[1], fg[2]));
@@ -828,6 +837,42 @@ impl Gfx {
                     rect: [x, y, cell_w_px, cell_h_px],
                     color: linear_rgba(snap.fg),
                 });
+            }
+
+            // Procedural glyphs: box-drawing, block elements, braille. The
+            // font's versions of these leave gaps between cells; we tile
+            // them ourselves so borders join cleanly. Drawn here (after
+            // bg/cursor, before text) so the cursor's fg block inverts them
+            // the same way the text inverts.
+            for (row_idx, row) in snap.cells.iter().enumerate() {
+                let cursor_col_here =
+                    (snap.cursor_visible && snap.cursor_line == row_idx).then_some(snap.cursor_col);
+                for (col, cell) in row.iter().enumerate() {
+                    if !crate::box_drawing::is_handled(cell.ch) {
+                        continue;
+                    }
+                    let on_cursor = Some(col) == cursor_col_here;
+                    let selected = cell_in_selection(snap, row_idx, col);
+                    let fg = if on_cursor {
+                        cell.bg
+                    } else if selected {
+                        snap.bg
+                    } else {
+                        cell.fg
+                    };
+                    let x = PAD_X * scale + col as f32 * cell_w_px;
+                    let y = top_offset_px + row_idx as f32 * cell_h_px;
+                    crate::box_drawing::push_quads(
+                        quads,
+                        cell.ch,
+                        x,
+                        y,
+                        cell_w_px,
+                        cell_h_px,
+                        linear_rgba(fg),
+                        scale,
+                    );
+                }
             }
 
             // Underlines: SGR underline or OSC 8 hyperlink cells are drawn
