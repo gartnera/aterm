@@ -117,6 +117,20 @@ fn default_shell() -> &'static str {
     "/bin/sh"
 }
 
+/// Render a path with `$HOME` collapsed to `~`, falling back to the
+/// lossy display form when the path isn't UTF-8.
+fn abbreviate_home(path: &std::path::Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
 /// URL regex borrowed from alacritty's hint mode defaults.
 const URL_REGEX_PATTERN: &str =
     "(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)\
@@ -487,6 +501,29 @@ impl TerminalSession {
 
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// Title to display in the tab strip / OS window. When a child program
+    /// (htop, vim, claude, …) is running in the foreground we append its
+    /// cwd so the user can still tell which directory the tab is in. When
+    /// the shell itself is foreground we just return the bare title — the
+    /// shell prompt already shows its own cwd.
+    pub fn tab_label(&self) -> String {
+        let base = self.title();
+        let Some(shell_pid) = self.shell_pid else {
+            return base.to_string();
+        };
+        let Some(fg_pid) = crate::cwd::foreground_pid(shell_pid) else {
+            return base.to_string();
+        };
+        if fg_pid == shell_pid {
+            return base.to_string();
+        }
+        let Some(cwd) = crate::cwd::cwd_of_pid(fg_pid) else {
+            return base.to_string();
+        };
+        let pretty = abbreviate_home(&cwd);
+        format!("{base} \u{2014} {pretty}")
     }
 
     pub fn send_input<B: Into<std::borrow::Cow<'static, [u8]>>>(&self, bytes: B) {

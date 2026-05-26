@@ -150,6 +150,67 @@ fn new_tab_inherits_cwd_from_active() {
     let _ = std::fs::remove_dir(&dir);
 }
 
+#[test]
+#[cfg(target_os = "linux")]
+fn tab_title_shows_cwd_of_foreground_process() {
+    require_display!();
+    use std::time::{Duration, Instant};
+    let mut t = AtermTest::spawn();
+
+    let dir = format!("/tmp/aterm-fgcwd-{}-{}", std::process::id(), rand_suffix());
+    std::fs::create_dir_all(&dir).expect("mkdir target");
+
+    // cd into the target dir, then launch a foreground process that just
+    // blocks (cat with no args reads stdin forever). Its cwd is `dir`, so
+    // the tab label should gain a " — <dir>" suffix while it runs.
+    t.type_line(&format!("cd {dir}"));
+    t.type_line("echo FG_READY_TAG");
+    t.wait_for_text("FG_READY_TAG");
+    t.type_line("cat");
+
+    // The cwd is appended after an em-dash separator. We match on the
+    // suffix specifically because the shell's own OSC-set title may also
+    // include the cwd path (bash sets "user@host: <cwd>"), and we only
+    // want to assert on the part *we* add for the foreground process.
+    let suffix = format!("\u{2014} {dir}");
+
+    // tabs() recomputes the label live (reads /proc), so poll it directly.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut last = String::new();
+    let mut seen = false;
+    while Instant::now() < deadline {
+        last = t.tabs()[0].title.clone();
+        if last.contains(&suffix) {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        seen,
+        "tab title did not show foreground cwd suffix {suffix:?}; last title was {last:?}"
+    );
+
+    // Quit the foreground process; the label should drop the cwd suffix
+    // once the shell is back in the foreground.
+    t.type_bytes(&[0x04]); // Ctrl-D closes cat's stdin
+    t.type_line("echo FG_DONE_TAG");
+    t.wait_for_text("FG_DONE_TAG");
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut cleared = false;
+    while Instant::now() < deadline {
+        if !t.tabs()[0].title.contains(&suffix) {
+            cleared = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(cleared, "tab title kept cwd suffix after foreground process exited");
+
+    let _ = std::fs::remove_dir(&dir);
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rand_suffix() -> String {
     // Tiny non-crypto entropy source: the low bits of the monotonic clock

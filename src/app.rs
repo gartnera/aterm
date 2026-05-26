@@ -115,11 +115,11 @@ impl App {
         let new_title = self
             .tabs
             .get(self.active_tab)
-            .map(|t| t.title())
-            .unwrap_or("aterm");
+            .map(|t| t.tab_label())
+            .unwrap_or_else(|| "aterm".to_string());
         if new_title != self.window_title {
-            window.set_title(new_title);
-            self.window_title = new_title.to_string();
+            window.set_title(&new_title);
+            self.window_title = new_title;
         }
     }
 
@@ -1054,7 +1054,7 @@ impl App {
                     .map(|(i, t)| {
                         serde_json::json!({
                             "index": i,
-                            "title": t.title(),
+                            "title": t.tab_label(),
                             "active": i == self.active_tab,
                         })
                     })

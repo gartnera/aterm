@@ -20,6 +20,44 @@ pub fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
     cwd_of_pid_impl(pid)
 }
 
+/// Best-effort lookup of the foreground process of the tty controlling
+/// `shell_pid`. Returns the PID of the process group leader running in
+/// the foreground — i.e. the program the user is currently looking at
+/// (`htop`, `vim`, etc.). When the shell itself is foreground (sitting at
+/// the prompt), this returns `Some(shell_pid)`. Returns `None` when the
+/// platform isn't supported, the shell has no controlling terminal, or
+/// the lookup failed.
+pub fn foreground_pid(shell_pid: u32) -> Option<u32> {
+    foreground_pid_impl(shell_pid)
+}
+
+#[cfg(target_os = "linux")]
+fn foreground_pid_impl(shell_pid: u32) -> Option<u32> {
+    // /proc/<pid>/stat field 8 is `tpgid`: the foreground process group
+    // of the controlling terminal. The kernel updates it whenever the
+    // shell calls tcsetpgrp() to hand the tty to a child job, so reading
+    // it gives us the pid of whatever's currently in the foreground.
+    //
+    // The comm field (field 2) is wrapped in parentheses and may itself
+    // contain spaces and parens, so we anchor parsing on the *last* `)`
+    // rather than splitting on whitespace from the start.
+    let stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
+    let rparen = stat.rfind(')')?;
+    // After ")" comes " S 563 ..." — fields 3..N separated by spaces.
+    // tpgid is field 8, i.e. the 6th field after state.
+    let mut fields = stat[rparen + 1..].split_ascii_whitespace();
+    let tpgid: i32 = fields.nth(5)?.parse().ok()?;
+    if tpgid <= 0 {
+        return None;
+    }
+    Some(tpgid as u32)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn foreground_pid_impl(_shell_pid: u32) -> Option<u32> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn cwd_of_pid_impl(pid: u32) -> Option<PathBuf> {
     // /proc/<pid>/cwd is a symlink to the process's current working
@@ -98,5 +136,19 @@ mod tests {
         // PID 0 is never a real process. The kernel returns EINVAL/ESRCH;
         // we map either to None.
         assert!(cwd_of_pid(0).is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn foreground_pid_parses_proc_stat() {
+        // Self-lookup: we have no controlling tty in the test runner, so
+        // tpgid is -1 and this returns None. Just exercise the parser
+        // path and make sure it doesn't panic on a real stat file.
+        let _ = foreground_pid(std::process::id());
+    }
+
+    #[test]
+    fn foreground_pid_nonexistent_returns_none() {
+        assert!(foreground_pid(0).is_none());
     }
 }
