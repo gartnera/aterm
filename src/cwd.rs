@@ -1,17 +1,24 @@
-//! Look up the current working directory of a process by PID.
+//! Look up process working directories and the tty's foreground process.
 //!
-//! Used to give new tabs the same cwd the user has `cd`d to in the active
-//! tab. This is the same trick alacritty uses; it works without any shell
-//! configuration because the kernel always knows where the process is.
+//! Two uses:
+//! - Seed a new tab's cwd from the active tab (the same trick alacritty
+//!   uses; works without shell config because the kernel always knows
+//!   where a process is).
+//! - Show the foreground program's name + cwd in the tab title.
 //!
-//! Two platforms are supported:
-//! - Linux: `readlink /proc/<pid>/cwd` (cheap; std-only).
-//! - macOS: `proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, …)` via libc.
+//! Platform support:
+//! - Linux: `/proc/<pid>/cwd` and `/proc/<pid>/comm` (std-only).
+//! - macOS: `proc_pidinfo`/`proc_name` via libc.
+//! - Foreground process lookup uses `tcgetpgrp()` on the pty master fd on
+//!   every unix.
 //!
-//! Everywhere else this returns `None`, and `App::spawn_tab` falls back to
-//! the launcher's cwd as before.
+//! Everywhere unsupported these return `None`, and callers fall back to
+//! the launcher's cwd / the bare title as before.
 
 use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::os::fd::RawFd;
 
 /// Resolve the working directory of `pid`. Returns `None` if the process
 /// has exited, the lookup is unsupported on this OS, or the OS reported
@@ -20,41 +27,30 @@ pub fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
     cwd_of_pid_impl(pid)
 }
 
-/// Best-effort lookup of the foreground process of the tty controlling
-/// `shell_pid`. Returns the PID of the process group leader running in
-/// the foreground — i.e. the program the user is currently looking at
-/// (`htop`, `vim`, etc.). When the shell itself is foreground (sitting at
-/// the prompt), this returns `Some(shell_pid)`. Returns `None` when the
-/// platform isn't supported, the shell has no controlling terminal, or
-/// the lookup failed.
-pub fn foreground_pid(shell_pid: u32) -> Option<u32> {
-    foreground_pid_impl(shell_pid)
-}
-
-#[cfg(target_os = "linux")]
-fn foreground_pid_impl(shell_pid: u32) -> Option<u32> {
-    // /proc/<pid>/stat field 8 is `tpgid`: the foreground process group
-    // of the controlling terminal. The kernel updates it whenever the
-    // shell calls tcsetpgrp() to hand the tty to a child job, so reading
-    // it gives us the pid of whatever's currently in the foreground.
-    //
-    // The comm field (field 2) is wrapped in parentheses and may itself
-    // contain spaces and parens, so we anchor parsing on the *last* `)`
-    // rather than splitting on whitespace from the start.
-    let stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
-    let rparen = stat.rfind(')')?;
-    // After ")" comes " S 563 ..." — fields 3..N separated by spaces.
-    // tpgid is field 8, i.e. the 6th field after state.
-    let mut fields = stat[rparen + 1..].split_ascii_whitespace();
-    let tpgid: i32 = fields.nth(5)?.parse().ok()?;
-    if tpgid <= 0 {
+/// Best-effort lookup of the foreground process of the terminal referred
+/// to by `tty_fd` (a fd open on the pty master). Returns the PID of the
+/// process group leader running in the foreground — i.e. the program the
+/// user is currently looking at (`htop`, `vim`, etc.). When the shell
+/// itself is foreground (sitting at the prompt) this returns the shell's
+/// pgid, which equals the shell pid for an interactive shell. Returns
+/// `None` when unsupported, the terminal has no foreground group, or the
+/// call failed.
+#[cfg(unix)]
+pub fn foreground_pid(tty_fd: RawFd) -> Option<u32> {
+    // tcgetpgrp() reports the foreground process group of the controlling
+    // terminal. The kernel updates it whenever the shell calls tcsetpgrp()
+    // to hand the tty to a child job, so it tracks the foreground program
+    // without any shell config. The group leader's pid equals the pgid, so
+    // we can pass the result straight to cwd_of_pid / process_name.
+    let pgrp = unsafe { libc::tcgetpgrp(tty_fd) };
+    if pgrp <= 0 {
         return None;
     }
-    Some(tpgid as u32)
+    Some(pgrp as u32)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn foreground_pid_impl(_shell_pid: u32) -> Option<u32> {
+#[cfg(not(unix))]
+pub fn foreground_pid(_tty_fd: i32) -> Option<u32> {
     None
 }
 
@@ -78,7 +74,38 @@ fn process_name_impl(pid: u32) -> Option<String> {
     Some(name.to_string())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn process_name_impl(pid: u32) -> Option<String> {
+    // proc_name() copies the process's (accounting) name into the buffer
+    // and returns the byte count. The name is at most 2*MAXCOMLEN; 256 is
+    // comfortably large. SAFETY: we pass a buffer and its true length, and
+    // only read the bytes the call reports it wrote.
+    let mut buf = [0u8; 256];
+    let written = unsafe {
+        libc::proc_name(
+            pid as libc::c_int,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len() as u32,
+        )
+    };
+    if written <= 0 {
+        return None;
+    }
+    let written = (written as usize).min(buf.len());
+    // proc_name may or may not include a trailing NUL in the count; stop
+    // at the first NUL to be safe.
+    let end = buf[..written]
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(written);
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_name_impl(_pid: u32) -> Option<String> {
     None
 }
@@ -164,16 +191,21 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn foreground_pid_parses_proc_stat() {
-        // Self-lookup: we have no controlling tty in the test runner, so
-        // tpgid is -1 and this returns None. Just exercise the parser
-        // path and make sure it doesn't panic on a real stat file.
-        let _ = foreground_pid(std::process::id());
+    #[cfg(unix)]
+    fn foreground_pid_bad_fd_returns_none() {
+        // -1 is never a valid fd; tcgetpgrp sets EBADF and we map to None.
+        assert!(foreground_pid(-1).is_none());
     }
 
     #[test]
-    fn foreground_pid_nonexistent_returns_none() {
-        assert!(foreground_pid(0).is_none());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn process_name_self_is_nonempty() {
+        let name = process_name(std::process::id()).expect("self process name");
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn process_name_nonexistent_returns_none() {
+        assert!(process_name(0).is_none());
     }
 }

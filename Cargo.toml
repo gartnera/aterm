@@ -29,9 +29,10 @@ serde_json = "1"
 dirs = "5"
 arboard = "3"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# proc_pidinfo + PROC_PIDVNODEPATHINFO for cwd-of-PID lookup. Linux uses
-# /proc/<pid>/cwd via std::fs::read_link and needs no extra dep.
+[target.'cfg(unix)'.dependencies]
+# tcgetpgrp() for foreground-process detection (both Linux and macOS).
+# On macOS also: proc_pidinfo/PROC_PIDVNODEPATHINFO for cwd-of-PID and
+# proc_name for the process name. Linux reads /proc for those two.
 libc = "0.2"
 
 [dev-dependencies]

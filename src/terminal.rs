@@ -357,6 +357,12 @@ pub struct TerminalSession {
     /// shell's current working directory when the user opens a new tab so
     /// it inherits the cd'd-to location.
     shell_pid: Option<u32>,
+    /// A dup of the pty master fd, kept so we can call tcgetpgrp() to find
+    /// the tty's foreground process for the tab title. The pty's own Drop
+    /// sends SIGHUP explicitly (it doesn't rely on the master fd closing),
+    /// so holding this extra fd doesn't change shutdown behaviour.
+    #[cfg(unix)]
+    tty_fd: Option<std::os::fd::OwnedFd>,
 }
 
 impl TerminalSession {
@@ -415,6 +421,13 @@ impl TerminalSession {
         // we need it to look up the shell's cwd later via /proc on Linux
         // or proc_pidinfo on macOS.
         let shell_pid = pty.child().id();
+        // Dup the master fd while we still hold the pty, so we can poll the
+        // tty's foreground process group later (tcgetpgrp) for the title.
+        #[cfg(unix)]
+        let tty_fd = {
+            use std::os::fd::AsFd;
+            pty.file().as_fd().try_clone_to_owned().ok()
+        };
 
         let (events_tx, events_rx) = unbounded();
         let listener = ChannelListener {
@@ -447,6 +460,8 @@ impl TerminalSession {
             palette,
             dynamic_title,
             shell_pid: Some(shell_pid),
+            #[cfg(unix)]
+            tty_fd,
         })
     }
 
@@ -511,23 +526,32 @@ impl TerminalSession {
     /// cwd, so there's nothing useful to add.
     pub fn tab_label(&self) -> String {
         let base = self.title();
-        let Some(shell_pid) = self.shell_pid else {
-            return base.to_string();
-        };
-        let Some(fg_pid) = crate::cwd::foreground_pid(shell_pid) else {
-            return base.to_string();
-        };
-        if fg_pid == shell_pid {
-            return base.to_string();
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let Some(tty_fd) = self.tty_fd.as_ref() else {
+                return base.to_string();
+            };
+            let Some(fg_pid) = crate::cwd::foreground_pid(tty_fd.as_raw_fd()) else {
+                return base.to_string();
+            };
+            // tcgetpgrp returns the shell's pgid while it's at the prompt;
+            // that equals the shell pid for our interactive shell, so skip
+            // the suffix in that case — the prompt already shows the cwd.
+            if self.shell_pid == Some(fg_pid) {
+                return base.to_string();
+            }
+            let name = crate::cwd::process_name(fg_pid);
+            let cwd = crate::cwd::cwd_of_pid(fg_pid).map(|p| abbreviate_home(&p));
+            match (name, cwd) {
+                (Some(name), Some(cwd)) => format!("{name} ({cwd})"),
+                (Some(name), None) => name,
+                (None, Some(cwd)) => format!("{base} ({cwd})"),
+                (None, None) => base.to_string(),
+            }
         }
-        let name = crate::cwd::process_name(fg_pid);
-        let cwd = crate::cwd::cwd_of_pid(fg_pid).map(|p| abbreviate_home(&p));
-        match (name, cwd) {
-            (Some(name), Some(cwd)) => format!("{name} ({cwd})"),
-            (Some(name), None) => name,
-            (None, Some(cwd)) => format!("{base} ({cwd})"),
-            (None, None) => base.to_string(),
-        }
+        #[cfg(not(unix))]
+        base.to_string()
     }
 
     pub fn send_input<B: Into<std::borrow::Cow<'static, [u8]>>>(&self, bytes: B) {
