@@ -336,6 +336,9 @@ pub struct TerminalSession {
     lines: u16,
     exited: bool,
     palette: ConfigColors,
+    /// When false, OSC 0/1/2 title-change requests from the running program
+    /// are ignored — the tab keeps its initial title.
+    dynamic_title: bool,
     /// PID of the shell process spawned for this tab. Used to resolve the
     /// shell's current working directory when the user opens a new tab so
     /// it inherits the cd'd-to location.
@@ -351,6 +354,7 @@ impl TerminalSession {
         proxy: EventLoopProxy<WakeEvent>,
         palette: ConfigColors,
         working_directory: Option<std::path::PathBuf>,
+        dynamic_title: bool,
     ) -> std::io::Result<Self> {
         let window_size = WindowSize {
             num_lines: lines,
@@ -427,6 +431,7 @@ impl TerminalSession {
             lines,
             exited: false,
             palette,
+            dynamic_title,
             shell_pid: Some(shell_pid),
         })
     }
@@ -712,8 +717,16 @@ impl TerminalSession {
         let mut wake = false;
         while let Ok(event) = self.events.try_recv() {
             match event {
-                TermEvent::Title(t) => self.title = t,
-                TermEvent::ResetTitle => self.title = "shell".into(),
+                TermEvent::Title(t) => {
+                    if self.dynamic_title {
+                        self.title = t;
+                    }
+                }
+                TermEvent::ResetTitle => {
+                    if self.dynamic_title {
+                        self.title = "shell".into();
+                    }
+                }
                 TermEvent::Wakeup => wake = true,
                 TermEvent::Exit | TermEvent::ChildExit(_) => {
                     self.exited = true;

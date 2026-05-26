@@ -143,6 +143,7 @@ impl App {
             self.proxy.clone(),
             self.config.colors.clone(),
             cwd,
+            self.config.dynamic_title,
         ) {
             Ok(s) => {
                 self.tabs.push(s);
@@ -359,6 +360,7 @@ impl ApplicationHandler<WakeEvent> for App {
             self.proxy.clone(),
             self.config.colors.clone(),
             None,
+            self.config.dynamic_title,
         ) {
             Ok(s) => {
                 self.tabs.push(s);
