@@ -7,6 +7,7 @@ pub struct WakeEvent;
 
 mod app;
 mod binding;
+mod box_drawing;
 mod config;
 mod cwd;
 #[cfg(unix)]
