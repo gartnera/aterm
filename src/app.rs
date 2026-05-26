@@ -26,6 +26,14 @@ use crate::WakeEvent;
 
 pub const TAB_BAR_HEIGHT: f32 = 28.0;
 
+/// How often the event loop recomputes tab labels from the foreground
+/// process, off the render path. Decoupled from render cadence so the title
+/// stays fresh while a program repaints slowly (htop, ~1 fps) or sits idle,
+/// while bounding the heavy per-poll syscalls regardless of how fast output
+/// flows. Costs ~4 cheap wakeups/sec while the app is running.
+#[cfg(unix)]
+const LABEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Logical-pixel inset reserved on the left edge of the tab bar so it doesn't
 /// overlap macOS traffic-light buttons (close/minimize/zoom). On other
 /// platforms the tab bar lives in its own strip below the window chrome, so
@@ -76,6 +84,12 @@ pub struct App {
     /// `ATERM_DEBUG_SOCK` was set at startup.
     #[cfg(unix)]
     debug_rx: Option<crossbeam_channel::Receiver<debug_ipc::PendingRequest>>,
+    /// When we last recomputed every tab's label. The event loop polls the
+    /// foreground process on a fixed cadence (off the render path) and
+    /// repaints only when a label changed, so titles stay fresh independent of
+    /// how often the foreground program repaints. See [`about_to_wait`].
+    #[cfg(unix)]
+    last_label_poll: std::time::Instant,
 }
 
 impl App {
@@ -105,6 +119,8 @@ impl App {
             window_title: String::new(),
             #[cfg(unix)]
             debug_rx,
+            #[cfg(unix)]
+            last_label_poll: std::time::Instant::now(),
         }
     }
 
@@ -558,6 +574,37 @@ impl ApplicationHandler<WakeEvent> for App {
                 w.request_redraw();
             }
         }
+    }
+
+    /// Drive the off-render label poll. winit calls this once per wake cycle
+    /// (after events are processed, before the loop sleeps). We recompute tab
+    /// labels at most once per `LABEL_POLL_INTERVAL` — so a burst of PTY output
+    /// that wakes us many times a second still costs a single poll — and
+    /// repaint only when a label actually changed. Re-arming `WaitUntil` makes
+    /// the loop wake on its own so the title stays fresh even when the
+    /// foreground program produces no output and there is no input (a shell
+    /// idle at its prompt after a job exits, htop between its ~1 fps frames).
+    #[cfg(unix)]
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = std::time::Instant::now();
+        if now.saturating_duration_since(self.last_label_poll) >= LABEL_POLL_INTERVAL {
+            self.last_label_poll = now;
+            let mut changed = false;
+            for tab in &self.tabs {
+                if tab.refresh_label() {
+                    changed = true;
+                }
+            }
+            if changed {
+                if let Some(w) = self.window.clone() {
+                    self.sync_window_title(&w);
+                    w.request_redraw();
+                }
+            }
+        }
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            self.last_label_poll + LABEL_POLL_INTERVAL,
+        ));
     }
 }
 
