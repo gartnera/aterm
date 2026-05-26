@@ -363,6 +363,12 @@ pub struct TerminalSession {
     /// so holding this extra fd doesn't change shutdown behaviour.
     #[cfg(unix)]
     tty_fd: Option<std::os::fd::OwnedFd>,
+    /// The foreground process group that owned the tty when `title` was last
+    /// set via OSC 0/1/2. Lets us tell a program's own title (vim, tmux, a
+    /// remote shell over ssh) apart from the shell's stale prompt title: if
+    /// this still matches the current foreground program, we show `title`
+    /// verbatim instead of synthesising `name (cwd)`.
+    title_set_by_pid: Option<u32>,
 }
 
 impl TerminalSession {
@@ -462,7 +468,22 @@ impl TerminalSession {
             shell_pid: Some(shell_pid),
             #[cfg(unix)]
             tty_fd,
+            title_set_by_pid: None,
         })
+    }
+
+    /// The tty's current foreground process group leader, or None when
+    /// unsupported / unavailable. Wraps the cross-platform `tcgetpgrp`
+    /// lookup with this session's pty master fd.
+    #[cfg(unix)]
+    fn current_foreground_pid(&self) -> Option<u32> {
+        use std::os::fd::AsRawFd;
+        let fd = self.tty_fd.as_ref()?;
+        crate::cwd::foreground_pid(fd.as_raw_fd())
+    }
+    #[cfg(not(unix))]
+    fn current_foreground_pid(&self) -> Option<u32> {
+        None
     }
 
     /// Best-effort lookup of the shell's current working directory.
@@ -539,6 +560,12 @@ impl TerminalSession {
             // that equals the shell pid for our interactive shell, so skip
             // the suffix in that case — the prompt already shows the cwd.
             if self.shell_pid == Some(fg_pid) {
+                return base.to_string();
+            }
+            // If the current foreground program set the title itself (vim,
+            // tmux, a remote shell over ssh), honour it verbatim rather than
+            // overwriting it with name (cwd).
+            if self.title_set_by_pid == Some(fg_pid) {
                 return base.to_string();
             }
             let name = crate::cwd::process_name(fg_pid);
@@ -784,12 +811,18 @@ impl TerminalSession {
             match event {
                 TermEvent::Title(t) => {
                     if self.dynamic_title {
+                        // Attribute the title to whatever owns the tty right
+                        // now, so tab_label can tell a foreground program's
+                        // own title from the shell's stale prompt title.
+                        let owner = self.current_foreground_pid();
                         self.title = t;
+                        self.title_set_by_pid = owner;
                     }
                 }
                 TermEvent::ResetTitle => {
                     if self.dynamic_title {
                         self.title = "shell".into();
+                        self.title_set_by_pid = None;
                     }
                 }
                 TermEvent::Wakeup => wake = true,

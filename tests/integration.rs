@@ -214,6 +214,49 @@ fn tab_title_shows_cwd_of_foreground_process() {
     let _ = std::fs::remove_dir(&dir);
 }
 
+#[test]
+#[cfg(target_os = "linux")]
+fn foreground_program_osc_title_wins_over_cwd() {
+    require_display!();
+    use std::time::{Duration, Instant};
+    let mut t = AtermTest::spawn();
+
+    let dir = format!("/tmp/aterm-osc-{}-{}", std::process::id(), rand_suffix());
+    std::fs::create_dir_all(&dir).expect("mkdir target");
+
+    t.type_line(&format!("cd {dir}"));
+    t.type_line("echo OSC_READY_TAG");
+    t.wait_for_text("OSC_READY_TAG");
+
+    // Launch a foreground subprocess that sets an OSC 0 title and then
+    // blocks. Because the title is set while this subprocess owns the tty,
+    // tab_label should show it verbatim — NOT "sh (<dir>)".
+    t.type_line("sh -c 'printf \"\\033]0;OSC_TITLE_TAG\\007\"; sleep 60'");
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut last = String::new();
+    let mut seen = false;
+    while Instant::now() < deadline {
+        last = t.tabs()[0].title.clone();
+        if last == "OSC_TITLE_TAG" {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        seen,
+        "expected verbatim OSC title 'OSC_TITLE_TAG', got {last:?}"
+    );
+    // The synthesised "name (cwd)" form must not leak in.
+    assert!(
+        !last.contains(&dir) && !last.contains('('),
+        "OSC title should be verbatim, not annotated with cwd: {last:?}"
+    );
+
+    let _ = std::fs::remove_dir(&dir);
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rand_suffix() -> String {
     // Tiny non-crypto entropy source: the low bits of the monotonic clock
