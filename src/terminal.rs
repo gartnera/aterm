@@ -363,13 +363,15 @@ pub struct TerminalSession {
     /// so holding this extra fd doesn't change shutdown behaviour.
     #[cfg(unix)]
     tty_fd: Option<std::os::fd::OwnedFd>,
-    /// Memoised result of [`tab_label`](Self::tab_label) with the instant it
-    /// was computed. The label resolution polls the foreground process, which
-    /// is heavy on macOS (sysctl(KERN_PROCARGS2) copies the target's whole
-    /// args+env blob), and tab_label() is called several times per frame.
-    /// Caching it for a short window keeps fast-output repaints cheap.
+    /// Last resolved tab label. The render path reads this through
+    /// [`tab_label`](Self::tab_label) so a repaint never touches the heavy
+    /// foreground-process lookup (`sysctl(KERN_PROCARGS2)` on macOS copies the
+    /// target's whole args+env blob). The event loop recomputes it on a fixed
+    /// cadence via [`refresh_label`](Self::refresh_label), independent of
+    /// render cadence, so the title stays fresh even while the foreground
+    /// program repaints slowly (htop, ~1 fps) or sits idle (shell at a prompt).
     #[cfg(unix)]
-    label_cache: std::cell::RefCell<Option<(std::time::Instant, String)>>,
+    label_cache: std::cell::RefCell<Option<String>>,
 }
 
 impl TerminalSession {
@@ -527,28 +529,44 @@ impl TerminalSession {
         &self.title
     }
 
-    /// Title to display in the tab strip / OS window, memoised for a short
-    /// window. [`compute_tab_label`](Self::compute_tab_label) polls the tty's
-    /// foreground process, which is heavy on macOS, and we call this several
-    /// times per frame (twice per tab in the layout pass, once for the OS
-    /// window title). The foreground job and its cwd change far slower than we
-    /// repaint, so serving a label that's up to `TTL` stale is invisible while
-    /// it keeps fast-output redraws off the syscall path.
+    /// Title to display in the tab strip / OS window. Returns the label last
+    /// resolved by [`refresh_label`](Self::refresh_label), computing it once
+    /// lazily if the event loop hasn't polled yet. The render path calls this
+    /// (twice per tab in the layout pass, once for the OS window title), so it
+    /// must stay cheap — the heavy foreground-process lookup lives in
+    /// `refresh_label`, which the event loop drives on a fixed cadence rather
+    /// than per frame.
     pub fn tab_label(&self) -> String {
         #[cfg(unix)]
         {
-            const TTL: std::time::Duration = std::time::Duration::from_millis(250);
-            if let Some((at, label)) = self.label_cache.borrow().as_ref() {
-                if at.elapsed() < TTL {
-                    return label.clone();
-                }
+            if let Some(label) = self.label_cache.borrow().as_ref() {
+                return label.clone();
             }
             let label = self.compute_tab_label();
-            *self.label_cache.borrow_mut() = Some((std::time::Instant::now(), label.clone()));
+            *self.label_cache.borrow_mut() = Some(label.clone());
             label
         }
         #[cfg(not(unix))]
         self.compute_tab_label()
+    }
+
+    /// Recompute the tab label from the live foreground process and store it
+    /// for [`tab_label`](Self::tab_label) to serve. Returns whether the label
+    /// changed, so the event loop can repaint only when something visible
+    /// moved. This is where the heavy `tcgetpgrp`/`invoked_name`/`cwd_of_pid`
+    /// lookups happen; the event loop calls it on a fixed cadence, so their
+    /// rate is bounded by the poll interval no matter how fast output flows —
+    /// and the title no longer lags a slow- or non-repainting foreground job.
+    #[cfg(unix)]
+    pub fn refresh_label(&self) -> bool {
+        let label = self.compute_tab_label();
+        let mut cache = self.label_cache.borrow_mut();
+        if cache.as_deref() == Some(label.as_str()) {
+            false
+        } else {
+            *cache = Some(label);
+            true
+        }
     }
 
     /// Resolve the tab label from scratch. When a child program (htop, vim,
