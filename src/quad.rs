@@ -2,10 +2,9 @@
 //! tab bar background, the active-tab highlight, and the terminal cursor.
 
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct Quad {
     /// (x_px, y_px, width_px, height_px) in surface (physical) pixels.
     pub rect: [f32; 4],
@@ -140,14 +139,14 @@ impl QuadPipeline {
         let needed = quads.len() as u64;
         if needed > self.instance_capacity {
             self.instance_capacity = needed.next_power_of_two().max(16);
-            self.instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            self.instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("quad instances"),
-                contents: bytemuck::cast_slice(quads),
+                size: self.instance_capacity * std::mem::size_of::<Quad>() as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             });
-        } else {
-            queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(quads));
         }
+        queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(quads));
     }
 
     pub fn render<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
