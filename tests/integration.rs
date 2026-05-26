@@ -206,7 +206,10 @@ fn tab_title_shows_cwd_of_foreground_process() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(cleared, "tab title kept cwd suffix after foreground process exited");
+    assert!(
+        cleared,
+        "tab title kept cwd suffix after foreground process exited"
+    );
 
     let _ = std::fs::remove_dir(&dir);
 }
