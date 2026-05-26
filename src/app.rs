@@ -11,6 +11,8 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{ModifiersState, PhysicalKey};
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::binding::{self, Action};
@@ -23,6 +25,15 @@ use crate::terminal::{self, MouseReporting, TerminalSession, UrlMatch};
 use crate::WakeEvent;
 
 pub const TAB_BAR_HEIGHT: f32 = 28.0;
+
+/// Logical-pixel inset reserved on the left edge of the tab bar so it doesn't
+/// overlap macOS traffic-light buttons (close/minimize/zoom). On other
+/// platforms the tab bar lives in its own strip below the window chrome, so
+/// no inset is needed.
+#[cfg(target_os = "macos")]
+pub const TAB_BAR_LEFT_INSET: f32 = 78.0;
+#[cfg(not(target_os = "macos"))]
+pub const TAB_BAR_LEFT_INSET: f32 = 0.0;
 
 pub struct App {
     config: Config,
@@ -309,6 +320,14 @@ impl ApplicationHandler<WakeEvent> for App {
         let attrs = Window::default_attributes()
             .with_title("aterm")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 600.0));
+        // On macOS, extend the content view under a transparent, title-hidden
+        // title bar so aterm's own tab strip occupies the title-bar area. The
+        // traffic-light buttons remain interactive on top of the content.
+        #[cfg(target_os = "macos")]
+        let attrs = attrs
+            .with_titlebar_transparent(true)
+            .with_title_hidden(true)
+            .with_fullsize_content_view(true);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         // Enable IME events so dead keys and CJK composition flow through
         // WindowEvent::Ime. Without this, pressing e.g. Option+e on a US
@@ -384,8 +403,14 @@ impl ApplicationHandler<WakeEvent> for App {
                 let term = self.tabs.get(active_tab);
                 let hover_url = self.hover_url.as_ref();
                 let Some(gfx) = self.gfx.as_mut() else { return };
-                if let Err(e) = gfx.render(term, &self.tabs, active_tab, TAB_BAR_HEIGHT, hover_url)
-                {
+                if let Err(e) = gfx.render(
+                    term,
+                    &self.tabs,
+                    active_tab,
+                    TAB_BAR_HEIGHT,
+                    TAB_BAR_LEFT_INSET,
+                    hover_url,
+                ) {
                     log::error!("render error: {e}");
                 }
             }
@@ -724,6 +749,13 @@ impl App {
                 self.select_tab(idx);
                 self.sync_window_title(window);
                 window.request_redraw();
+                return;
+            }
+            // Empty area of the tab bar on macOS doubles as a title-bar
+            // drag handle, matching how Safari/Terminal/Ghostty behave.
+            #[cfg(target_os = "macos")]
+            {
+                let _ = window.drag_window();
             }
             return;
         }

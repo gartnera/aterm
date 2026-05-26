@@ -500,11 +500,16 @@ impl Gfx {
         tabs: &[TerminalSession],
         active_idx: usize,
         tab_bar_height: f32,
+        left_inset: f32,
         metrics: Metrics,
     ) -> (f32, f32, Color) {
         let width = self.surface_config.width;
         let scale = self.window.scale_factor() as f32;
         let cell_w_px = self.cell_width_logical * scale;
+        // Left edge of the tab strip in physical pixels. On macOS this is
+        // shifted right to clear the traffic-light buttons; elsewhere it's
+        // just PAD_X.
+        let strip_left_px = (PAD_X + left_inset) * scale;
 
         // Variable-width tabs: each tab gets either its natural width
         // (title length in cells) or a fair share of what's available,
@@ -512,7 +517,7 @@ impl Gfx {
         // round-robin to tabs that still want more room.
         const SEP_CHARS: usize = 2;
         const MIN_TITLE_CHARS: usize = 4;
-        let usable_chars = ((width as f32 - 2.0 * PAD_X * scale) / cell_w_px)
+        let usable_chars = ((width as f32 - strip_left_px - PAD_X * scale) / cell_w_px)
             .floor()
             .max(0.0) as usize;
 
@@ -569,7 +574,7 @@ impl Gfx {
                 segments.push((sep_pad.clone(), false));
                 tab_text.push_str(&sep_pad);
                 let sep_mid_x =
-                    PAD_X * scale + (chars_cursor as f32 + SEP_CHARS as f32 * 0.5) * cell_w_px;
+                    strip_left_px + (chars_cursor as f32 + SEP_CHARS as f32 * 0.5) * cell_w_px;
                 let prev_active = i - 1 == active_idx;
                 let next_active = i == active_idx;
                 // Only draw the dividing line between two inactive tabs.
@@ -589,7 +594,7 @@ impl Gfx {
             }
             let title = truncate_with_ellipsis(t.title(), budgets.get(i).copied().unwrap_or(0));
             let title_chars = title.chars().count();
-            let x0 = PAD_X * scale + chars_cursor as f32 * cell_w_px;
+            let x0 = strip_left_px + chars_cursor as f32 * cell_w_px;
             let x1 = x0 + title_chars as f32 * cell_w_px;
             self.tab_hit_regions.push((i, x0 - 4.0, x1 + 4.0));
             if i == active_idx {
@@ -646,7 +651,7 @@ impl Gfx {
         buf.shape_until_scroll(&mut self.font_system, false);
 
         (
-            PAD_X * scale,
+            strip_left_px,
             (tab_bar_height - self.line_height) * 0.5 * scale,
             Color::rgb(inactive_fg[0], inactive_fg[1], inactive_fg[2]),
         )
@@ -716,6 +721,7 @@ impl Gfx {
         tabs: &[TerminalSession],
         active_idx: usize,
         tab_bar_height: f32,
+        tab_bar_left_inset: f32,
         hover_url: Option<&UrlMatch>,
     ) -> Result<(), String> {
         let width = self.surface_config.width;
@@ -741,7 +747,13 @@ impl Gfx {
             color: self.tab_theme.bar_bg,
         });
 
-        let tab_pos = self.prepare_tab_bar(tabs, active_idx, tab_bar_height, metrics);
+        let tab_pos = self.prepare_tab_bar(
+            tabs,
+            active_idx,
+            tab_bar_height,
+            tab_bar_left_inset,
+            metrics,
+        );
         let family_name = self.font_family.clone();
         let quads = &mut self.quad_scratch;
 
