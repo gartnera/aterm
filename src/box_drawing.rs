@@ -723,3 +723,219 @@ fn push_braille(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CW: f32 = 10.0;
+    const CH: f32 = 20.0;
+    const SCALE: f32 = 1.0;
+    const FG: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+    fn render(ch: char, x: f32, y: f32) -> Vec<Quad> {
+        let mut q = Vec::new();
+        push_quads(&mut q, ch, x, y, CW, CH, FG, SCALE);
+        q
+    }
+
+    fn bounds_x(q: &Quad) -> (f32, f32) {
+        (q.rect[0], q.rect[0] + q.rect[2])
+    }
+    fn bounds_y(q: &Quad) -> (f32, f32) {
+        (q.rect[1], q.rect[1] + q.rect[3])
+    }
+
+    #[test]
+    fn is_handled_range() {
+        assert!(is_handled('─'));
+        assert!(is_handled('│'));
+        assert!(is_handled('█'));
+        assert!(is_handled('▒'));
+        assert!(is_handled('⠁'));
+        assert!(is_handled('⣿'));
+        // Outside the handled ranges.
+        assert!(!is_handled('a'));
+        assert!(!is_handled(' '));
+        assert!(!is_handled('▲'));
+        assert!(!is_handled('●'));
+    }
+
+    /// Pick a y in the middle of the line stroke (cell centre), then return
+    /// (min_x_start, max_x_end) across all quads of `cell` that contain it.
+    /// Lets us check "does the stroke cover the full cell width at row y?"
+    /// regardless of how many sub-segments the renderer used.
+    fn x_span_at(cell: &[Quad], y: f32) -> Option<(f32, f32)> {
+        cell.iter()
+            .filter(|q| y >= q.rect[1] && y <= q.rect[1] + q.rect[3])
+            .fold(None, |acc, q| {
+                let (x0, x1) = bounds_x(q);
+                Some(match acc {
+                    None => (x0, x1),
+                    Some((a, b)) => (a.min(x0), b.max(x1)),
+                })
+            })
+    }
+
+    fn y_span_at(cell: &[Quad], x: f32) -> Option<(f32, f32)> {
+        cell.iter()
+            .filter(|q| x >= q.rect[0] && x <= q.rect[0] + q.rect[2])
+            .fold(None, |acc, q| {
+                let (y0, y1) = bounds_y(q);
+                Some(match acc {
+                    None => (y0, y1),
+                    Some((a, b)) => (a.min(y0), b.max(y1)),
+                })
+            })
+    }
+
+    /// Two horizontally-adjacent `─` cells must produce horizontal-line
+    /// quads that meet at the cell boundary. The point of this whole module
+    /// is to avoid the visible gap that fonts leave here.
+    #[test]
+    fn adjacent_horizontal_lines_have_no_gap() {
+        let left = render('─', 0.0, 0.0);
+        let right = render('─', CW, 0.0);
+        let (_, lx1) = x_span_at(&left, CH / 2.0).expect("left stroke at cy");
+        let (rx0, _) = x_span_at(&right, CH / 2.0).expect("right stroke at cy");
+        assert!(
+            lx1 >= rx0,
+            "horizontal lines have a gap: left ends at {lx1}, right starts at {rx0}"
+        );
+    }
+
+    /// Same for vertical `│` cells stacked above each other.
+    #[test]
+    fn adjacent_vertical_lines_have_no_gap() {
+        let top = render('│', 0.0, 0.0);
+        let bot = render('│', 0.0, CH);
+        let (_, ty1) = y_span_at(&top, CW / 2.0).expect("top stroke at cx");
+        let (by0, _) = y_span_at(&bot, CW / 2.0).expect("bot stroke at cx");
+        assert!(
+            ty1 >= by0,
+            "vertical lines have a gap: top ends at {ty1}, bot starts at {by0}"
+        );
+    }
+
+    /// A `┌` corner's right-going stroke must reach the right cell edge,
+    /// and its down-going stroke must reach the bottom cell edge. This is
+    /// what lets the next cell's `─` or the cell below's `│` join cleanly.
+    #[test]
+    fn corner_strokes_reach_cell_edges() {
+        let q = render('┌', 0.0, 0.0);
+        let right_reaches = q.iter().any(|q| (q.rect[0] + q.rect[2] - CW).abs() < 0.01);
+        let down_reaches = q.iter().any(|q| (q.rect[1] + q.rect[3] - CH).abs() < 0.01);
+        assert!(right_reaches, "┌ does not extend to right edge: {q:?}");
+        assert!(down_reaches, "┌ does not extend to bottom edge: {q:?}");
+    }
+
+    #[test]
+    fn cross_reaches_all_four_edges() {
+        let q = render('┼', 0.0, 0.0);
+        assert!(q.iter().any(|r| r.rect[0] <= 0.01), "no left reach");
+        assert!(
+            q.iter().any(|r| (r.rect[0] + r.rect[2] - CW).abs() < 0.01),
+            "no right reach"
+        );
+        assert!(q.iter().any(|r| r.rect[1] <= 0.01), "no up reach");
+        assert!(
+            q.iter().any(|r| (r.rect[1] + r.rect[3] - CH).abs() < 0.01),
+            "no down reach"
+        );
+    }
+
+    /// `█` fills the entire cell exactly — exactly one quad covering the cell rect.
+    #[test]
+    fn full_block_fills_cell() {
+        let q = render('█', 0.0, 0.0);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].rect, [0.0, 0.0, CW, CH]);
+    }
+
+    /// The lower-half block `▄` covers exactly the bottom half of the cell,
+    /// and the upper-half `▀` covers the top half — together they tile
+    /// without gap or overlap.
+    #[test]
+    fn half_blocks_tile_vertically() {
+        let upper = render('▀', 0.0, 0.0);
+        let lower = render('▄', 0.0, 0.0);
+        assert_eq!(upper.len(), 1);
+        assert_eq!(lower.len(), 1);
+        let (_, uy1) = bounds_y(&upper[0]);
+        let (ly0, _) = bounds_y(&lower[0]);
+        assert!(
+            (uy1 - ly0).abs() < 0.01,
+            "half-block seam mismatch: upper ends at {uy1}, lower starts at {ly0}"
+        );
+    }
+
+    /// Two horizontally-adjacent `█` cells must produce quads that meet at
+    /// the cell boundary (no vertical gap between solid block columns).
+    #[test]
+    fn adjacent_full_blocks_touch() {
+        let left = render('█', 0.0, 0.0);
+        let right = render('█', CW, 0.0);
+        let (_, lx1) = bounds_x(&left[0]);
+        let (rx0, _) = bounds_x(&right[0]);
+        assert!(
+            (lx1 - rx0).abs() < 0.01,
+            "adjacent full blocks have a gap: {lx1} vs {rx0}"
+        );
+    }
+
+    /// All 8 braille dots active (`⣿`, U+28FF) produces 8 dot quads.
+    #[test]
+    fn braille_all_dots() {
+        let q = render('⣿', 0.0, 0.0);
+        assert_eq!(q.len(), 8, "expected 8 dots for ⣿, got {}", q.len());
+    }
+
+    /// Empty braille `⠀` (U+2800) produces no quads.
+    #[test]
+    fn braille_empty_no_dots() {
+        let q = render('⠀', 0.0, 0.0);
+        assert!(q.is_empty(), "expected 0 dots for ⠀, got {}", q.len());
+    }
+
+    /// Each braille bit toggles exactly one dot quad.
+    #[test]
+    fn braille_bit_count_matches() {
+        for mask in 0u32..=0xFFu32 {
+            let ch = char::from_u32(0x2800 + mask).unwrap();
+            let q = render(ch, 0.0, 0.0);
+            assert_eq!(
+                q.len(),
+                mask.count_ones() as usize,
+                "braille mask {mask:08b} produced {} quads, expected {}",
+                q.len(),
+                mask.count_ones()
+            );
+        }
+    }
+
+    /// Every code point in U+2500..=U+257F that we map should produce at
+    /// least one quad. (Catches accidental table drops during edits.)
+    #[test]
+    fn mapped_box_drawing_chars_emit_quads() {
+        // Spot-check the chars that show up in normal TUI use.
+        for ch in [
+            '─', '━', '│', '┃', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '═', '║', '╔', '╗',
+            '╚', '╝', '╠', '╣', '╦', '╩', '╬', '╴', '╵', '╶', '╷', '╭', '╮', '╯', '╰',
+        ] {
+            let q = render(ch, 0.0, 0.0);
+            assert!(!q.is_empty(), "no quads emitted for {ch:?}");
+        }
+    }
+
+    /// Heavy `━` should be visibly thicker than light `─`. The whole point
+    /// of the heavy variant is the extra weight; locking it in prevents a
+    /// future refactor from collapsing them.
+    #[test]
+    fn heavy_lines_are_thicker_than_light() {
+        let light = render('─', 0.0, 0.0);
+        let heavy = render('━', 0.0, 0.0);
+        let l_h = light.iter().map(|q| q.rect[3]).fold(0.0_f32, f32::max);
+        let h_h = heavy.iter().map(|q| q.rect[3]).fold(0.0_f32, f32::max);
+        assert!(h_h > l_h, "heavy ({h_h}) not thicker than light ({l_h})");
+    }
+}

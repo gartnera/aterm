@@ -4,7 +4,7 @@
 use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct Quad {
     /// (x_px, y_px, width_px, height_px) in surface (physical) pixels.
     pub rect: [f32; 4],
