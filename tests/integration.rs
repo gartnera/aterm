@@ -162,17 +162,17 @@ fn tab_title_shows_cwd_of_foreground_process() {
 
     // cd into the target dir, then launch a foreground process that just
     // blocks (cat with no args reads stdin forever). Its cwd is `dir`, so
-    // the tab label should gain a " — <dir>" suffix while it runs.
+    // the tab label should become "cat (<dir>)" while it runs.
     t.type_line(&format!("cd {dir}"));
     t.type_line("echo FG_READY_TAG");
     t.wait_for_text("FG_READY_TAG");
     t.type_line("cat");
 
-    // The cwd is appended after an em-dash separator. We match on the
-    // suffix specifically because the shell's own OSC-set title may also
-    // include the cwd path (bash sets "user@host: <cwd>"), and we only
-    // want to assert on the part *we* add for the foreground process.
-    let suffix = format!("\u{2014} {dir}");
+    // We match on the parenthesised cwd specifically because the shell's
+    // own OSC-set title may also include the cwd path (bash sets
+    // "user@host: <cwd>"); we only want to assert on what *we* add for the
+    // foreground process.
+    let suffix = format!("({dir})");
 
     // tabs() recomputes the label live (reads /proc), so poll it directly.
     let deadline = Instant::now() + Duration::from_secs(8);

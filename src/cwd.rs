@@ -58,6 +58,31 @@ fn foreground_pid_impl(_shell_pid: u32) -> Option<u32> {
     None
 }
 
+/// Human-readable name of the process `pid` is running — e.g. `htop`,
+/// `vim`, `node`. Returns `None` on unsupported platforms or if the
+/// process has exited.
+pub fn process_name(pid: u32) -> Option<String> {
+    process_name_impl(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_name_impl(pid: u32) -> Option<String> {
+    // /proc/<pid>/comm is the command name (truncated by the kernel to 15
+    // chars), newline-terminated. It tracks exec() and prctl(PR_SET_NAME),
+    // so it reflects whatever the process currently calls itself.
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let name = comm.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_name_impl(_pid: u32) -> Option<String> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn cwd_of_pid_impl(pid: u32) -> Option<PathBuf> {
     // /proc/<pid>/cwd is a symlink to the process's current working

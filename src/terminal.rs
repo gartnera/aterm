@@ -504,10 +504,11 @@ impl TerminalSession {
     }
 
     /// Title to display in the tab strip / OS window. When a child program
-    /// (htop, vim, claude, …) is running in the foreground we append its
-    /// cwd so the user can still tell which directory the tab is in. When
-    /// the shell itself is foreground we just return the bare title — the
-    /// shell prompt already shows its own cwd.
+    /// (htop, vim, claude, …) is running in the foreground we show its name
+    /// and cwd as `name (cwd)`, since the shell stops updating its own OSC
+    /// title while a foreground job runs. When the shell itself is in the
+    /// foreground we return its bare title — the prompt already shows the
+    /// cwd, so there's nothing useful to add.
     pub fn tab_label(&self) -> String {
         let base = self.title();
         let Some(shell_pid) = self.shell_pid else {
@@ -519,11 +520,14 @@ impl TerminalSession {
         if fg_pid == shell_pid {
             return base.to_string();
         }
-        let Some(cwd) = crate::cwd::cwd_of_pid(fg_pid) else {
-            return base.to_string();
-        };
-        let pretty = abbreviate_home(&cwd);
-        format!("{base} \u{2014} {pretty}")
+        let name = crate::cwd::process_name(fg_pid);
+        let cwd = crate::cwd::cwd_of_pid(fg_pid).map(|p| abbreviate_home(&p));
+        match (name, cwd) {
+            (Some(name), Some(cwd)) => format!("{name} ({cwd})"),
+            (Some(name), None) => name,
+            (None, Some(cwd)) => format!("{base} ({cwd})"),
+            (None, None) => base.to_string(),
+        }
     }
 
     pub fn send_input<B: Into<std::borrow::Cow<'static, [u8]>>>(&self, bytes: B) {
