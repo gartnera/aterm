@@ -60,6 +60,10 @@ pub enum Request {
     /// true, the URL regex sweep is performed; otherwise only OSC 8 links are
     /// reported (mirroring the modifier-gated UI behavior).
     HoverUrl { row: usize, col: usize, ctrl: bool },
+    /// Select the word at the given viewport cell (as a double-click would)
+    /// and return the resulting selection text. Exercises the semantic
+    /// selection path without synthesizing raw mouse events.
+    SelectWord { row: usize, col: usize },
 }
 
 #[derive(Debug, Serialize)]

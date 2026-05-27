@@ -691,8 +691,25 @@ impl TerminalSession {
         self.term.lock().scroll_display(scroll);
     }
 
-    /// Begin a new selection at the given viewport cell.
+    /// Begin a new character selection at the given viewport cell.
     pub fn selection_start(&self, vp_line: usize, vp_col: usize, right_half: bool) {
+        self.start_selection(SelectionType::Simple, vp_line, vp_col, right_half);
+    }
+
+    /// Begin a word (semantic) selection at the given viewport cell. The
+    /// selection immediately expands to the surrounding word; dragging then
+    /// extends it word-by-word. Used for double-click.
+    pub fn selection_start_word(&self, vp_line: usize, vp_col: usize, right_half: bool) {
+        self.start_selection(SelectionType::Semantic, vp_line, vp_col, right_half);
+    }
+
+    fn start_selection(
+        &self,
+        ty: SelectionType,
+        vp_line: usize,
+        vp_col: usize,
+        right_half: bool,
+    ) {
         let mut term = self.term.lock();
         let lines = term.screen_lines();
         let cols = term.columns();
@@ -701,7 +718,7 @@ impl TerminalSession {
         let display_offset = term.grid().display_offset();
         let point = viewport_to_point(display_offset, Point::new(vp_line, Column(vp_col)));
         let side = if right_half { Side::Right } else { Side::Left };
-        term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+        term.selection = Some(Selection::new(ty, point, side));
     }
 
     /// Extend the in-progress selection to the given viewport cell.

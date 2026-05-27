@@ -116,6 +116,32 @@ fn url_regex_matches_printed_url() {
 }
 
 #[test]
+fn double_click_selects_word() {
+    require_display!();
+    let mut t = AtermTest::spawn();
+
+    t.type_line("echo lemon:melon kiwi");
+    t.wait_for_text("lemon:melon kiwi");
+
+    // Locate the echoed command line and the columns of each token.
+    let lines = t.snapshot_text();
+    let (row, line) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(r, l)| l.contains("lemon:melon kiwi").then(|| (r, l.clone())))
+        .expect("echoed command not found in snapshot");
+
+    // Space bounds the word: clicking "kiwi" selects just "kiwi".
+    let kiwi_col = line.find("kiwi").expect("kiwi column");
+    assert_eq!(t.select_word(row, kiwi_col).as_deref(), Some("kiwi"));
+
+    // ':' is a semantic escape char (alacritty default), so it bounds the
+    // word too: clicking "lemon" selects "lemon", not "lemon:melon".
+    let lemon_col = line.find("lemon").expect("lemon column");
+    assert_eq!(t.select_word(row, lemon_col).as_deref(), Some("lemon"));
+}
+
+#[test]
 fn url_regex_trims_trailing_punctuation() {
     require_display!();
     let mut t = AtermTest::spawn();
