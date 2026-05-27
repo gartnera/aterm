@@ -703,13 +703,7 @@ impl TerminalSession {
         self.start_selection(SelectionType::Semantic, vp_line, vp_col, right_half);
     }
 
-    fn start_selection(
-        &self,
-        ty: SelectionType,
-        vp_line: usize,
-        vp_col: usize,
-        right_half: bool,
-    ) {
+    fn start_selection(&self, ty: SelectionType, vp_line: usize, vp_col: usize, right_half: bool) {
         let mut term = self.term.lock();
         let lines = term.screen_lines();
         let cols = term.columns();
