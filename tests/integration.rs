@@ -116,6 +116,28 @@ fn url_regex_matches_printed_url() {
 }
 
 #[test]
+fn url_regex_trims_trailing_punctuation() {
+    require_display!();
+    let mut t = AtermTest::spawn();
+
+    // URL wrapped in parentheses and followed by a period, as it would appear
+    // in prose. The regex greedily includes the trailing `).`, which must be
+    // trimmed so the click target is the bare URL.
+    t.type_line("echo \"(see https://example.com/foo).\"");
+    t.wait_for_text("https://example.com/foo");
+
+    let lines = t.snapshot_text();
+    let (row, col) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(r, l)| l.find("https://").map(|c| (r, c)))
+        .expect("URL not found in snapshot");
+
+    let uri = t.hover_url(row, col, true);
+    assert_eq!(uri.as_deref(), Some("https://example.com/foo"));
+}
+
+#[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn new_tab_inherits_cwd_from_active() {
     require_display!();

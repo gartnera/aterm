@@ -152,6 +152,56 @@ pub fn compile_url_regex() -> Option<RegexSearch> {
     }
 }
 
+/// Trim trailing characters that commonly abut a URL in prose but aren't part
+/// of it: sentence punctuation (`https://x.com.` → `https://x.com`) and
+/// unbalanced closing brackets (`(see https://x.com)` matches `https://x.com)`
+/// → `https://x.com`). A closing bracket is kept when an opening bracket
+/// inside the URL balances it, so Wikipedia-style links like
+/// `https://en.wikipedia.org/wiki/Foo_(bar)` survive intact. Returns the byte
+/// length of the trimmed (kept) prefix.
+fn trim_url_end(url: &str) -> usize {
+    let mut end = url.len();
+    loop {
+        let kept = &url[..end];
+        let Some(last) = kept.chars().next_back() else {
+            break;
+        };
+        let keep = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' => false,
+            ')' | ']' | '}' => {
+                let (open, close) = match last {
+                    ')' => ('(', ')'),
+                    ']' => ('[', ']'),
+                    _ => ('{', '}'),
+                };
+                kept.matches(open).count() >= kept.matches(close).count()
+            }
+            _ => true,
+        };
+        if keep {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    end
+}
+
+/// Move `point` left by `n` cells, wrapping to the previous row's last column
+/// at row boundaries. Used to pull a regex match's end back over trailing
+/// punctuation. Trailing punctuation is single-width ASCII, so one trimmed
+/// character is one cell.
+fn move_point_left(mut point: Point, n: usize, cols: usize) -> Point {
+    for _ in 0..n {
+        if point.column.0 > 0 {
+            point.column.0 -= 1;
+        } else if cols > 0 {
+            point.line -= 1;
+            point.column = Column(cols - 1);
+        }
+    }
+    point
+}
+
 enum Role {
     Fg,
     Bg,
@@ -686,7 +736,11 @@ impl TerminalSession {
         let display_offset = term.grid().display_offset();
         let point = viewport_to_point(display_offset, Point::new(vp_line, Column(vp_col)));
         let link = term.grid()[point].hyperlink()?;
-        let uri = link.uri().to_string();
+        let full = link.uri();
+        // Some emitters fold trailing prose punctuation into the hyperlink
+        // target (e.g. a sentence-ending period). Trim it so the opened URL
+        // matches what the user sees, the same way we do for regex matches.
+        let uri = full[..trim_url_end(full)].to_string();
         let id = link.id().to_string();
         let spans = osc8_spans(&term, point, &id, vp_line, cols);
         Some(UrlMatch { uri, spans })
@@ -728,8 +782,14 @@ impl TerminalSession {
             .take_while(|rm| rm.start().line <= viewport_end)
             .find(|rm| rm.contains(&point))?;
 
-        let uri = term.bounds_to_string(*mat.start(), *mat.end());
-        let spans = match_to_spans(*mat.start(), *mat.end(), display_offset, lines, cols);
+        let start = *mat.start();
+        let full = term.bounds_to_string(start, *mat.end());
+        let kept = trim_url_end(&full);
+        // Trimmed chars are single-byte ASCII punctuation, so the byte count
+        // dropped equals the number of cells to pull the end back.
+        let end = move_point_left(*mat.end(), full.len() - kept, cols);
+        let uri = full[..kept].to_string();
+        let spans = match_to_spans(start, end, display_offset, lines, cols);
         Some(UrlMatch { uri, spans })
     }
 
@@ -996,5 +1056,50 @@ mod tests {
     fn match_to_spans_handles_zero_width_grid() {
         let spans = match_to_spans(pt(0, 0), pt(0, 0), 0, 5, 0);
         assert!(spans.is_empty());
+    }
+
+    fn trim(url: &str) -> &str {
+        &url[..trim_url_end(url)]
+    }
+
+    #[test]
+    fn trim_url_strips_trailing_sentence_punctuation() {
+        assert_eq!(trim("https://example.com."), "https://example.com");
+        assert_eq!(trim("https://example.com,"), "https://example.com");
+        assert_eq!(trim("https://example.com!?"), "https://example.com");
+        assert_eq!(trim("https://example.com/foo:"), "https://example.com/foo");
+    }
+
+    #[test]
+    fn trim_url_strips_unbalanced_closing_bracket() {
+        // The leading `(` isn't part of the regex match (it precedes the
+        // scheme), so the match ends with a dangling `)`.
+        assert_eq!(trim("https://example.com)"), "https://example.com");
+        assert_eq!(trim("https://example.com/foo)."), "https://example.com/foo");
+        assert_eq!(trim("https://example.com]"), "https://example.com");
+    }
+
+    #[test]
+    fn trim_url_keeps_balanced_brackets() {
+        let wiki = "https://en.wikipedia.org/wiki/Foo_(bar)";
+        assert_eq!(trim(wiki), wiki);
+        let nested = "https://example.com/a(b)c";
+        assert_eq!(trim(nested), nested);
+    }
+
+    #[test]
+    fn trim_url_leaves_clean_urls_untouched() {
+        let url = "https://example.com/path?q=1#frag";
+        assert_eq!(trim(url), url);
+    }
+
+    #[test]
+    fn move_point_left_wraps_rows() {
+        // Within a row.
+        assert_eq!(move_point_left(pt(0, 5), 2, 80), pt(0, 3));
+        // No movement.
+        assert_eq!(move_point_left(pt(0, 5), 0, 80), pt(0, 5));
+        // Wraps to previous row's last column.
+        assert_eq!(move_point_left(pt(-1, 0), 1, 80), pt(-2, 79));
     }
 }
