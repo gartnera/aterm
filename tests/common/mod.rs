@@ -362,6 +362,17 @@ impl AtermTest {
         data.get("uri").and_then(Value::as_str).map(str::to_string)
     }
 
+    /// Select the word at (row, col), as a double-click would, and return the
+    /// resulting selection text (None if nothing was selected).
+    pub fn select_word(&mut self, row: usize, col: usize) -> Option<String> {
+        let data = self.request(json!({
+            "cmd": "select_word",
+            "row": row,
+            "col": col,
+        }));
+        data.get("text").and_then(Value::as_str).map(str::to_string)
+    }
+
     /// Block until the visible grid contains `needle`. Useful for waiting on
     /// shell output without sleeping a fixed duration. Polls every 50ms.
     pub fn wait_for_text(&mut self, needle: &str) {

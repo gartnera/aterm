@@ -26,6 +26,11 @@ use crate::WakeEvent;
 
 pub const TAB_BAR_HEIGHT: f32 = 28.0;
 
+/// Maximum gap between two left-clicks on the same cell for the second to
+/// count as a double-click (word selection). Matches the common ~300ms
+/// desktop default.
+const DOUBLE_CLICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// How often the event loop recomputes tab labels from the foreground
 /// process, off the render path. Decoupled from render cadence so the title
 /// stays fresh while a program repaints slowly (htop, ~1 fps) or sits idle,
@@ -54,6 +59,10 @@ pub struct App {
     cursor_pos: (f64, f64),
     /// Whether a left-button drag is in progress over the grid.
     selecting: bool,
+    /// Time and cell of the last left-button press over the grid, used to
+    /// detect a double-click (same cell within [`DOUBLE_CLICK_INTERVAL`]) and
+    /// promote it to a word selection.
+    last_click: Option<(std::time::Instant, usize, usize)>,
     /// Bitmask of mouse buttons currently pressed and being reported to the
     /// PTY (bit per `input::MouseButton`). Used to emit motion events with
     /// the correct button code while a drag is in progress.
@@ -106,6 +115,7 @@ impl App {
             mods: ModifiersState::empty(),
             cursor_pos: (0.0, 0.0),
             selecting: false,
+            last_click: None,
             mouse_buttons_held: 0,
             last_mouse_cell: None,
             scroll_accum: 0.0,
@@ -841,18 +851,31 @@ impl App {
                 }
                 let Some(gfx) = self.gfx.as_ref() else { return };
                 let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+                let Some((line, col, right)) = gfx.cell_at(
+                    self.cursor_pos.0 as f32,
+                    self.cursor_pos.1 as f32,
+                    TAB_BAR_HEIGHT,
+                    cols,
+                    lines,
+                ) else {
+                    return;
+                };
+                // A second press on the same cell within the interval is a
+                // double-click: select the word under the cursor instead of
+                // starting an empty character selection.
+                let now = std::time::Instant::now();
+                let double_click = self.last_click.is_some_and(|(t, l, c)| {
+                    l == line && c == col && now.duration_since(t) <= DOUBLE_CLICK_INTERVAL
+                });
+                self.last_click = Some((now, line, col));
                 if let Some(session) = self.tabs.get(self.active_tab) {
-                    if let Some((line, col, right)) = gfx.cell_at(
-                        self.cursor_pos.0 as f32,
-                        self.cursor_pos.1 as f32,
-                        TAB_BAR_HEIGHT,
-                        cols,
-                        lines,
-                    ) {
+                    if double_click {
+                        session.selection_start_word(line, col, right);
+                    } else {
                         session.selection_start(line, col, right);
-                        self.selecting = true;
-                        window.request_redraw();
                     }
+                    self.selecting = true;
+                    window.request_redraw();
                 }
             }
             ElementState::Released => {
@@ -1182,6 +1205,18 @@ impl App {
                     Some(u) => Response::ok_data(serde_json::json!({ "uri": u.uri })),
                     None => Response::ok_data(serde_json::Value::Null),
                 }
+            }
+            Request::SelectWord { row, col } => {
+                let Some(session) = self.tabs.get(self.active_tab) else {
+                    return Response::err("no active tab");
+                };
+                session.selection_start_word(row, col, false);
+                if let Some(w) = self.window.clone() {
+                    w.request_redraw();
+                }
+                Response::ok_data(serde_json::json!({
+                    "text": session.selection_text(),
+                }))
             }
         }
     }
