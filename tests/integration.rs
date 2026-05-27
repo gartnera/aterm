@@ -70,6 +70,34 @@ fn create_close_and_select_tabs() {
 }
 
 #[test]
+fn new_tab_opens_to_right_of_active() {
+    require_display!();
+    let mut t = AtermTest::spawn();
+
+    // Build up three tabs: [0, 1, 2], active on 2.
+    t.create_tab();
+    t.create_tab();
+    assert_eq!(t.tabs().len(), 3);
+
+    // Activate the leftmost tab, then open a new one. It should be inserted
+    // immediately to the right of tab 0 (index 1), not appended at the end.
+    t.select_tab(0);
+    t.create_tab();
+
+    let tabs = t.tabs();
+    assert_eq!(tabs.len(), 4);
+    let active = tabs
+        .iter()
+        .find(|tb| tb.active)
+        .expect("a tab should be active");
+    assert_eq!(
+        active.index, 1,
+        "new tab should open to the right of the active tab, got index {}",
+        active.index
+    );
+}
+
+#[test]
 fn font_size_clamped_and_resettable() {
     require_display!();
     let mut t = AtermTest::spawn();

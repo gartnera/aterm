@@ -172,8 +172,9 @@ impl App {
             self.config.dynamic_title,
         ) {
             Ok(s) => {
-                self.tabs.push(s);
-                self.active_tab = self.tabs.len() - 1;
+                let idx = (self.active_tab + 1).min(self.tabs.len());
+                self.tabs.insert(idx, s);
+                self.active_tab = idx;
             }
             Err(e) => log::error!("spawn tab: {e}"),
         }
