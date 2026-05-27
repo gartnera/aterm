@@ -123,13 +123,15 @@ fn double_click_selects_word() {
     t.type_line("echo lemon:melon kiwi");
     t.wait_for_text("lemon:melon kiwi");
 
-    // Locate the echoed command line and the columns of each token.
+    // Target the echo *output* line, not the echoed command: it sits at
+    // column 0 with no prompt prefix, so it never wraps and the column math
+    // is independent of the CI shell's prompt length.
     let lines = t.snapshot_text();
     let (row, line) = lines
         .iter()
         .enumerate()
-        .find_map(|(r, l)| l.contains("lemon:melon kiwi").then(|| (r, l.clone())))
-        .expect("echoed command not found in snapshot");
+        .find_map(|(r, l)| (l.trim_end() == "lemon:melon kiwi").then(|| (r, l.clone())))
+        .expect("echo output line not found in snapshot");
 
     // Space bounds the word: clicking "kiwi" selects just "kiwi".
     let kiwi_col = line.find("kiwi").expect("kiwi column");
