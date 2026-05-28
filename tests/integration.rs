@@ -429,3 +429,47 @@ fn snapshot_reflects_typed_command_before_enter() {
         lines.join("\n")
     );
 }
+
+/// Reproduce the htop column-alignment pattern under each available
+/// monospace font and save a screenshot per font. Inspecting the PNGs
+/// shows whether the misalignment seen in real htop output is a font
+/// issue (the rightmost field shifts between rows) or aterm-side.
+#[test]
+fn font_alignment_under_htop_pattern() {
+    require_display!();
+    let fonts = [
+        ("monospace", "monospace"),
+        ("dejavu-sans-mono", "DejaVu Sans Mono"),
+        ("liberation-mono", "Liberation Mono"),
+        ("freemono", "FreeMono"),
+        ("courier-10-pitch", "Courier 10 Pitch"),
+        // Negative control: a proportional font should look obviously
+        // worse than the monospace candidates.
+        ("dejavu-sans", "DejaVu Sans"),
+    ];
+    for (slug, family) in fonts {
+        let mut t = AtermTest::spawn_with_font(
+            format!("font_align_{slug}"),
+            family,
+        );
+        // Two-line pattern that recreates the htop misalignment scenario:
+        // one row has a single-char state column ("S"), the next has only
+        // spaces there and pads the TIME+ field with extra spaces. If the
+        // font is truly monospace, every column header ("P", "C", "M",
+        // "T", "/") stacks vertically.
+        t.type_line(concat!(
+            "printf '",
+            "PID    USER PRI NI VIRT  RES   SHR  S CPU%% MEM%% TIME+   Command\\n",
+            "12120 root  20  0 43968 26820 16128 S 3.9  0.2  0:29.25 /haystack/tractor/app/telemetry_bridge\\n",
+            "13130 root  20  0 253M  30292 14872   2.6  0.2          0:23.17 /haystack/tractor/app/vehicle_state_agent\\n",
+            "13319 root  20  0 32920 23688 14496 S 2.6  0.1  0:23.99 /haystack/tractor/app/low_level_controller\\n",
+            "12956 root  20  0 35256 21724 12276   1.3  0.1          0:10.55 /haystack/tractor/app/closed_loop_collision_checker\\n",
+            "'",
+        ));
+        t.wait_for_text("telemetry_bridge");
+        // Let the renderer settle for one more frame before capture.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let path = t.screenshot("grid");
+        eprintln!("font {family:?} -> {path:?}");
+    }
+}

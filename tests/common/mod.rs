@@ -97,8 +97,33 @@ impl AtermTest {
     /// Same as `spawn`, but lets the caller pick the test name used in
     /// failure-screenshot filenames.
     pub fn spawn_named(test_name: String) -> Self {
+        Self::spawn_with(test_name, None)
+    }
+
+    /// Spawn aterm with a generated alacritty.toml that sets the font
+    /// family. Used by exploratory font-alignment tests.
+    pub fn spawn_with_font(test_name: String, family: &str) -> Self {
+        Self::spawn_with(test_name, Some(family))
+    }
+
+    fn spawn_with(test_name: String, font_family: Option<&str>) -> Self {
         let dir = tempfile::tempdir().expect("mktemp");
         let sock_path = dir.path().join("aterm.sock");
+        // If a font was requested, drop an alacritty.toml under a fake
+        // XDG_CONFIG_HOME so aterm's config loader picks it up.
+        let xdg_home = if let Some(family) = font_family {
+            let xdg = dir.path().join("xdg");
+            let alacritty_dir = xdg.join("alacritty");
+            std::fs::create_dir_all(&alacritty_dir).expect("mkdir alacritty cfg");
+            let toml = format!(
+                "[font]\nsize = 13.0\n[font.normal]\nfamily = \"{family}\"\n"
+            );
+            std::fs::write(alacritty_dir.join("alacritty.toml"), toml)
+                .expect("write alacritty.toml");
+            Some(xdg)
+        } else {
+            None
+        };
         // Leak the tempdir handle: we want the directory to outlive this fn
         // so the socket path stays valid while the child runs. Drop removes
         // the socket file explicitly.
@@ -111,6 +136,11 @@ impl AtermTest {
 
         let mut cmd = Command::new(aterm_binary());
         cmd.env("ATERM_DEBUG_SOCK", &sock_path);
+        if let Some(xdg) = xdg_home.as_ref() {
+            // XDG_CONFIG_HOME is the first path Config::find_config_path
+            // checks, so this shadows any host ~/.config/alacritty.toml.
+            cmd.env("XDG_CONFIG_HOME", xdg);
+        }
         // Verbose by default — these logs are what you read when a test
         // fails. Override with ATERM_LOG to e.g. trim to "warn" if a noisy
         // test floods the file.
