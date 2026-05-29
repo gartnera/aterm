@@ -83,6 +83,9 @@ fn srgb_to_linear(c: u8) -> f64 {
     }
 }
 
+/// Shorten a string to `max_chars` by dropping the tail and appending an
+/// ellipsis. Used for the URL hover preview, where the scheme and host at the
+/// front are what the user needs to see.
 fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     let count = s.chars().count();
     if max_chars == 0 {
@@ -96,6 +99,75 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
     let head: String = s.chars().take(max_chars - 1).collect();
     format!("{head}…")
+}
+
+/// Shorten a tab label to `max_chars` by eliding from the *middle*, keeping
+/// both ends. Tab labels are dominated by cwd paths, where the deepest
+/// directory identifies the tab — dropping the tail (the old behaviour) threw
+/// away the one part the user cares about. We instead keep the leading segment
+/// and as many trailing path components as fit, e.g.
+/// `~/workspace/github.com/gartnera/aterm` -> `~/…/gartnera/aterm`.
+fn compact_with_ellipsis(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if max_chars == 0 {
+        return String::new();
+    }
+    if count <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 1 {
+        return "…".into();
+    }
+    // Path-aware: keep the leading segment and a whole-component tail.
+    if let Some(compacted) = compact_path(s, max_chars) {
+        return compacted;
+    }
+    // Fallback for labels without usable path structure: drop characters from
+    // the middle, biasing toward the tail so the end stays visible.
+    let avail = max_chars - 1; // room for the ellipsis
+    let head_len = avail / 2;
+    let tail_len = avail - head_len;
+    let head: String = s.chars().take(head_len).collect();
+    let mut tail: Vec<char> = s.chars().rev().take(tail_len).collect();
+    tail.reverse();
+    let tail: String = tail.into_iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// Compact a `/`-separated path-like label into `first/…/trailing components`,
+/// pulling whole trailing components in from the end until they no longer fit.
+/// Returns `None` when the label has no elidable middle or the leading segment
+/// alone won't fit, leaving the caller to fall back to character elision.
+fn compact_path(s: &str, max_chars: usize) -> Option<String> {
+    let segs: Vec<&str> = s.split('/').collect();
+    // Need a leading segment, at least one middle to drop, and a tail.
+    if segs.len() < 3 {
+        return None;
+    }
+    let first = segs[0];
+    // "/…/" sits between the leading segment and the trailing run.
+    let prefix_len = first.chars().count() + 3;
+    if prefix_len >= max_chars {
+        return None;
+    }
+    let tail_budget = max_chars - prefix_len;
+    let mut tail_segs: Vec<&str> = Vec::new();
+    let mut tail_len = 0usize;
+    for seg in segs[1..].iter().rev() {
+        let added = seg.chars().count() + usize::from(!tail_segs.is_empty());
+        if tail_len + added > tail_budget {
+            break;
+        }
+        tail_len += added;
+        tail_segs.push(seg);
+    }
+    // No trailing component fits beside the prefix, or nothing was actually
+    // elided — let the caller's character fallback handle it.
+    if tail_segs.is_empty() || tail_segs.len() == segs.len() - 1 {
+        return None;
+    }
+    tail_segs.reverse();
+    Some(format!("{first}/…/{}", tail_segs.join("/")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -590,7 +662,7 @@ impl Gfx {
                 chars_cursor += SEP_CHARS;
             }
             let label = t.tab_label();
-            let title = truncate_with_ellipsis(&label, budgets.get(i).copied().unwrap_or(0));
+            let title = compact_with_ellipsis(&label, budgets.get(i).copied().unwrap_or(0));
             let title_chars = title.chars().count();
             let x0 = strip_left_px + chars_cursor as f32 * cell_w_px;
             let x1 = x0 + title_chars as f32 * cell_w_px;
@@ -1085,22 +1157,59 @@ mod tests {
     use crate::terminal::{GridSnapshot, SelectionView, SnapCell};
 
     #[test]
-    fn truncate_keeps_short_strings_intact() {
-        assert_eq!(truncate_with_ellipsis("abc", 10), "abc");
-        assert_eq!(truncate_with_ellipsis("abc", 3), "abc");
+    fn compact_keeps_short_strings_intact() {
+        assert_eq!(compact_with_ellipsis("abc", 10), "abc");
+        assert_eq!(compact_with_ellipsis("abc", 3), "abc");
     }
 
     #[test]
-    fn truncate_appends_ellipsis_when_over_budget() {
-        assert_eq!(truncate_with_ellipsis("abcdef", 4), "abc…");
-        assert_eq!(truncate_with_ellipsis("abcdef", 1), "…");
-        assert_eq!(truncate_with_ellipsis("abcdef", 0), "");
+    fn compact_elides_middle_keeping_tail() {
+        // No path structure: drop from the middle, keeping both ends with a
+        // bias toward the tail.
+        assert_eq!(compact_with_ellipsis("abcdef", 4), "a…ef");
+        assert_eq!(compact_with_ellipsis("abcdef", 1), "…");
+        assert_eq!(compact_with_ellipsis("abcdef", 0), "");
     }
 
     #[test]
-    fn truncate_handles_multibyte_chars() {
-        // chars(), not bytes — 4 chars of "αβγδεζ" should fit in budget 4.
-        assert_eq!(truncate_with_ellipsis("αβγδεζ", 4), "αβγ…");
+    fn compact_handles_multibyte_chars() {
+        // chars(), not bytes — counts should respect grapheme-free unicode.
+        assert_eq!(compact_with_ellipsis("αβγδεζ", 4), "α…εζ");
+    }
+
+    #[test]
+    fn compact_path_keeps_leading_and_trailing_components() {
+        // The deepest directory is the most important part of a cwd label, so
+        // it must survive while the middle collapses to an ellipsis.
+        assert_eq!(
+            compact_with_ellipsis("~/workspace/github.com/gartnera/aterm", 20),
+            "~/…/gartnera/aterm"
+        );
+        // Tighter budget drops more middle components but keeps the last one.
+        assert_eq!(
+            compact_with_ellipsis("~/workspace/github.com/gartnera/aterm", 12),
+            "~/…/aterm"
+        );
+    }
+
+    #[test]
+    fn compact_path_preserves_label_prefix_and_suffix() {
+        // `name (cwd)` labels keep the program name and the closing paren.
+        assert_eq!(
+            compact_with_ellipsis("claude (~/workspace/github.com/gartnera/aterm)", 28),
+            "claude (~/…/gartnera/aterm)"
+        );
+    }
+
+    #[test]
+    fn compact_always_respects_budget() {
+        // Whatever the structure, the result never exceeds the budget and
+        // still signals elision.
+        for budget in 2..=16 {
+            let out = compact_with_ellipsis("/very-long-leading-segment/a/b/c", budget);
+            assert!(out.chars().count() <= budget, "budget {budget}: {out:?}");
+            assert!(out.contains('…'), "budget {budget}: {out:?}");
+        }
     }
 
     fn snap_with_selection(sel: SelectionView) -> GridSnapshot {
