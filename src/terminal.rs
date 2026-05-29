@@ -117,6 +117,29 @@ fn default_shell() -> &'static str {
     "/bin/sh"
 }
 
+/// Decide which `LANG` value to seed into the child environment.
+///
+/// `LC_ALL`, `LC_CTYPE`, and `LANG` form the precedence chain that determines
+/// the ctype locale; if any is already present and non-empty the charset is
+/// decided and we return `None` so the user's setting is left untouched.
+/// Otherwise we return a UTF-8 locale the platform reliably provides: macOS
+/// ships `en_US.UTF-8` but not `C.UTF-8`, while most Linux systems always have
+/// `C.UTF-8` but may not have generated `en_US.UTF-8`. A locale that isn't
+/// installed silently falls back to C, which would defeat the purpose.
+fn default_lang(lookup: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    let has_locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .any(|k| lookup(k).map(|v| !v.is_empty()).unwrap_or(false));
+    if has_locale {
+        return None;
+    }
+    Some(if cfg!(target_os = "macos") {
+        "en_US.UTF-8"
+    } else {
+        "C.UTF-8"
+    })
+}
+
 /// Render a path with `$HOME` collapsed to `~`, falling back to the
 /// lossy display form when the path isn't UTF-8.
 fn abbreviate_home(path: &std::path::Path) -> String {
@@ -463,6 +486,15 @@ impl TerminalSession {
         pty_options
             .env
             .insert("COLORTERM".into(), "truecolor".into());
+        // GUI-launched apps (Finder/Spotlight/.app, .desktop launchers) also
+        // inherit no locale, so the shell — and pagers/ncurses programs like
+        // `less`, which `git log` pipes through — fall back to the C locale and
+        // render every non-ASCII byte as an escape (e.g. "ñ" shows as
+        // "<C3><B1>"). Seed a UTF-8 locale, but only when none is already set,
+        // so a user's real locale is never clobbered.
+        if let Some(lang) = default_lang(|k| std::env::var(k).ok()) {
+            pty_options.env.insert("LANG".into(), lang.into());
+        }
         // Caller-supplied working directory wins (used to inherit the cwd
         // of the active tab on Cmd+T). Fall back to $HOME when aterm's
         // own cwd looks like the launcher default (`/`).
@@ -956,6 +988,35 @@ impl TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_lang_skips_when_locale_already_set() {
+        // Any of the three vars being set means the charset is already decided.
+        assert_eq!(
+            default_lang(|k| (k == "LANG").then(|| "fr_FR.UTF-8".into())),
+            None
+        );
+        assert_eq!(
+            default_lang(|k| (k == "LC_CTYPE").then(|| "C".into())),
+            None
+        );
+        assert_eq!(
+            default_lang(|k| (k == "LC_ALL").then(|| "en_GB.UTF-8".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn default_lang_seeds_utf8_when_locale_absent() {
+        // No locale present at all → seed a platform-appropriate UTF-8 locale.
+        let lang = default_lang(|_| None).expect("should seed a default locale");
+        assert!(
+            lang.ends_with(".UTF-8"),
+            "expected a UTF-8 locale, got {lang:?}"
+        );
+        // An empty value counts as unset (env vars are often exported empty).
+        assert!(default_lang(|_| Some(String::new())).is_some());
+    }
 
     #[test]
     fn indexed_palette_first_8_match_normal() {
