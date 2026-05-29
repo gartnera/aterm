@@ -203,9 +203,14 @@ fn build_row_text<'a>(
         // avoid double-drawing (and the font's gappy version).
         let render_ch = if crate::box_drawing::is_handled(ch) {
             '\u{00A0}'
-        } else if ch == ' ' {
+        } else if ch == ' ' || ch.is_control() {
             // cosmic-text collapses runs of spaces in some shaping paths,
-            // which can drift the column grid.
+            // which can drift the column grid. Control characters get the same
+            // treatment: alacritty stores a literal '\t' in the leading cell of
+            // a tab span (the rest of the span is blank cells), and cosmic-text
+            // would expand that tab to a tab stop, shoving every later glyph
+            // right and desyncing the selection highlight from the text. Each
+            // cell must advance exactly one column, so render these as NBSP.
             '\u{00A0}'
         } else {
             ch
@@ -1146,6 +1151,40 @@ mod tests {
         assert!(cell_in_selection(&snap, 3, 0));
         assert!(cell_in_selection(&snap, 3, 2));
         assert!(!cell_in_selection(&snap, 3, 3));
+    }
+
+    #[test]
+    fn build_row_text_renders_tab_as_single_cell() {
+        // alacritty stores a literal '\t' in the leading cell of a tab span.
+        // If that byte reaches cosmic-text it gets expanded to a tab stop,
+        // shifting every later glyph and desyncing the selection highlight.
+        // build_row_text must replace it (and any control char) with NBSP so
+        // each cell advances exactly one column.
+        let mut row = vec![SnapCell::default(); 4];
+        row[0].ch = '\t';
+        row[1].ch = 'a';
+        row[2].ch = '\u{7}'; // BEL — another control char
+        row[3].ch = 'b';
+        let snap = GridSnapshot {
+            cells: vec![row.clone()],
+            cursor_line: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            fg: [0; 3],
+            bg: [0; 3],
+            selection: None,
+        };
+        let (text, _spans) = build_row_text(&row, 0, &snap, family_of("monospace"));
+        // One char per cell, no literal control bytes that the shaper would
+        // expand.
+        assert_eq!(text.chars().count(), 4);
+        assert!(!text.contains('\t'));
+        assert!(!text.contains('\u{7}'));
+        let chars: Vec<char> = text.chars().collect();
+        assert_eq!(chars[0], '\u{00A0}');
+        assert_eq!(chars[1], 'a');
+        assert_eq!(chars[2], '\u{00A0}');
+        assert_eq!(chars[3], 'b');
     }
 
     #[test]
