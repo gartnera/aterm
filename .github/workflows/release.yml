@@ -22,6 +22,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      wait_notarization:
+        description: "Wait for notarization and staple the DMG (slower; fails CI if Apple rejects)"
+        type: boolean
+        default: false
 
 concurrency:
   group: release
@@ -78,6 +83,10 @@ jobs:
     env:
       VERSION: ${{ needs.tag.outputs.version }}
       TAG: ${{ needs.tag.outputs.tag }}
+      # Manual runs use the workflow_dispatch input; automatic (push) runs fall
+      # back to the NOTARIZE_WAIT repo variable. Default off so CI never hangs
+      # on Apple's notarization queue.
+      WAIT_NOTARIZATION: ${{ github.event.inputs.wait_notarization || vars.NOTARIZE_WAIT || 'false' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -174,22 +183,32 @@ jobs:
         run: |
           codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG_PATH"
 
-      # Submit for notarization but don't block on the result. Gatekeeper
-      # verifies the ticket online on first launch, so we skip --wait (and
-      # therefore stapling, which requires a completed notarization). Trade-off:
-      # a notarization rejection won't fail this workflow, and the app needs a
-      # network connection the first time it's opened.
+      # By default, submit without blocking: Gatekeeper verifies the ticket
+      # online at first launch. When WAIT_NOTARIZATION is true we instead wait
+      # for Apple's result and staple the ticket into the DMG, which makes the
+      # workflow fail on rejection and lets the DMG verify offline — at the
+      # cost of hanging on Apple's queue (minutes, sometimes longer).
       - name: Notarize
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          xcrun notarytool submit "$DMG_PATH" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --no-wait
+          if [ "$WAIT_NOTARIZATION" = "true" ]; then
+            xcrun notarytool submit "$DMG_PATH" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+            xcrun stapler staple "$DMG_PATH"
+            xcrun stapler validate "$DMG_PATH"
+          else
+            xcrun notarytool submit "$DMG_PATH" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --no-wait
+          fi
 
       - name: Clean up keychain
         if: always()
