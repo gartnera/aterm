@@ -81,6 +81,12 @@ cargo install --path .
 
 ### macOS .app bundle
 
+Signed, notarized universal DMGs are attached to each
+[GitHub release](https://github.com/gartnera/aterm/releases) — download,
+open, and drag `aterm.app` to `/Applications`.
+
+To build the bundle yourself:
+
 ```
 cargo install cargo-bundle
 cargo bundle --release
@@ -89,5 +95,30 @@ cp -r target/release/bundle/osx/aterm.app /Applications/
 
 ### Linux
 
-The release binary at `target/release/aterm` is self-contained; copy it
-anywhere on `$PATH`. A `.desktop` entry is not bundled yet.
+Prebuilt `x86_64` and `aarch64` binaries are attached to each
+[GitHub release](https://github.com/gartnera/aterm/releases) as
+`aterm-<version>-<target>.tar.gz`. Or build it yourself — the release
+binary at `target/release/aterm` is self-contained; copy it anywhere on
+`$PATH`. A `.desktop` entry is not bundled yet.
+
+## Releases
+
+`.github/workflows/release.yml` cuts releases automatically. Bump `version`
+in `Cargo.toml` and merge to `main`; the workflow tags `v<version>`, builds a
+universal (arm64 + x86_64) macOS app — code-signed, wrapped in a DMG,
+notarized and stapled — plus `x86_64` and `aarch64` Linux binary tarballs,
+then publishes a GitHub release with all of them attached. (It can also be
+triggered manually from the Actions tab.)
+
+macOS signing/notarization needs these repository secrets
+(*Settings → Secrets and variables → Actions*):
+
+| Secret | What it is |
+| --- | --- |
+| `APPLE_CERTIFICATE_BASE64` | base64 of your *Developer ID Application* `.p12` (`base64 -i cert.p12 \| pbcopy`) |
+| `APPLE_CERTIFICATE_PASSWORD` | password set when exporting that `.p12` |
+| `APPLE_SIGNING_IDENTITY` | e.g. `Developer ID Application: Your Name (TEAMID)` |
+| `APPLE_ID` | Apple ID email used for notarization |
+| `APPLE_APP_PASSWORD` | app-specific password for that Apple ID |
+| `APPLE_TEAM_ID` | 10-character Apple Developer Team ID |
+| `KEYCHAIN_PASSWORD` | any throwaway string securing the temp build keychain |
