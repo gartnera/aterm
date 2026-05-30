@@ -126,7 +126,14 @@ struct RawBinding {
     key: String,
     #[serde(default)]
     mods: Option<String>,
-    action: String,
+    #[serde(default)]
+    action: Option<String>,
+    /// Literal bytes to send to the PTY, mirroring alacritty's `chars`.
+    /// TOML basic-string escapes apply, e.g. `chars = "\u001bb"` sends
+    /// ESC then `b` (readline backward-word). Mutually exclusive with
+    /// `action`; `chars` wins if both are present.
+    #[serde(default)]
+    chars: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -343,9 +350,21 @@ fn apply_raw(cfg: &mut Config, raw: RawConfig) {
                 log::warn!("ignoring binding: unknown key {:?}", rb.key);
                 continue;
             };
-            let Some(action) = binding::parse_action(&rb.action) else {
-                log::warn!("ignoring binding: unknown action {:?}", rb.action);
-                continue;
+            let action = match (rb.chars, rb.action) {
+                (Some(chars), _) if !chars.is_empty() => {
+                    binding::Action::SendChars(chars.into_bytes())
+                }
+                (_, Some(action)) => {
+                    let Some(parsed) = binding::parse_action(&action) else {
+                        log::warn!("ignoring binding: unknown action {action:?}");
+                        continue;
+                    };
+                    parsed
+                }
+                _ => {
+                    log::warn!("ignoring binding for {:?}: no action or chars", rb.key);
+                    continue;
+                }
             };
             let mods = rb
                 .mods
@@ -483,6 +502,34 @@ mod tests {
         let raw: RawConfig = toml::from_str("[window]\ndynamic_title = false\n").unwrap();
         apply_raw(&mut cfg, raw);
         assert!(!cfg.dynamic_title);
+    }
+
+    #[test]
+    fn chars_binding_parses_to_send_chars() {
+        let mut cfg = Config::default();
+        let raw: RawConfig = toml::from_str(
+            "[[keyboard.bindings]]\nkey = \"Left\"\nmods = \"Alt\"\nchars = \"\\u001bb\"\n",
+        )
+        .unwrap();
+        apply_raw(&mut cfg, raw);
+        let hit = binding::find(
+            &cfg.bindings,
+            winit::keyboard::KeyCode::ArrowLeft,
+            winit::keyboard::ModifiersState::ALT,
+        )
+        .expect("Alt+Left binding present");
+        assert_eq!(hit.action, binding::Action::SendChars(vec![0x1b, b'b']));
+    }
+
+    #[test]
+    fn binding_without_action_or_chars_is_ignored() {
+        let mut cfg = Config::default();
+        let before = cfg.bindings.len();
+        let raw: RawConfig =
+            toml::from_str("[[keyboard.bindings]]\nkey = \"Left\"\nmods = \"Alt\"\n").unwrap();
+        apply_raw(&mut cfg, raw);
+        // The bogus binding is dropped; defaults are left untouched.
+        assert_eq!(cfg.bindings.len(), before);
     }
 
     #[test]

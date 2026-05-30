@@ -24,7 +24,7 @@ honored up to a depth of 4.
 | `[colors.cursor]` | `cursor` |
 | `[colors.normal]` | `black` `red` `green` `yellow` `blue` `magenta` `cyan` `white` |
 | `[colors.bright]` | (same eight) |
-| `[[keyboard.bindings]]` | `key`, `mods`, `action` |
+| `[[keyboard.bindings]]` | `key`, `mods`, `action` or `chars` |
 
 Colors accept `#RRGGBB`, `0xRRGGBB`, or `RRGGBB`. `#RRGGBBAA` is accepted
 but the alpha is discarded (the renderer doesn't composite translucent
@@ -44,6 +44,24 @@ wherever aterm itself was launched from.
 User bindings layer on top of the defaults; a user entry whose
 `(key, mods)` matches a default replaces it. Use `action = "ReceiveChar"`
 to suppress a default binding and let the keystroke flow to the PTY.
+
+A binding carries either an `action` or, like alacritty, a `chars` string
+of literal bytes to send to the PTY (`chars` wins if both are given). TOML
+basic-string escapes apply, so `"\u001b"` is ESC. This is how you get
+macOS-style Option+Left/Right word movement, which works in any shell
+without an `~/.inputrc`:
+
+```toml
+[[keyboard.bindings]]
+key = "Left"
+mods = "Alt"
+chars = "\u001bb"   # ESC b → backward-word
+
+[[keyboard.bindings]]
+key = "Right"
+mods = "Alt"
+chars = "\u001bf"   # ESC f → forward-word
+```
 
 Recognized actions: `CreateTab`, `CloseTab`, `SelectTab1`..`SelectTab9`,
 `PrevTab`/`NextTab`, `Copy`, `Paste`, `ScrollLineUp`/`ScrollLineDown`,

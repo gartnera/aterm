@@ -8,7 +8,7 @@
 
 use winit::keyboard::{KeyCode, ModifiersState};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     CreateTab,
     CloseTab,
@@ -27,6 +27,9 @@ pub enum Action {
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
+    /// Send a literal byte sequence to the PTY. Mirrors alacritty's `chars`
+    /// binding field — e.g. `chars = "b"` for Alt+Left → backward-word.
+    SendChars(Vec<u8>),
     /// Suppress a default binding without doing anything — the keystroke
     /// is passed through to the PTY. Mirrors alacritty's `ReceiveChar`.
     ReceiveChar,
