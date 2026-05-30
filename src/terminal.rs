@@ -475,7 +475,22 @@ impl TerminalSession {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| default_shell().to_string());
-        pty_options.shell = Some(Shell::new(shell_path, Vec::new()));
+        // Spawn a login shell on macOS. The per-user PATH there — Homebrew's
+        // `eval "$(brew shellenv)"` and the system `path_helper` — lives in
+        // login-only files (/etc/zprofile, ~/.zprofile, ~/.bash_profile) that a
+        // non-login shell never sources, so without this `$PATH` is missing
+        // /opt/homebrew/bin and friends and `brew` is "command not found".
+        // alacritty gets this for free by launching via `/usr/bin/login`; since
+        // we bypass `login` (the sandbox blocks it, see above) we pass `-l`
+        // ourselves. macOS Terminal and iTerm both default to login shells, so
+        // this matches expectations. On Linux the convention is the opposite —
+        // interactive non-login shells reading ~/.bashrc — and alacritty doesn't
+        // use `login` there either, so we leave the shell non-login.
+        #[cfg(target_os = "macos")]
+        let shell_args = vec!["-l".to_string()];
+        #[cfg(not(target_os = "macos"))]
+        let shell_args = Vec::new();
+        pty_options.shell = Some(Shell::new(shell_path, shell_args));
         // GUI-spawned processes (Finder/Spotlight/.app, .desktop launchers)
         // inherit an empty TERM, leaving ncurses programs unable to initialize.
         // Set it here so the shell works regardless of how aterm itself was
