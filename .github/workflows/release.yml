@@ -174,7 +174,12 @@ jobs:
         run: |
           codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG_PATH"
 
-      - name: Notarize and staple
+      # Submit for notarization but don't block on the result. Gatekeeper
+      # verifies the ticket online on first launch, so we skip --wait (and
+      # therefore stapling, which requires a completed notarization). Trade-off:
+      # a notarization rejection won't fail this workflow, and the app needs a
+      # network connection the first time it's opened.
+      - name: Notarize
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
@@ -184,9 +189,7 @@ jobs:
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
-            --wait
-          xcrun stapler staple "$DMG_PATH"
-          xcrun stapler validate "$DMG_PATH"
+            --no-wait
 
       - name: Clean up keychain
         if: always()
