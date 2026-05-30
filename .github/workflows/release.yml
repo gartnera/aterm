@@ -1,11 +1,10 @@
 name: Release
 
-# Cuts a release whenever the version in Cargo.toml lands on main and no tag
-# for it exists yet. Bump `version` in Cargo.toml, merge to main, and this
-# workflow tags `v<version>`, builds a universal (arm64 + x86_64) signed and
-# notarized macOS .app, wraps it in a DMG, and publishes a GitHub release.
-#
-# Can also be kicked manually from the Actions tab (workflow_dispatch).
+# Cuts a release. Run it manually from the Actions tab (workflow_dispatch):
+# it reads `version` from Cargo.toml and, if `v<version>` isn't already tagged,
+# tags it, builds an arm64 signed and notarized macOS .app wrapped in a DMG
+# plus Linux binary tarballs, and publishes a GitHub release.
+# Bump `version` in Cargo.toml before running to cut a new release.
 #
 # Required repository secrets (Settings -> Secrets and variables -> Actions):
 #   APPLE_CERTIFICATE_BASE64    base64 of your "Developer ID Application" .p12
@@ -19,8 +18,6 @@ name: Release
 #   KEYCHAIN_PASSWORD           any throwaway string; secures the temp keychain
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       wait_notarization:
@@ -95,7 +92,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-darwin
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
@@ -130,20 +127,14 @@ jobs:
           # Keep the login keychain in the search list so Apple roots resolve.
           security list-keychains -d user -s "$keychain_path" login.keychain-db
 
-      - name: Build universal binary and bundle
+      - name: Build app bundle (arm64)
         run: |
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
-
-          # cargo-bundle builds the .app skeleton (Info.plist, layout) for one
-          # arch; we then drop a lipo'd universal binary into it.
+          # arm64 only — cargo-bundle compiles and lays out the .app
+          # (Info.plist, MacOS/aterm) for the aarch64 target.
           cargo bundle --release --target aarch64-apple-darwin
 
           app="target/aarch64-apple-darwin/release/bundle/osx/aterm.app"
-          lipo -create -output "$app/Contents/MacOS/aterm" \
-            target/aarch64-apple-darwin/release/aterm \
-            target/x86_64-apple-darwin/release/aterm
-          lipo -info "$app/Contents/MacOS/aterm"
+          lipo -info "$app/Contents/MacOS/aterm" || true
           echo "APP_PATH=$app" >> "$GITHUB_ENV"
 
       - name: Codesign app

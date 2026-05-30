@@ -81,7 +81,7 @@ cargo install --path .
 
 ### macOS .app bundle
 
-Signed, notarized universal DMGs are attached to each
+Signed, notarized arm64 (Apple Silicon) DMGs are attached to each
 [GitHub release](https://github.com/gartnera/aterm/releases) — download,
 open, and drag `aterm.app` to `/Applications`.
 
@@ -103,12 +103,12 @@ binary at `target/release/aterm` is self-contained; copy it anywhere on
 
 ## Releases
 
-`.github/workflows/release.yml` cuts releases automatically. Bump `version`
-in `Cargo.toml` and merge to `main`; the workflow tags `v<version>`, builds a
-universal (arm64 + x86_64) macOS app — code-signed, wrapped in a DMG,
-notarized and stapled — plus `x86_64` and `aarch64` Linux binary tarballs,
-then publishes a GitHub release with all of them attached. (It can also be
-triggered manually from the Actions tab.)
+`.github/workflows/release.yml` cuts releases. Bump `version` in
+`Cargo.toml`, then run the workflow manually (*Actions → Release → Run
+workflow*); it tags `v<version>`, builds an arm64 (Apple Silicon) macOS app
+— code-signed, wrapped in a DMG and notarized — plus `x86_64` and `aarch64`
+Linux binary tarballs, then publishes a GitHub release with all of them
+attached.
 
 macOS signing/notarization needs these repository secrets
 (*Settings → Secrets and variables → Actions*):
