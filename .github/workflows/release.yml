@@ -1,0 +1,201 @@
+name: Release
+
+# Cuts a release whenever the version in Cargo.toml lands on main and no tag
+# for it exists yet. Bump `version` in Cargo.toml, merge to main, and this
+# workflow tags `v<version>`, builds a universal (arm64 + x86_64) signed and
+# notarized macOS .app, wraps it in a DMG, and publishes a GitHub release.
+#
+# Can also be kicked manually from the Actions tab (workflow_dispatch).
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   APPLE_CERTIFICATE_BASE64    base64 of your "Developer ID Application" .p12
+#                               (e.g. `base64 -i cert.p12 | pbcopy`)
+#   APPLE_CERTIFICATE_PASSWORD  password used when exporting that .p12
+#   APPLE_SIGNING_IDENTITY      e.g. "Developer ID Application: Your Name (TEAMID)"
+#   APPLE_ID                    Apple ID email used for notarization
+#   APPLE_APP_PASSWORD          app-specific password for that Apple ID
+#                               (appleid.apple.com -> Sign-In and Security)
+#   APPLE_TEAM_ID               10-character Apple Developer Team ID
+#   KEYCHAIN_PASSWORD           any throwaway string; secures the temp keychain
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  # Read the version out of Cargo.toml. If v<version> isn't already tagged,
+  # create and push the tag; downstream jobs only run when a new tag is cut.
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      created: ${{ steps.tag.outputs.created }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ -z "$version" ]; then
+            echo "could not parse version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $version"
+
+      - name: Create tag if missing
+        id: tag
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists; nothing to release."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "Release $tag"
+            git push origin "$tag"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  macos:
+    needs: tag
+    if: needs.tag.outputs.created == 'true'
+    runs-on: macos-14
+    env:
+      VERSION: ${{ needs.tag.outputs.version }}
+      TAG: ${{ needs.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install tooling
+        run: |
+          cargo install cargo-bundle --locked
+          brew install create-dmg
+
+      # Import the Developer ID Application cert into a temporary keychain so
+      # codesign can find it, then make that keychain searchable for the run.
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          cert_path="$RUNNER_TEMP/certificate.p12"
+          keychain_path="$RUNNER_TEMP/app-signing.keychain-db"
+
+          echo -n "$APPLE_CERTIFICATE_BASE64" | base64 --decode -o "$cert_path"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+
+          security import "$cert_path" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$keychain_path" >/dev/null
+
+          # Keep the login keychain in the search list so Apple roots resolve.
+          security list-keychains -d user -s "$keychain_path" login.keychain-db
+
+      - name: Build universal binary and bundle
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+          # cargo-bundle builds the .app skeleton (Info.plist, layout) for one
+          # arch; we then drop a lipo'd universal binary into it.
+          cargo bundle --release --target aarch64-apple-darwin
+
+          app="target/aarch64-apple-darwin/release/bundle/osx/aterm.app"
+          lipo -create -output "$app/Contents/MacOS/aterm" \
+            target/aarch64-apple-darwin/release/aterm \
+            target/x86_64-apple-darwin/release/aterm
+          lipo -info "$app/Contents/MacOS/aterm"
+          echo "APP_PATH=$app" >> "$GITHUB_ENV"
+
+      - name: Codesign app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          codesign --force --options runtime --timestamp \
+            --entitlements scripts/macos/entitlements.plist \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$APP_PATH"
+          codesign --verify --strict --verbose=2 "$APP_PATH"
+
+      - name: Create DMG
+        run: |
+          dmg="aterm-$VERSION.dmg"
+          # create-dmg exits non-zero when it can't set a custom volume icon
+          # (no AppleScript/Finder on headless runners); the DMG is still
+          # produced, so guard on the file existing rather than the exit code.
+          create-dmg \
+            --volname "aterm $VERSION" \
+            --window-size 540 360 \
+            --icon-size 100 \
+            --icon "aterm.app" 140 180 \
+            --app-drop-link 400 180 \
+            --no-internet-enable \
+            "$dmg" \
+            "$APP_PATH" || true
+          if [ ! -f "$dmg" ]; then
+            echo "create-dmg did not produce $dmg" >&2
+            exit 1
+          fi
+          echo "DMG_PATH=$dmg" >> "$GITHUB_ENV"
+
+      - name: Sign DMG
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG_PATH"
+
+      - name: Notarize and staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit "$DMG_PATH" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$DMG_PATH"
+          xcrun stapler validate "$DMG_PATH"
+
+      - name: Clean up keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.tag.outputs.tag }}
+          name: aterm ${{ needs.tag.outputs.version }}
+          generate_release_notes: true
+          files: ${{ env.DMG_PATH }}
