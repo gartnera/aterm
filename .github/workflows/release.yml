@@ -206,7 +206,7 @@ jobs:
         run: security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
 
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: macos-dmg
           path: ${{ env.DMG_PATH }}
@@ -261,7 +261,7 @@ jobs:
           echo "TARBALL=$tarball" >> "$GITHUB_ENV"
 
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: linux-${{ matrix.target }}
           path: ${{ env.TARBALL }}
@@ -273,13 +273,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.tag.outputs.tag }}
           name: aterm ${{ needs.tag.outputs.version }}
