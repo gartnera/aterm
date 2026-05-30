@@ -492,7 +492,7 @@ impl ApplicationHandler<WakeEvent> for App {
                 // regardless of the layout-derived character (which would be
                 // "¡" on a US layout with Alt held).
                 let binding_action = if let PhysicalKey::Code(code) = physical_key {
-                    binding::find(&self.config.bindings, code, self.mods).map(|b| b.action)
+                    binding::find(&self.config.bindings, code, self.mods).map(|b| b.action.clone())
                 } else {
                     None
                 };
@@ -501,6 +501,17 @@ impl ApplicationHandler<WakeEvent> for App {
                     // ReceiveChar to disable a default. Fall through to the
                     // PTY input encoder.
                     Some(Action::ReceiveChar) => {}
+                    // Literal `chars` binding: send the bytes to the PTY, like
+                    // ordinary typed input (snap to live output, clear sel).
+                    Some(Action::SendChars(bytes)) => {
+                        if let Some(session) = self.tabs.get(self.active_tab) {
+                            session.scroll(Scroll::Bottom);
+                            session.clear_selection();
+                            session.send_input(bytes);
+                            window.request_redraw();
+                        }
+                        return;
+                    }
                     Some(action) => {
                         self.run_action(action, event_loop);
                         return;
@@ -1039,9 +1050,10 @@ impl App {
             Action::IncreaseFontSize => self.adjust_font_size(1.0),
             Action::DecreaseFontSize => self.adjust_font_size(-1.0),
             Action::ResetFontSize => self.reset_font_size(),
-            // Handled at the dispatch site (key falls through to PTY); if
-            // we somehow get here, treat it as a no-op.
-            Action::ReceiveChar => {}
+            // Both are handled at the dispatch site (ReceiveChar falls
+            // through to the PTY encoder, SendChars writes its bytes there);
+            // if we somehow get here, treat them as no-ops.
+            Action::ReceiveChar | Action::SendChars(_) => {}
         }
         if let Some(w) = self.window.clone() {
             self.sync_window_title(&w);
