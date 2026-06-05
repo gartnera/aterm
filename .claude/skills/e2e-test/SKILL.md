@@ -137,7 +137,7 @@ single-line JSON response per request:
 | `select_tab` | `index: usize` | `{active}` |
 | `font_size` | `delta: f32` | `{font_size}` |
 | `font_size_reset` | – | `{font_size}` |
-| `hover_url` | `row, col, ctrl` | `{uri}` or `null` |
+| `hover_url` | `row, col, ctrl` | `{uri, spans}` or `null` |
 
 ## Ad-hoc poking from the shell
 

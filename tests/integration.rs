@@ -144,6 +144,94 @@ fn url_regex_matches_printed_url() {
 }
 
 #[test]
+fn url_regex_highlights_wrapped_rows() {
+    require_display!();
+    let mut t = AtermTest::spawn();
+
+    // A URL long enough to wrap onto a second row when printed at column 0.
+    let url = "https://example.com/a/very/long/path/that/keeps/going/and/going/and/going/until/it/definitely/wraps/across/two/rows/foobarbaz";
+    t.type_line(&format!("printf '%s\\n' {url}"));
+    t.wait_for_text("until/it/definitely");
+
+    // The printed URL (not the echoed command) is the last `https://` row.
+    let lines = t.snapshot_text();
+    let (row, col) = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(r, l)| l.find("https://").map(|c| (r, c)))
+        .expect("printed URL not found");
+
+    // The regex sweep (ctrl held) must report the full URI and underline every
+    // row it wraps onto, not just the first.
+    let data = t.hover_url_raw(row, col, true);
+    assert_eq!(data["uri"].as_str(), Some(url));
+    let span_rows = span_lines(&data);
+    assert!(
+        span_rows.len() >= 2 && span_rows.contains(&row) && span_rows.contains(&(row + 1)),
+        "wrapped URL should span the first row and its continuation; got {span_rows:?}"
+    );
+
+    // The continuation row is clickable too: hovering it resolves the same URI.
+    assert_eq!(t.hover_url(row + 1, 0, true).as_deref(), Some(url));
+}
+
+#[test]
+fn osc8_link_highlights_wrapped_rows() {
+    require_display!();
+    let mut t = AtermTest::spawn();
+
+    // An OSC 8 hyperlink whose display text is long enough to wrap. The URI is
+    // hidden behind the text, so it surfaces on hover without the modifier.
+    let uri = "https://osc8.example.com/target";
+    let text = "CLICKHERE-this-is-a-very-long-hyperlink-display-text-that-will-definitely-wrap-across-two-rows-in-the-terminal-windowEND";
+    t.type_line(&format!(
+        "printf '\\033]8;;{uri}\\033\\\\%s\\033]8;;\\033\\\\\\n' {text}"
+    ));
+    t.wait_for_text("wrap-across");
+
+    // The hyperlink OUTPUT is the last row carrying the display text's head.
+    let lines = t.snapshot_text();
+    let (row, col) = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(r, l)| l.find("CLICKHERE").map(|c| (r, c)))
+        .expect("hyperlink output not found");
+
+    // OSC 8 links surface without ctrl. Hovering the first row must underline
+    // both the row and its wrapped continuation.
+    let data = t.hover_url_raw(row, col, false);
+    assert_eq!(data["uri"].as_str(), Some(uri));
+    let span_rows = span_lines(&data);
+    assert!(
+        span_rows.len() >= 2 && span_rows.contains(&row) && span_rows.contains(&(row + 1)),
+        "wrapped OSC 8 link should span both rows; got {span_rows:?}"
+    );
+
+    // Hovering the continuation row resolves the same link and also spans both
+    // rows (the walk is symmetric).
+    let data2 = t.hover_url_raw(row + 1, 0, false);
+    assert_eq!(data2["uri"].as_str(), Some(uri));
+    assert_eq!(span_lines(&data2), span_rows);
+}
+
+/// Sorted viewport rows touched by a `hover_url` response's spans.
+fn span_lines(data: &serde_json::Value) -> Vec<usize> {
+    let mut rows: Vec<usize> = data["spans"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s["line"].as_u64().map(|n| n as usize))
+                .collect()
+        })
+        .unwrap_or_default();
+    rows.sort_unstable();
+    rows.dedup();
+    rows
+}
+
+#[test]
 fn double_click_selects_word() {
     require_display!();
     let mut t = AtermTest::spawn();

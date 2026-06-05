@@ -362,6 +362,15 @@ impl AtermTest {
         data.get("uri").and_then(Value::as_str).map(str::to_string)
     }
 
+    pub fn hover_url_raw(&mut self, row: usize, col: usize, ctrl: bool) -> Value {
+        self.request(json!({
+            "cmd": "hover_url",
+            "row": row,
+            "col": col,
+            "ctrl": ctrl,
+        }))
+    }
+
     /// Select the word at (row, col), as a double-click would, and return the
     /// resulting selection text (None if nothing was selected).
     pub fn select_word(&mut self, row: usize, col: usize) -> Option<String> {

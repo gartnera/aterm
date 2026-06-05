@@ -335,37 +335,86 @@ fn resolve_color(
     }
 }
 
-/// Walk left and right from `point` on the same row, collecting cells that
-/// share the OSC 8 hyperlink id. Returns a single-row span; OSC 8 links that
-/// wrap to a new line aren't extended onto it (rare in practice and not worth
-/// the complexity).
+/// Collect the per-row viewport spans of the OSC 8 hyperlink with id `id`
+/// that contains `point`. Walks left/right from the point through cells that
+/// share the id, stepping onto adjacent rows where the link wraps, so a link
+/// whose display text spans several rows is highlighted on every row rather
+/// than just the one under the cursor. The walk is clamped to the visible
+/// viewport: a run that continues off-screen covers the edge row from column 0
+/// (or to the last column), so there's no need to climb into the scrollback.
 fn osc8_spans<T>(
     term: &alacritty_terminal::Term<T>,
     point: Point,
     id: &str,
-    vp_line: usize,
+    display_offset: usize,
+    vp_lines: usize,
     cols: usize,
 ) -> Vec<UrlSpan> {
-    let row = &term.grid()[point.line];
-    let mut start_col = point.column.0;
-    while start_col > 0 {
-        match row[Column(start_col - 1)].hyperlink() {
-            Some(h) if h.id() == id => start_col -= 1,
-            _ => break,
-        }
+    if cols == 0 || vp_lines == 0 {
+        return Vec::new();
     }
-    let mut end_col = point.column.0;
-    while end_col + 1 < cols {
-        match row[Column(end_col + 1)].hyperlink() {
-            Some(h) if h.id() == id => end_col += 1,
-            _ => break,
+    let last_col = cols - 1;
+    // Viewport line v maps to grid Line(v - display_offset); invert for bounds.
+    let top_line = Line(-(display_offset as i32));
+    let bottom_line = top_line + (vp_lines as i32 - 1);
+
+    let same_id = |line: Line, col: usize| match term.grid()[line][Column(col)].hyperlink() {
+        Some(h) => h.id() == id,
+        None => false,
+    };
+
+    // Walk to the start of the run. At column 0, step onto the previous row's
+    // last column when the link wraps there.
+    let mut start = point;
+    loop {
+        if start.column.0 > 0 {
+            if same_id(start.line, start.column.0 - 1) {
+                start.column.0 -= 1;
+                continue;
+            }
+            break;
         }
+        if start.line > top_line && same_id(start.line - 1i32, last_col) {
+            start.line -= 1i32;
+            start.column = Column(last_col);
+            continue;
+        }
+        break;
     }
-    vec![UrlSpan {
-        line: vp_line,
-        start_col,
-        end_col,
-    }]
+
+    // Walk to the end of the run, stepping onto the next row's first column.
+    let mut end = point;
+    loop {
+        if end.column.0 < last_col {
+            if same_id(end.line, end.column.0 + 1) {
+                end.column.0 += 1;
+                continue;
+            }
+            break;
+        }
+        if end.line < bottom_line && same_id(end.line + 1i32, 0) {
+            end.line += 1i32;
+            end.column = Column(0);
+            continue;
+        }
+        break;
+    }
+
+    let mut spans = Vec::with_capacity((end.line.0 - start.line.0 + 1).max(0) as usize);
+    for line in start.line.0..=end.line.0 {
+        let s = if line == start.line.0 { start.column.0 } else { 0 };
+        let e = if line == end.line.0 { end.column.0 } else { last_col };
+        let vp_line = line + display_offset as i32;
+        if vp_line < 0 || vp_line >= vp_lines as i32 {
+            continue;
+        }
+        spans.push(UrlSpan {
+            line: vp_line as usize,
+            start_col: s,
+            end_col: e,
+        });
+    }
+    spans
 }
 
 /// Convert a regex `Match` (inclusive grid-line range) into per-row viewport
@@ -800,7 +849,7 @@ impl TerminalSession {
         // matches what the user sees, the same way we do for regex matches.
         let uri = full[..trim_url_end(full)].to_string();
         let id = link.id().to_string();
-        let spans = osc8_spans(&term, point, &id, vp_line, cols);
+        let spans = osc8_spans(&term, point, &id, display_offset, lines, cols);
         Some(UrlMatch { uri, spans })
     }
 
