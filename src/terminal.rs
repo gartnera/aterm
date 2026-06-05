@@ -402,8 +402,16 @@ fn osc8_spans<T>(
 
     let mut spans = Vec::with_capacity((end.line.0 - start.line.0 + 1).max(0) as usize);
     for line in start.line.0..=end.line.0 {
-        let s = if line == start.line.0 { start.column.0 } else { 0 };
-        let e = if line == end.line.0 { end.column.0 } else { last_col };
+        let s = if line == start.line.0 {
+            start.column.0
+        } else {
+            0
+        };
+        let e = if line == end.line.0 {
+            end.column.0
+        } else {
+            last_col
+        };
         let vp_line = line + display_offset as i32;
         if vp_line < 0 || vp_line >= vp_lines as i32 {
             continue;
