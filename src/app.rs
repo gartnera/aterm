@@ -1215,7 +1215,12 @@ impl App {
                     session.osc8_at(row, col)
                 };
                 match url {
-                    Some(u) => Response::ok_data(serde_json::json!({ "uri": u.uri })),
+                    Some(u) => Response::ok_data(serde_json::json!({
+                        "uri": u.uri,
+                        "spans": u.spans.iter().map(|s| serde_json::json!({
+                            "line": s.line, "start_col": s.start_col, "end_col": s.end_col,
+                        })).collect::<Vec<_>>(),
+                    })),
                     None => Response::ok_data(serde_json::Value::Null),
                 }
             }
