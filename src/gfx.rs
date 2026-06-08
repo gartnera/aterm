@@ -553,6 +553,20 @@ impl Gfx {
         self.url_bar_buffer = None;
     }
 
+    /// Swap the active color palette. Recomputes the window clear color (the
+    /// terminal background) and the derived tab-bar theme so a later repaint
+    /// reflects the new scheme. Used when the OS light/dark appearance changes.
+    pub fn set_colors(&mut self, colors: &ConfigColors) {
+        let bg = colors.background;
+        self.clear_color = wgpu::Color {
+            r: srgb_to_linear(bg[0]),
+            g: srgb_to_linear(bg[1]),
+            b: srgb_to_linear(bg[2]),
+            a: 1.0,
+        };
+        self.tab_theme = TabBarTheme::derive(colors);
+    }
+
     /// Compute the grid (cols, lines) that fit in the current window below the
     /// tab bar.
     pub fn grid_for_window(&self, tab_bar_height: f32) -> (u16, u16) {

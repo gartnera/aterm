@@ -931,6 +931,14 @@ impl TerminalSession {
         self.term.lock().resize(size);
     }
 
+    /// Replace the color palette used to resolve named/indexed/default cell
+    /// colors when this tab is snapshotted for rendering. Called when the OS
+    /// light/dark appearance changes so existing tabs repaint in the new
+    /// scheme.
+    pub fn set_palette(&mut self, palette: ConfigColors) {
+        self.palette = palette;
+    }
+
     /// Snapshot the current viewport for rendering. Takes the lock briefly,
     /// then releases it so the renderer can run unsynchronized.
     pub fn snapshot(&self) -> GridSnapshot {

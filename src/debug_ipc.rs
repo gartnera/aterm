@@ -64,6 +64,14 @@ pub enum Request {
     /// and return the resulting selection text. Exercises the semantic
     /// selection path without synthesizing raw mouse events.
     SelectWord { row: usize, col: usize },
+    /// Report the active theme: the resolved background/foreground colors (as
+    /// `#rrggbb`) and whether aterm is following the system appearance.
+    Theme,
+    /// Force the active palette to the light or dark scheme, as a system
+    /// appearance change would. Test back door for the live theme-switch path
+    /// (the real trigger is `WindowEvent::ThemeChanged`, which can't be
+    /// synthesized from the debug socket). Returns the new background color.
+    SetTheme { light: bool },
 }
 
 #[derive(Debug, Serialize)]

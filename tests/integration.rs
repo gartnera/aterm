@@ -98,6 +98,36 @@ fn new_tab_opens_to_right_of_active() {
 }
 
 #[test]
+fn theme_switches_between_light_and_dark() {
+    require_display!();
+    let mut t = AtermTest::spawn();
+
+    // Force the dark scheme, then light, and confirm the active background
+    // tracks the swap. The built-in defaults are the alacritty dark scheme
+    // (#181818) and the base16 light scheme (#f8f8f8).
+    let dark = t.set_theme(false);
+    assert_eq!(
+        dark, "#181818",
+        "dark background should be the alacritty default"
+    );
+
+    let light = t.set_theme(true);
+    assert_eq!(
+        light, "#f8f8f8",
+        "light background should be the base16 light default"
+    );
+    assert_eq!(
+        t.theme_background(),
+        "#f8f8f8",
+        "query should reflect the live swap"
+    );
+
+    // And back to dark.
+    let dark_again = t.set_theme(false);
+    assert_eq!(dark_again, "#181818");
+}
+
+#[test]
 fn font_size_clamped_and_resettable() {
     require_display!();
     let mut t = AtermTest::spawn();

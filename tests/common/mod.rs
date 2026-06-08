@@ -382,6 +382,33 @@ impl AtermTest {
         data.get("text").and_then(Value::as_str).map(str::to_string)
     }
 
+    /// Return the active theme's background color as `#rrggbb`.
+    pub fn theme_background(&mut self) -> String {
+        let data = self.request(json!({ "cmd": "theme" }));
+        data.get("background")
+            .and_then(Value::as_str)
+            .expect("theme background")
+            .to_string()
+    }
+
+    /// Whether aterm is configured to follow the OS light/dark appearance.
+    pub fn follows_system_theme(&mut self) -> bool {
+        let data = self.request(json!({ "cmd": "theme" }));
+        data.get("follow_system_theme")
+            .and_then(Value::as_bool)
+            .expect("follow_system_theme")
+    }
+
+    /// Force the active palette to light or dark, as a system appearance
+    /// change would. Returns the resulting background color as `#rrggbb`.
+    pub fn set_theme(&mut self, light: bool) -> String {
+        let data = self.request(json!({ "cmd": "set_theme", "light": light }));
+        data.get("background")
+            .and_then(Value::as_str)
+            .expect("set_theme background")
+            .to_string()
+    }
+
     /// Block until the visible grid contains `needle`. Useful for waiting on
     /// shell output without sleeping a fixed duration. Polls every 50ms.
     pub fn wait_for_text(&mut self, needle: &str) {

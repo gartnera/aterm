@@ -13,7 +13,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{ModifiersState, PhysicalKey};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
-use winit::window::{CursorIcon, Window, WindowId};
+use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 use crate::binding::{self, Action};
 use crate::config::{self, Config};
@@ -364,6 +364,10 @@ impl ApplicationHandler<WakeEvent> for App {
         // produces Ime::Commit(s) once composition finishes; we forward the
         // committed bytes to the PTY just like typed input.
         window.set_ime_allowed(true);
+        // Resolve the initial palette from the OS appearance. `window.theme()`
+        // is None on platforms/backends that can't report it (e.g. bare X11),
+        // in which case we keep the dark default.
+        self.config.colors = self.resolve_theme_colors(window.theme());
         let line_height = (self.config.font_size * 1.25).round();
         let gfx = pollster::block_on(Gfx::new(
             window.clone(),
@@ -446,6 +450,14 @@ impl ApplicationHandler<WakeEvent> for App {
             WindowEvent::ModifiersChanged(mods) => {
                 self.mods = mods.state();
                 self.refresh_hover_url(&window);
+            }
+            // The OS switched between light and dark appearance. Swap to the
+            // matching palette live (no restart needed) when we're following
+            // the system theme.
+            WindowEvent::ThemeChanged(theme) => {
+                if self.config.follow_system_theme {
+                    self.apply_theme_colors(self.resolve_theme_colors(Some(theme)), &window);
+                }
             }
             // IME composition output. Preedit/Enabled/Disabled don't write
             // to the PTY — the platform IME handles its own preview popup,
@@ -1099,6 +1111,34 @@ impl App {
             tab.resize(cols, lines, cell_w_px, cell_h_px);
         }
     }
+
+    /// Pick the palette that matches the given OS theme. Falls back to the
+    /// dark palette when the theme is unknown or when we aren't following the
+    /// system (so an explicit single scheme is always honored).
+    fn resolve_theme_colors(&self, theme: Option<Theme>) -> config::Colors {
+        if self.config.follow_system_theme && theme == Some(Theme::Light) {
+            self.config.colors_light.clone()
+        } else {
+            self.config.colors_dark.clone()
+        }
+    }
+
+    /// Make `colors` the active palette across the renderer and every open
+    /// tab, then repaint. A no-op if the palette is already in effect, so
+    /// redundant theme-change events don't churn the GPU state.
+    fn apply_theme_colors(&mut self, colors: config::Colors, window: &Window) {
+        if self.config.colors == colors {
+            return;
+        }
+        self.config.colors = colors.clone();
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.set_colors(&colors);
+        }
+        for tab in &mut self.tabs {
+            tab.set_palette(colors.clone());
+        }
+        window.request_redraw();
+    }
 }
 
 #[cfg(unix)]
@@ -1236,6 +1276,30 @@ impl App {
                     "text": session.selection_text(),
                 }))
             }
+            Request::Theme => Response::ok_data(serde_json::json!({
+                "background": hex_color(self.config.colors.background),
+                "foreground": hex_color(self.config.colors.foreground),
+                "follow_system_theme": self.config.follow_system_theme,
+            })),
+            Request::SetTheme { light } => {
+                let colors = if light {
+                    self.config.colors_light.clone()
+                } else {
+                    self.config.colors_dark.clone()
+                };
+                if let Some(w) = self.window.clone() {
+                    self.apply_theme_colors(colors, &w);
+                }
+                Response::ok_data(serde_json::json!({
+                    "background": hex_color(self.config.colors.background),
+                }))
+            }
         }
     }
+}
+
+/// Format an RGB triple as a `#rrggbb` string for debug-IPC responses.
+#[cfg(unix)]
+fn hex_color([r, g, b]: [u8; 3]) -> String {
+    format!("#{r:02x}{g:02x}{b:02x}")
 }

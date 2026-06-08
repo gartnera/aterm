@@ -16,7 +16,17 @@ pub struct Config {
     /// Original font size as configured by the user. `font_size` is the
     /// current (possibly zoomed) size; this is what ResetFontSize restores.
     pub font_size_initial: Option<f32>,
+    /// The palette currently in effect. Equals `colors_dark` or `colors_light`
+    /// depending on the resolved system theme (see [`follow_system_theme`]).
     pub colors: Colors,
+    /// Palette used when the system theme is dark (or theme detection is
+    /// unavailable). Standard alacritty `[colors]` keys customize this one.
+    pub colors_dark: Colors,
+    /// Palette used when the system reports a light appearance.
+    pub colors_light: Colors,
+    /// When true, aterm follows the OS light/dark appearance and swaps between
+    /// `colors_dark` and `colors_light` live as the system theme changes.
+    pub follow_system_theme: bool,
     pub padding_x: f32,
     pub padding_y: f32,
     pub bindings: Vec<Keybinding>,
@@ -32,7 +42,15 @@ impl Default for Config {
             font_family: default_font_family().to_string(),
             font_size: 13.0,
             font_size_initial: None,
-            colors: Colors::default(),
+            colors: Colors::default_dark(),
+            colors_dark: Colors::default_dark(),
+            colors_light: Colors::default_light(),
+            // Off by default: with no `[colors]` config this still resolves to
+            // the dark palette (matching the historical look), but a user who
+            // opts in — or who defines a `[colors.light]`/`[colors.dark]`
+            // table — gets live theme switching. `load()` flips this on when
+            // appropriate.
+            follow_system_theme: false,
             padding_x: 6.0,
             padding_y: 6.0,
             bindings: binding::defaults(),
@@ -50,7 +68,7 @@ fn default_font_family() -> &'static str {
     "monospace"
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Colors {
     pub background: [u8; 3],
     pub foreground: [u8; 3],
@@ -59,7 +77,7 @@ pub struct Colors {
     pub bright: AnsiPalette,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnsiPalette {
     pub black: [u8; 3],
     pub red: [u8; 3],
@@ -73,8 +91,15 @@ pub struct AnsiPalette {
 
 impl Default for Colors {
     fn default() -> Self {
-        // Matches alacritty's built-in default scheme so the look is
-        // identical when no [colors] table is provided.
+        Self::default_dark()
+    }
+}
+
+impl Colors {
+    /// Matches alacritty's built-in default scheme so the look is identical
+    /// when no `[colors]` table is provided. Used when the system theme is
+    /// dark or when theme detection is unavailable.
+    pub fn default_dark() -> Self {
         Self {
             background: [0x18, 0x18, 0x18],
             foreground: [0xd8, 0xd8, 0xd8],
@@ -98,6 +123,38 @@ impl Default for Colors {
                 magenta: [0xc2, 0x8c, 0xb8],
                 cyan: [0x93, 0xd3, 0xc3],
                 white: [0xf8, 0xf8, 0xf8],
+            },
+        }
+    }
+
+    /// Built-in light scheme (base16 "Default Light" by Chris Kempson), the
+    /// natural companion to the dark default above. Used when the system
+    /// reports a light appearance and the user hasn't supplied their own
+    /// `[colors.light]` table.
+    pub fn default_light() -> Self {
+        Self {
+            background: [0xf8, 0xf8, 0xf8],
+            foreground: [0x38, 0x38, 0x38],
+            cursor: [0x38, 0x38, 0x38],
+            normal: AnsiPalette {
+                black: [0xf8, 0xf8, 0xf8],
+                red: [0xab, 0x46, 0x42],
+                green: [0xa1, 0xb5, 0x6c],
+                yellow: [0xf7, 0xca, 0x88],
+                blue: [0x7c, 0xaf, 0xc2],
+                magenta: [0xba, 0x8b, 0xaf],
+                cyan: [0x86, 0xc1, 0xb9],
+                white: [0x38, 0x38, 0x38],
+            },
+            bright: AnsiPalette {
+                black: [0xb8, 0xb8, 0xb8],
+                red: [0xab, 0x46, 0x42],
+                green: [0xa1, 0xb5, 0x6c],
+                yellow: [0xf7, 0xca, 0x88],
+                blue: [0x7c, 0xaf, 0xc2],
+                magenta: [0xba, 0x8b, 0xaf],
+                cyan: [0x86, 0xc1, 0xb9],
+                white: [0x18, 0x18, 0x18],
             },
         }
     }
@@ -159,6 +216,18 @@ struct RawColors {
     normal: Option<RawAnsi>,
     #[serde(default)]
     bright: Option<RawAnsi>,
+    /// aterm extension: overrides applied to the dark palette only. Same shape
+    /// as the standard `[colors]` table (primary/cursor/normal/bright).
+    #[serde(default)]
+    dark: Option<Box<RawColors>>,
+    /// aterm extension: overrides applied to the light palette only.
+    #[serde(default)]
+    light: Option<Box<RawColors>>,
+    /// aterm extension: explicitly enable/disable following the OS appearance.
+    /// When unset, aterm infers a sensible default (follow when the user
+    /// hasn't pinned a single explicit scheme; see [`apply_raw`]).
+    #[serde(default)]
+    auto_theme: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -327,22 +396,55 @@ fn apply_raw(cfg: &mut Config, raw: RawConfig) {
         }
     }
     if let Some(colors) = raw.colors {
-        if let Some(primary) = colors.primary {
-            if let Some(bg) = primary.background.as_deref().and_then(parse_hex) {
-                cfg.colors.background = bg;
-            }
-            if let Some(fg) = primary.foreground.as_deref().and_then(parse_hex) {
-                cfg.colors.foreground = fg;
-            }
+        // Standard alacritty `[colors]` keys customize the dark palette — that
+        // preserves the historical look for users who configured a single
+        // (typically dark) scheme.
+        let has_flat = colors.primary.is_some()
+            || colors.cursor.is_some()
+            || colors.normal.is_some()
+            || colors.bright.is_some();
+        apply_palette_overrides(
+            &mut cfg.colors_dark,
+            colors.primary,
+            colors.cursor,
+            colors.normal,
+            colors.bright,
+        );
+        // aterm extensions: per-scheme overrides.
+        let has_split = colors.dark.is_some() || colors.light.is_some();
+        if let Some(dark) = colors.dark {
+            apply_palette_overrides(
+                &mut cfg.colors_dark,
+                dark.primary,
+                dark.cursor,
+                dark.normal,
+                dark.bright,
+            );
         }
-        if let Some(cur) = colors.cursor {
-            if let Some(c) = cur.cursor.as_deref().and_then(parse_hex) {
-                cfg.colors.cursor = c;
-            }
+        if let Some(light) = colors.light {
+            apply_palette_overrides(
+                &mut cfg.colors_light,
+                light.primary,
+                light.cursor,
+                light.normal,
+                light.bright,
+            );
         }
-        apply_ansi(&mut cfg.colors.normal, colors.normal);
-        apply_ansi(&mut cfg.colors.bright, colors.bright);
+        // Follow the OS appearance unless the user pinned a single explicit
+        // scheme via a flat `[colors]` table. An explicit `auto_theme` always
+        // wins; defining a `[colors.dark]`/`[colors.light]` split is itself a
+        // request to switch.
+        cfg.follow_system_theme = match colors.auto_theme {
+            Some(v) => v,
+            None => has_split || !has_flat,
+        };
+    } else {
+        // No `[colors]` table at all: follow the system out of the box.
+        cfg.follow_system_theme = true;
     }
+    // Keep the active palette in sync as a pre-theme-resolution default. The
+    // event loop overrides this from the real OS theme once a window exists.
+    cfg.colors = cfg.colors_dark.clone();
     if let Some(kb) = raw.keyboard {
         let mut user = Vec::with_capacity(kb.bindings.len());
         for rb in kb.bindings {
@@ -377,6 +479,33 @@ fn apply_raw(cfg: &mut Config, raw: RawConfig) {
             cfg.bindings = binding::merge(user, binding::defaults());
         }
     }
+}
+
+/// Apply the standard alacritty color keys (primary/cursor/normal/bright) onto
+/// a single [`Colors`] palette. Shared by the flat `[colors]` table and the
+/// aterm-specific `[colors.dark]`/`[colors.light]` sub-tables.
+fn apply_palette_overrides(
+    target: &mut Colors,
+    primary: Option<RawPrimary>,
+    cursor: Option<RawCursor>,
+    normal: Option<RawAnsi>,
+    bright: Option<RawAnsi>,
+) {
+    if let Some(primary) = primary {
+        if let Some(bg) = primary.background.as_deref().and_then(parse_hex) {
+            target.background = bg;
+        }
+        if let Some(fg) = primary.foreground.as_deref().and_then(parse_hex) {
+            target.foreground = fg;
+        }
+    }
+    if let Some(cur) = cursor {
+        if let Some(c) = cur.cursor.as_deref().and_then(parse_hex) {
+            target.cursor = c;
+        }
+    }
+    apply_ansi(&mut target.normal, normal);
+    apply_ansi(&mut target.bright, bright);
 }
 
 fn apply_ansi(pal: &mut AnsiPalette, raw: Option<RawAnsi>) {
@@ -530,6 +659,67 @@ mod tests {
         apply_raw(&mut cfg, raw);
         // The bogus binding is dropped; defaults are left untouched.
         assert_eq!(cfg.bindings.len(), before);
+    }
+
+    #[test]
+    fn no_colors_table_follows_system() {
+        let mut cfg = Config::default();
+        let raw: RawConfig = toml::from_str("[font]\nsize = 12.0\n").unwrap();
+        apply_raw(&mut cfg, raw);
+        // Out of the box (no [colors] customization) aterm follows the OS.
+        assert!(cfg.follow_system_theme);
+        // Built-in light scheme is available even without explicit config.
+        assert_eq!(cfg.colors_light, Colors::default_light());
+    }
+
+    #[test]
+    fn flat_colors_table_pins_dark_scheme() {
+        let mut cfg = Config::default();
+        let raw: RawConfig =
+            toml::from_str("[colors.primary]\nbackground = \"#102030\"\n").unwrap();
+        apply_raw(&mut cfg, raw);
+        // A single explicit scheme opts out of following the system, and the
+        // override lands on the dark palette (the historical behavior).
+        assert!(!cfg.follow_system_theme);
+        assert_eq!(cfg.colors_dark.background, [0x10, 0x20, 0x30]);
+        assert_eq!(cfg.colors.background, [0x10, 0x20, 0x30]);
+    }
+
+    #[test]
+    fn light_table_enables_following_and_overrides_light_only() {
+        let mut cfg = Config::default();
+        let raw: RawConfig = toml::from_str(
+            "[colors.primary]\nbackground = \"#102030\"\n\
+             [colors.light.primary]\nbackground = \"#fafbfc\"\n",
+        )
+        .unwrap();
+        apply_raw(&mut cfg, raw);
+        // Defining a per-scheme table is a request to switch.
+        assert!(cfg.follow_system_theme);
+        assert_eq!(cfg.colors_dark.background, [0x10, 0x20, 0x30]);
+        assert_eq!(cfg.colors_light.background, [0xfa, 0xfb, 0xfc]);
+    }
+
+    #[test]
+    fn auto_theme_explicit_override_wins() {
+        let mut cfg = Config::default();
+        // Flat table alone would pin to dark, but auto_theme = true overrides.
+        let raw: RawConfig = toml::from_str(
+            "[colors]\nauto_theme = true\n[colors.primary]\nbackground = \"#102030\"\n",
+        )
+        .unwrap();
+        apply_raw(&mut cfg, raw);
+        assert!(cfg.follow_system_theme);
+
+        let mut cfg = Config::default();
+        // Conversely, a light/dark split would follow, but auto_theme = false
+        // pins it off.
+        let raw: RawConfig = toml::from_str(
+            "[colors]\nauto_theme = false\n[colors.light.primary]\nbackground = \"#fafbfc\"\n",
+        )
+        .unwrap();
+        apply_raw(&mut cfg, raw);
+        assert!(!cfg.follow_system_theme);
     }
 
     #[test]
