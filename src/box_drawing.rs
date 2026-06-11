@@ -5,6 +5,11 @@
 //! braille range (U+2800–U+28FF), used by btop/htop for bar graphs, has the
 //! same problem.
 //!
+//! U+23FA (`⏺`, BLACK CIRCLE FOR RECORD) is a special case: most monospace
+//! fonts lack it, so cosmic-text either falls back to a mismatched (often
+//! colour-emoji) glyph or draws tofu. Claude Code uses it as its per-message
+//! bullet, so it's worth drawing ourselves as a clean filled circle.
+//!
 //! We sidestep the font for these ranges and emit quads sized to the cell.
 //! Returns `true` if the char was handled (the caller should suppress the
 //! font glyph for that cell).
@@ -13,7 +18,7 @@ use crate::quad::Quad;
 
 pub fn is_handled(ch: char) -> bool {
     let c = ch as u32;
-    (0x2500..=0x259F).contains(&c) || (0x2800..=0x28FF).contains(&c)
+    (0x2500..=0x259F).contains(&c) || (0x2800..=0x28FF).contains(&c) || c == 0x23FA
 }
 
 /// Append quads for `ch` rendered inside the cell at (`x`, `y`) with size
@@ -40,8 +45,56 @@ pub fn push_quads(
     } else if (0x2800..=0x28FF).contains(&c) {
         push_braille(quads, ch, x, y, cell_w, cell_h, color, scale);
         true
+    } else if c == 0x23FA {
+        push_filled_circle(quads, x, y, cell_w, cell_h, color);
+        true
     } else {
         false
+    }
+}
+
+/// `⏺` (U+23FA): a filled circle centred in the cell. The quad pipeline draws
+/// flat-coloured rects with no anti-aliasing, so a naive scanline disc reads as
+/// a chunky diamond at bullet sizes. Instead we emit one 1px quad per covered
+/// pixel and fold the circle's edge coverage into the quad's alpha (the
+/// pipeline blends in linear space, where this AA is correct). The result is a
+/// smooth disc even at ~6px diameter.
+fn push_filled_circle(
+    quads: &mut Vec<Quad>,
+    x: f32,
+    y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    color: [f32; 4],
+) {
+    let cx = x + cell_w * 0.5;
+    let cy = y + cell_h * 0.5;
+    // Diameter ~0.8 of the smaller cell dimension: prominent enough to read as
+    // a bullet, with a margin so it never bleeds into neighbouring cells.
+    let r = cell_w.min(cell_h) * 0.5 * 0.8;
+    if r <= 0.0 {
+        return;
+    }
+
+    // Bounding box, padded a pixel so the anti-aliased fringe isn't clipped.
+    let px0 = (cx - r - 1.0).floor() as i32;
+    let px1 = (cx + r + 1.0).ceil() as i32;
+    let py0 = (cy - r - 1.0).floor() as i32;
+    let py1 = (cy + r + 1.0).ceil() as i32;
+
+    for py in py0..py1 {
+        for px in px0..px1 {
+            let dx = px as f32 + 0.5 - cx;
+            let dy = py as f32 + 0.5 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            // Coverage of a 1px pixel by the disc edge: full inside, 0 outside,
+            // a linear ramp across the ~1px transition band.
+            let coverage = (r + 0.5 - dist).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                let c = [color[0], color[1], color[2], color[3] * coverage];
+                rect(quads, px as f32, py as f32, 1.0, 1.0, c);
+            }
+        }
     }
 }
 
@@ -754,11 +807,51 @@ mod tests {
         assert!(is_handled('▒'));
         assert!(is_handled('⠁'));
         assert!(is_handled('⣿'));
+        assert!(is_handled('⏺'));
         // Outside the handled ranges.
         assert!(!is_handled('a'));
         assert!(!is_handled(' '));
         assert!(!is_handled('▲'));
         assert!(!is_handled('●'));
+    }
+
+    /// `⏺` (U+23FA) renders as a disc: the row through the centre must be
+    /// wider than a row near the top, and the whole glyph must stay inside the
+    /// cell so it never bleeds into a neighbour. Rendered at a large cell so the
+    /// per-pixel coverage has enough resolution for the width comparison.
+    #[test]
+    fn record_circle_is_round_and_contained() {
+        const CELL: f32 = 48.0;
+        let mut q = Vec::new();
+        push_quads(&mut q, '⏺', 0.0, 0.0, CELL, CELL, FG, 1.0);
+        assert!(!q.is_empty(), "no quads emitted for ⏺");
+
+        let mid = CELL * 0.5;
+        let center = x_span_at(&q, mid).expect("no pixels at circle centre");
+        let center_w = center.1 - center.0;
+        let near_top = x_span_at(&q, mid - CELL * 0.3)
+            .map(|(a, b)| b - a)
+            .unwrap_or(0.0);
+        assert!(
+            center_w > near_top,
+            "circle not round: centre width {center_w} <= near-top width {near_top}"
+        );
+
+        for quad in &q {
+            let (x0, x1) = bounds_x(quad);
+            let (y0, y1) = bounds_y(quad);
+            assert!(
+                x0 >= 0.0 && x1 <= CELL && y0 >= 0.0 && y1 <= CELL,
+                "circle quad {:?} escapes the cell",
+                quad.rect
+            );
+        }
+        // Edge pixels carry fractional coverage in the alpha channel; the
+        // anti-aliasing is the whole point, so confirm it's actually present.
+        let has_fractional = q
+            .iter()
+            .any(|quad| quad.color[3] > 0.0 && quad.color[3] < 1.0);
+        assert!(has_fractional, "circle has no anti-aliased edge pixels");
     }
 
     /// Pick a y in the middle of the line stroke (cell centre), then return
