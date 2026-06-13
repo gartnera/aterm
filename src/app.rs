@@ -605,6 +605,14 @@ impl ApplicationHandler<WakeEvent> for App {
             // window title so it appears in window-list switchers.
             self.sync_window_title(&w);
             if wake {
+                // New output can scroll the grid under a stationary pointer,
+                // leaving the hovered URL's spans (underline, preview bar,
+                // click target) pointing at content that has moved away.
+                // Re-resolve against the new grid; bounded to frames where a
+                // URL is actually showing so idle output never pays for it.
+                if self.hover_url.is_some() {
+                    self.refresh_hover_url(&w);
+                }
                 w.request_redraw();
             }
         }

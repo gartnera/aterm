@@ -39,6 +39,13 @@ libc = "0.2"
 serde_json = "1"
 tempfile = "3"
 
+[profile.release]
+# Cross-crate inlining matters here: the per-cell render path calls small
+# alacritty_terminal/glyphon helpers in tight loops. Release builds are
+# CI-only, so the extra link time costs nothing day-to-day.
+lto = true
+codegen-units = 1
+
 [profile.dev]
 opt-level = 1
 
