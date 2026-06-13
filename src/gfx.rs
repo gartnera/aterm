@@ -61,9 +61,41 @@ fn linear_rgba(c: [u8; 3]) -> [f32; 4] {
 const PAD_X: f32 = 6.0;
 const PAD_Y: f32 = 4.0;
 
-struct RowSpan<'a> {
+/// Styling for one run of adjacent same-attribute cells in a row, kept as
+/// plain data (rather than `Attrs`) so a row's spans can be compared against
+/// the previous frame to skip re-shaping unchanged rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SpanMeta {
     range: std::ops::Range<usize>,
-    attrs: Attrs<'a>,
+    fg: [u8; 3],
+    bold: bool,
+    italic: bool,
+}
+
+impl SpanMeta {
+    fn attrs<'a>(&self, family: Family<'a>) -> Attrs<'a> {
+        let mut attrs = Attrs::new()
+            .family(family)
+            .color(Color::rgb(self.fg[0], self.fg[1], self.fg[2]));
+        if self.bold {
+            attrs = attrs.weight(glyphon::Weight::BOLD);
+        }
+        if self.italic {
+            attrs = attrs.style(glyphon::Style::Italic);
+        }
+        attrs
+    }
+}
+
+/// The text and span layout last shaped into the matching `row_buffers`
+/// entry. When a row re-derives to the same text and spans (and the font
+/// metrics haven't changed), the buffer's shaped contents are still valid and
+/// the expensive `set_rich_text` + `shape_until_scroll` calls are skipped.
+#[derive(Default)]
+struct RowCache {
+    valid: bool,
+    text: String,
+    spans: Vec<SpanMeta>,
 }
 
 fn family_of(name: &str) -> Family<'_> {
@@ -241,14 +273,15 @@ fn cell_in_selection(snap: &GridSnapshot, row: usize, col: usize) -> bool {
     }
 }
 
-fn build_row_text<'a>(
+fn build_row_text(
     row: &[crate::terminal::SnapCell],
     row_idx: usize,
     snap: &GridSnapshot,
-    family: Family<'a>,
-) -> (String, Vec<RowSpan<'a>>) {
-    let mut text = String::with_capacity(row.len() * 2);
-    let mut spans: Vec<RowSpan<'_>> = Vec::new();
+    text: &mut String,
+    spans: &mut Vec<SpanMeta>,
+) {
+    text.clear();
+    spans.clear();
     let cursor_here = snap.cursor_visible && snap.cursor_line == row_idx;
 
     for (col, cell) in row.iter().enumerate() {
@@ -289,20 +322,23 @@ fn build_row_text<'a>(
         };
         text.push(render_ch);
         let end = text.len();
-        let mut attrs = Attrs::new().family(family);
-        attrs = attrs.color(Color::rgb(fg[0], fg[1], fg[2]));
-        if cell.bold {
-            attrs = attrs.weight(glyphon::Weight::BOLD);
+        // Adjacent cells almost always share styling (a prompt, a run of
+        // plain output), so merge them into one span: the shaper then sees a
+        // handful of attribute runs per row instead of one per cell.
+        match spans.last_mut() {
+            Some(last)
+                if last.fg == fg && last.bold == cell.bold && last.italic == cell.italic =>
+            {
+                last.range.end = end;
+            }
+            _ => spans.push(SpanMeta {
+                range: start..end,
+                fg,
+                bold: cell.bold,
+                italic: cell.italic,
+            }),
         }
-        if cell.italic {
-            attrs = attrs.style(glyphon::Style::Italic);
-        }
-        spans.push(RowSpan {
-            range: start..end,
-            attrs,
-        });
     }
-    (text, spans)
 }
 
 fn measure_cell_width(
@@ -381,6 +417,19 @@ pub struct Gfx {
     /// Reusable per-row text buffers; grown as the grid grows. Recreating
     /// these every frame was the dominant per-frame cost.
     row_buffers: Vec<Buffer>,
+    /// What each `row_buffers` entry was last shaped with; lets unchanged
+    /// rows skip re-shaping entirely. Kept in lockstep with `row_buffers`.
+    row_caches: Vec<RowCache>,
+    /// The (font_size_px, line_height_px, cell_w_px) the row caches were
+    /// built under. Any change (zoom, DPI scale, resize) invalidates them.
+    shape_key: Option<(f32, f32, f32)>,
+    /// Scratch for deriving a row's text/spans before the cache comparison;
+    /// swapped into the cache on change so allocations are recycled.
+    row_text_scratch: String,
+    row_spans_scratch: Vec<SpanMeta>,
+    /// Reusable grid snapshot so the per-row cell vectors survive across
+    /// frames instead of being reallocated for every repaint.
+    snapshot_scratch: GridSnapshot,
     tab_buffer: Option<Buffer>,
     /// Reusable buffer for the bottom URL preview text. Allocated lazily the
     /// first time a hover URL is shown.
@@ -482,6 +531,11 @@ impl Gfx {
             tab_hit_regions: Vec::new(),
             quads,
             row_buffers: Vec::new(),
+            row_caches: Vec::new(),
+            shape_key: None,
+            row_text_scratch: String::new(),
+            row_spans_scratch: Vec::new(),
+            snapshot_scratch: GridSnapshot::default(),
             tab_buffer: None,
             url_bar_buffer: None,
             quad_scratch: Vec::new(),
@@ -549,6 +603,7 @@ impl Gfx {
             &self.font_family,
         );
         self.row_buffers.clear();
+        self.row_caches.clear();
         self.tab_buffer = None;
         self.url_bar_buffer = None;
     }
@@ -614,17 +669,21 @@ impl Gfx {
         // (title length in cells) or a fair share of what's available,
         // whichever is smaller. Slack from short titles is redistributed
         // round-robin to tabs that still want more room.
-        const SEP_CHARS: usize = 2;
+        const SEP_PAD: &str = "  ";
+        const SEP_CHARS: usize = SEP_PAD.len();
         const MIN_TITLE_CHARS: usize = 4;
         let usable_chars = ((width as f32 - strip_left_px - PAD_X * scale) / cell_w_px)
             .floor()
             .max(0.0) as usize;
 
+        // Resolve each label once — `tab_label` clones the cached string, so
+        // don't ask for it again per use below.
+        let labels: Vec<String> = tabs.iter().map(|t| t.tab_label()).collect();
         let mut budgets: Vec<usize> = Vec::with_capacity(tabs.len());
         if !tabs.is_empty() {
             let total_seps = tabs.len().saturating_sub(1) * SEP_CHARS;
             let mut pool = usable_chars.saturating_sub(total_seps);
-            let natural: Vec<usize> = tabs.iter().map(|t| t.tab_label().chars().count()).collect();
+            let natural: Vec<usize> = labels.iter().map(|l| l.chars().count()).collect();
             // Start by giving each tab MIN_TITLE_CHARS (or its natural width
             // if smaller). This guarantees a usable rendering even when the
             // bar is very narrow.
@@ -666,17 +725,13 @@ impl Gfx {
         let tab_pad_x_px = (4.0 * scale).round();
         let inactive_inset_y = (bar_h_px * 0.18).round();
         let mut segments: Vec<(String, bool)> = Vec::new();
-        let mut tab_text = String::new();
         let mut chars_cursor: usize = 0;
-        for (i, t) in tabs.iter().enumerate() {
+        for (i, label) in labels.iter().enumerate() {
             if i > 0 {
-                let sep_pad = " ".repeat(SEP_CHARS);
-                segments.push((sep_pad.clone(), false));
-                tab_text.push_str(&sep_pad);
+                segments.push((SEP_PAD.to_string(), false));
                 chars_cursor += SEP_CHARS;
             }
-            let label = t.tab_label();
-            let title = compact_with_ellipsis(&label, budgets.get(i).copied().unwrap_or(0));
+            let title = compact_with_ellipsis(label, budgets.get(i).copied().unwrap_or(0));
             let title_chars = title.chars().count();
             let x0 = strip_left_px + chars_cursor as f32 * cell_w_px;
             let x1 = x0 + title_chars as f32 * cell_w_px;
@@ -717,7 +772,6 @@ impl Gfx {
                     color: self.tab_theme.inactive_bg,
                 });
             }
-            tab_text.push_str(&title);
             chars_cursor += title_chars;
             segments.push((title, i == active_idx));
         }
@@ -836,12 +890,31 @@ impl Gfx {
         let cell_h_px = self.line_height * scale;
         let metrics = Metrics::new(self.font_size * scale, self.line_height * scale);
 
-        // Snapshot the active terminal once outside the prepare call.
-        let snapshot = active.map(|t| t.snapshot());
-        let default_fg = snapshot
-            .as_ref()
-            .map(|s| Color::rgb(s.fg[0], s.fg[1], s.fg[2]))
-            .unwrap_or_else(|| Color::rgb(0xd0, 0xd0, 0xd0));
+        // Any change to the shaping inputs (zoom, DPI scale, font swap)
+        // invalidates the cached per-row shaping results.
+        let shape_key = (metrics.font_size, metrics.line_height, cell_w_px);
+        if self.shape_key != Some(shape_key) {
+            self.shape_key = Some(shape_key);
+            for cache in &mut self.row_caches {
+                cache.valid = false;
+            }
+        }
+
+        // Snapshot the active terminal once, into the reusable scratch so the
+        // per-row vectors aren't reallocated every frame.
+        let has_snapshot = match active {
+            Some(t) => {
+                t.snapshot_into(&mut self.snapshot_scratch);
+                true
+            }
+            None => false,
+        };
+        let default_fg = if has_snapshot {
+            let s = &self.snapshot_scratch;
+            Color::rgb(s.fg[0], s.fg[1], s.fg[2])
+        } else {
+            Color::rgb(0xd0, 0xd0, 0xd0)
+        };
 
         self.quad_scratch.clear();
         self.quad_scratch.push(Quad {
@@ -856,13 +929,14 @@ impl Gfx {
             tab_bar_left_inset,
             metrics,
         );
-        let family_name = self.font_family.clone();
+        let family = family_of(&self.font_family);
         let quads = &mut self.quad_scratch;
 
         // ===== Grid: background quads, cursor quad, row text buffers. =====
         let top_offset_px = (tab_bar_height + PAD_Y) * scale;
         let mut row_count = 0usize;
-        if let Some(snap) = snapshot.as_ref() {
+        if has_snapshot {
+            let snap = &self.snapshot_scratch;
             let default_bg = snap.bg;
             for (row_idx, row) in snap.cells.iter().enumerate() {
                 let y = top_offset_px + row_idx as f32 * cell_h_px;
@@ -1021,7 +1095,28 @@ impl Gfx {
                         .push(Buffer::new(&mut self.font_system, metrics));
                 }
             }
+            if self.row_caches.len() < snap.cells.len() {
+                self.row_caches
+                    .resize_with(snap.cells.len(), RowCache::default);
+            }
             for (row_idx, row) in snap.cells.iter().enumerate() {
+                build_row_text(
+                    row,
+                    row_idx,
+                    snap,
+                    &mut self.row_text_scratch,
+                    &mut self.row_spans_scratch,
+                );
+                // Identical text and styling under an unchanged shape_key
+                // means the buffer's shaped contents are already right —
+                // shaping is the dominant per-frame cost, so skip it.
+                let cache = &mut self.row_caches[row_idx];
+                if cache.valid
+                    && cache.text == self.row_text_scratch
+                    && cache.spans == self.row_spans_scratch
+                {
+                    continue;
+                }
                 let buf = &mut self.row_buffers[row_idx];
                 buf.set_metrics(&mut self.font_system, metrics);
                 buf.set_size(
@@ -1029,19 +1124,22 @@ impl Gfx {
                     Some(cell_w_px * row.len() as f32 + cell_w_px),
                     Some(cell_h_px + 2.0),
                 );
-                let (text, spans_meta) =
-                    build_row_text(row, row_idx, snap, family_of(&family_name));
-                let spans = spans_meta
+                let text = &self.row_text_scratch;
+                let spans = self
+                    .row_spans_scratch
                     .iter()
-                    .map(|s| (&text[s.range.clone()], s.attrs.clone()));
+                    .map(|s| (&text[s.range.clone()], s.attrs(family)));
                 buf.set_rich_text(
                     &mut self.font_system,
                     spans,
-                    &Attrs::new().family(family_of(&family_name)),
+                    &Attrs::new().family(family),
                     Shaping::Advanced,
                     None,
                 );
                 buf.shape_until_scroll(&mut self.font_system, false);
+                cache.valid = true;
+                std::mem::swap(&mut cache.text, &mut self.row_text_scratch);
+                std::mem::swap(&mut cache.spans, &mut self.row_spans_scratch);
             }
             row_count = snap.cells.len();
         }
@@ -1297,7 +1395,9 @@ mod tests {
             bg: [0; 3],
             selection: None,
         };
-        let (text, _spans) = build_row_text(&row, 0, &snap, family_of("monospace"));
+        let mut text = String::new();
+        let mut spans = Vec::new();
+        build_row_text(&row, 0, &snap, &mut text, &mut spans);
         // One char per cell, no literal control bytes that the shaper would
         // expand.
         assert_eq!(text.chars().count(), 4);
@@ -1308,6 +1408,75 @@ mod tests {
         assert_eq!(chars[1], 'a');
         assert_eq!(chars[2], '\u{00A0}');
         assert_eq!(chars[3], 'b');
+    }
+
+    #[test]
+    fn build_row_text_merges_same_attr_cells_into_one_span() {
+        // A row of uniformly-styled cells must shape as a single span; a
+        // styling change (here: fg color) starts a new one. Span count is
+        // what the shaper's run segmentation sees, so this is the contract
+        // the render-path cache and the merge optimization rely on.
+        let mut row = vec![
+            SnapCell {
+                ch: 'x',
+                ..SnapCell::default()
+            };
+            8
+        ];
+        for cell in &mut row[4..] {
+            cell.fg = [255, 0, 0];
+        }
+        let snap = GridSnapshot {
+            cells: vec![row.clone()],
+            cursor_line: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            fg: [0; 3],
+            bg: [0; 3],
+            selection: None,
+        };
+        let mut text = String::new();
+        let mut spans = Vec::new();
+        build_row_text(&row, 0, &snap, &mut text, &mut spans);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].range, 0..4);
+        assert_eq!(spans[0].fg, [0; 3]);
+        assert_eq!(spans[1].range, 4..8);
+        assert_eq!(spans[1].fg, [255, 0, 0]);
+        // Spans must tile the text exactly — set_rich_text slices it by range.
+        assert_eq!(spans.last().unwrap().range.end, text.len());
+    }
+
+    #[test]
+    fn build_row_text_cursor_inversion_changes_spans() {
+        // The row cache skips re-shaping when text+spans are unchanged, so
+        // anything that alters rendering must surface in the spans. The
+        // cursor inverts the cell's fg; moving it must therefore produce
+        // different span metadata for the same text.
+        let row = vec![
+            SnapCell {
+                ch: 'x',
+                fg: [200, 200, 200],
+                bg: [10, 10, 10],
+                ..SnapCell::default()
+            };
+            4
+        ];
+        let snap_at = |col: usize| GridSnapshot {
+            cells: vec![row.clone()],
+            cursor_line: 0,
+            cursor_col: col,
+            cursor_visible: true,
+            fg: [0; 3],
+            bg: [0; 3],
+            selection: None,
+        };
+        let (mut t0, mut s0) = (String::new(), Vec::new());
+        let (mut t1, mut s1) = (String::new(), Vec::new());
+        build_row_text(&row, 0, &snap_at(0), &mut t0, &mut s0);
+        build_row_text(&row, 0, &snap_at(1), &mut t1, &mut s1);
+        assert_eq!(t0, t1);
+        assert_ne!(s0, s1);
     }
 
     #[test]
