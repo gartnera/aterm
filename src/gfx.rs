@@ -326,9 +326,7 @@ fn build_row_text(
         // plain output), so merge them into one span: the shaper then sees a
         // handful of attribute runs per row instead of one per cell.
         match spans.last_mut() {
-            Some(last)
-                if last.fg == fg && last.bold == cell.bold && last.italic == cell.italic =>
-            {
+            Some(last) if last.fg == fg && last.bold == cell.bold && last.italic == cell.italic => {
                 last.range.end = end;
             }
             _ => spans.push(SpanMeta {
