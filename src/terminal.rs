@@ -40,6 +40,7 @@ pub struct SnapCell {
     pub underline: bool,
 }
 
+#[derive(Default)]
 pub struct GridSnapshot {
     pub cells: Vec<Vec<SnapCell>>,
     pub cursor_line: usize,
@@ -942,14 +943,23 @@ impl TerminalSession {
     /// Snapshot the current viewport for rendering. Takes the lock briefly,
     /// then releases it so the renderer can run unsynchronized.
     pub fn snapshot(&self) -> GridSnapshot {
+        let mut snap = GridSnapshot::default();
+        self.snapshot_into(&mut snap);
+        snap
+    }
+
+    /// Like [`snapshot`](Self::snapshot), but writes into a caller-owned
+    /// buffer so the per-row cell vectors are reused frame to frame instead
+    /// of reallocated for every repaint.
+    pub fn snapshot_into(&self, out: &mut GridSnapshot) {
         let term = self.term.lock();
         let content = term.renderable_content();
         let display_offset = content.display_offset;
         let cols = term.columns();
         let lines = term.screen_lines();
         let cursor_point = content.cursor.point;
-        let cursor_visible = !matches!(content.cursor.shape, CursorShape::Hidden);
-        let selection = content.selection.and_then(|range| {
+        out.cursor_visible = !matches!(content.cursor.shape, CursorShape::Hidden);
+        out.selection = content.selection.and_then(|range| {
             // Convert to viewport coordinates and clamp to the visible grid so
             // selections that extend into scrollback off-screen render as a
             // partial highlight rather than disappearing.
@@ -969,9 +979,11 @@ impl TerminalSession {
             })
         });
 
-        let mut cells: Vec<Vec<SnapCell>> = (0..lines)
-            .map(|_| (0..cols).map(|_| SnapCell::default()).collect())
-            .collect();
+        out.cells.resize_with(lines, Vec::new);
+        for row in &mut out.cells {
+            row.clear();
+            row.resize(cols, SnapCell::default());
+        }
 
         for indexed in content.display_iter {
             let Some(vp) = point_to_viewport(display_offset, indexed.point) else {
@@ -993,7 +1005,7 @@ impl TerminalSession {
             };
             let underline =
                 cell.hyperlink().is_some() || cell.flags.intersects(Flags::ALL_UNDERLINES);
-            cells[vp.line][vp.column.0] = SnapCell {
+            out.cells[vp.line][vp.column.0] = SnapCell {
                 ch,
                 fg,
                 bg,
@@ -1003,19 +1015,14 @@ impl TerminalSession {
             };
         }
         let cursor_vp = point_to_viewport(display_offset, cursor_point);
-        GridSnapshot {
-            cells,
-            cursor_line: cursor_vp.map(|p| p.line).unwrap_or(0),
-            cursor_col: cursor_vp.map(|p| p.column.0).unwrap_or(0),
-            cursor_visible,
-            fg: content.colors[NamedColor::Foreground]
-                .map(rgb_to_arr)
-                .unwrap_or(self.palette.foreground),
-            bg: content.colors[NamedColor::Background]
-                .map(rgb_to_arr)
-                .unwrap_or(self.palette.background),
-            selection,
-        }
+        out.cursor_line = cursor_vp.map(|p| p.line).unwrap_or(0);
+        out.cursor_col = cursor_vp.map(|p| p.column.0).unwrap_or(0);
+        out.fg = content.colors[NamedColor::Foreground]
+            .map(rgb_to_arr)
+            .unwrap_or(self.palette.foreground);
+        out.bg = content.colors[NamedColor::Background]
+            .map(rgb_to_arr)
+            .unwrap_or(self.palette.background);
     }
 
     /// Snapshot the visible viewport as plain text — one string per row, with
