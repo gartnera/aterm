@@ -98,6 +98,20 @@ fn new_tab_opens_to_right_of_active() {
 }
 
 #[test]
+fn follows_system_theme_without_config() {
+    require_display!();
+    let mut t = AtermTest::spawn();
+
+    // With no config file, aterm should still follow the OS appearance out of
+    // the box — otherwise `WindowEvent::ThemeChanged` is ignored and live
+    // light/dark switching silently never fires.
+    assert!(
+        t.follows_system_theme(),
+        "default (no config file) should follow the system theme"
+    );
+}
+
+#[test]
 fn theme_switches_between_light_and_dark() {
     require_display!();
     let mut t = AtermTest::spawn();
