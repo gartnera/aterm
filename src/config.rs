@@ -45,12 +45,12 @@ impl Default for Config {
             colors: Colors::default_dark(),
             colors_dark: Colors::default_dark(),
             colors_light: Colors::default_light(),
-            // Off by default: with no `[colors]` config this still resolves to
-            // the dark palette (matching the historical look), but a user who
-            // opts in — or who defines a `[colors.light]`/`[colors.dark]`
-            // table — gets live theme switching. `load()` flips this on when
-            // appropriate.
-            follow_system_theme: false,
+            // Follow the OS appearance out of the box. This default is what
+            // takes effect when there's no config file at all (or it fails to
+            // load), since `load()` returns early without calling `apply_raw`
+            // in those cases. `apply_raw` overrides it to `false` only when a
+            // flat `[colors]` table pins a single explicit scheme.
+            follow_system_theme: true,
             padding_x: 6.0,
             padding_y: 6.0,
             bindings: binding::defaults(),
@@ -659,6 +659,15 @@ mod tests {
         apply_raw(&mut cfg, raw);
         // The bogus binding is dropped; defaults are left untouched.
         assert_eq!(cfg.bindings.len(), before);
+    }
+
+    #[test]
+    fn default_config_follows_system() {
+        // With no config file at all, `load()` returns `Config::default()`
+        // without running `apply_raw`, so the default itself must opt into
+        // following the OS — otherwise live theme switching silently never
+        // fires for users who haven't written a config.
+        assert!(Config::default().follow_system_theme);
     }
 
     #[test]
