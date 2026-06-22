@@ -87,15 +87,32 @@ impl SpanMeta {
     }
 }
 
+/// One wide (double-width) glyph — CJK, emoji, etc. — pulled out of the row's
+/// flowed text so it can be positioned at its exact grid column. The row text
+/// reserves the glyph's two columns with NBSP placeholders; this overlay is
+/// what actually draws the glyph. Keeping it out of the row buffer is what
+/// stops a wide glyph's font advance (rarely exactly two cells) from shoving
+/// every later cell sideways.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WideGlyph {
+    col: usize,
+    ch: char,
+    fg: [u8; 3],
+    bold: bool,
+    italic: bool,
+}
+
 /// The text and span layout last shaped into the matching `row_buffers`
-/// entry. When a row re-derives to the same text and spans (and the font
-/// metrics haven't changed), the buffer's shaped contents are still valid and
-/// the expensive `set_rich_text` + `shape_until_scroll` calls are skipped.
+/// entry. When a row re-derives to the same text, spans, and wide glyphs (and
+/// the font metrics haven't changed), the buffer's shaped contents are still
+/// valid and the expensive `set_rich_text` + `shape_until_scroll` calls (plus
+/// the wide-glyph overlay buffers) are reused as-is.
 #[derive(Default)]
 struct RowCache {
     valid: bool,
     text: String,
     spans: Vec<SpanMeta>,
+    wide: Vec<WideGlyph>,
 }
 
 fn family_of(name: &str) -> Family<'_> {
@@ -279,9 +296,11 @@ fn build_row_text(
     snap: &GridSnapshot,
     text: &mut String,
     spans: &mut Vec<SpanMeta>,
+    wide: &mut Vec<WideGlyph>,
 ) {
     text.clear();
     spans.clear();
+    wide.clear();
     let cursor_here = snap.cursor_visible && snap.cursor_line == row_idx;
 
     for (col, cell) in row.iter().enumerate() {
@@ -302,11 +321,27 @@ fn build_row_text(
         } else {
             cell.fg
         };
+        // A wide (double-width) cell is stored by alacritty as the glyph
+        // followed by a spacer cell whose char snapshots to '\0'. Detect the
+        // lead by peeking at that spacer.
+        let is_wide_lead = cell.ch != '\0' && col + 1 < row.len() && row[col + 1].ch == '\0';
         let start = text.len();
         // Box-drawing / block / braille chars are drawn procedurally as
         // quads in render(), so replace them with NBSP in the text buffer to
         // avoid double-drawing (and the font's gappy version).
         let render_ch = if crate::box_drawing::is_handled(ch) {
+            '\u{00A0}'
+        } else if is_wide_lead {
+            // Hold the glyph's first column with NBSP (the spacer cell holds
+            // the second) and draw the real glyph as a positioned overlay, so
+            // its font advance can't drift the rest of the row.
+            wide.push(WideGlyph {
+                col,
+                ch,
+                fg,
+                bold: cell.bold,
+                italic: cell.italic,
+            });
             '\u{00A0}'
         } else if ch == ' ' || ch.is_control() {
             // cosmic-text collapses runs of spaces in some shaping paths,
@@ -425,6 +460,13 @@ pub struct Gfx {
     /// swapped into the cache on change so allocations are recycled.
     row_text_scratch: String,
     row_spans_scratch: Vec<SpanMeta>,
+    /// Per-row overlay buffers for wide glyphs, one buffer per wide glyph in
+    /// the row (column order), parallel to `row_buffers`. Rebuilt only when a
+    /// row's wide-glyph set changes, alongside the row's text re-shape.
+    wide_buffers: Vec<Vec<Buffer>>,
+    /// Scratch for a row's wide glyphs before the cache comparison; swapped
+    /// into the cache on change so the Vec allocation is recycled.
+    row_wide_scratch: Vec<WideGlyph>,
     /// Reusable grid snapshot so the per-row cell vectors survive across
     /// frames instead of being reallocated for every repaint.
     snapshot_scratch: GridSnapshot,
@@ -533,6 +575,8 @@ impl Gfx {
             shape_key: None,
             row_text_scratch: String::new(),
             row_spans_scratch: Vec::new(),
+            wide_buffers: Vec::new(),
+            row_wide_scratch: Vec::new(),
             snapshot_scratch: GridSnapshot::default(),
             tab_buffer: None,
             url_bar_buffer: None,
@@ -1097,6 +1141,9 @@ impl Gfx {
                 self.row_caches
                     .resize_with(snap.cells.len(), RowCache::default);
             }
+            if self.wide_buffers.len() < snap.cells.len() {
+                self.wide_buffers.resize_with(snap.cells.len(), Vec::new);
+            }
             for (row_idx, row) in snap.cells.iter().enumerate() {
                 build_row_text(
                     row,
@@ -1104,6 +1151,7 @@ impl Gfx {
                     snap,
                     &mut self.row_text_scratch,
                     &mut self.row_spans_scratch,
+                    &mut self.row_wide_scratch,
                 );
                 // Identical text and styling under an unchanged shape_key
                 // means the buffer's shaped contents are already right —
@@ -1112,6 +1160,7 @@ impl Gfx {
                 if cache.valid
                     && cache.text == self.row_text_scratch
                     && cache.spans == self.row_spans_scratch
+                    && cache.wide == self.row_wide_scratch
                 {
                     continue;
                 }
@@ -1135,9 +1184,44 @@ impl Gfx {
                     None,
                 );
                 buf.shape_until_scroll(&mut self.font_system, false);
+
+                // Re-shape this row's wide-glyph overlays. Each lives in its
+                // own one-glyph buffer so it can be placed at its grid column
+                // independently of its font advance.
+                let wb = &mut self.wide_buffers[row_idx];
+                wb.clear();
+                for wg in &self.row_wide_scratch {
+                    let mut gb = Buffer::new(&mut self.font_system, metrics);
+                    gb.set_size(
+                        &mut self.font_system,
+                        Some(cell_w_px * 2.0),
+                        Some(cell_h_px + 2.0),
+                    );
+                    let mut attrs = Attrs::new()
+                        .family(family)
+                        .color(Color::rgb(wg.fg[0], wg.fg[1], wg.fg[2]));
+                    if wg.bold {
+                        attrs = attrs.weight(glyphon::Weight::BOLD);
+                    }
+                    if wg.italic {
+                        attrs = attrs.style(glyphon::Style::Italic);
+                    }
+                    let mut tmp = [0u8; 4];
+                    gb.set_text(
+                        &mut self.font_system,
+                        wg.ch.encode_utf8(&mut tmp),
+                        &attrs,
+                        Shaping::Advanced,
+                        None,
+                    );
+                    gb.shape_until_scroll(&mut self.font_system, false);
+                    wb.push(gb);
+                }
+
                 cache.valid = true;
                 std::mem::swap(&mut cache.text, &mut self.row_text_scratch);
                 std::mem::swap(&mut cache.spans, &mut self.row_spans_scratch);
+                std::mem::swap(&mut cache.wide, &mut self.row_wide_scratch);
             }
             row_count = snap.cells.len();
         }
@@ -1173,6 +1257,26 @@ impl Gfx {
                 custom_glyphs: &[],
             }
         });
+        // Wide-glyph overlays: one TextArea per double-width glyph, placed at
+        // its exact grid column so it sits in the two NBSP columns the row
+        // text reserved for it. `row_caches[i].wide` holds the descriptors in
+        // lockstep with `wide_buffers[i]`.
+        let wide_areas = (0..row_count).flat_map(|i| {
+            let y = top_offset_px + i as f32 * cell_h_px;
+            let descs = &self.row_caches[i].wide;
+            self.wide_buffers[i]
+                .iter()
+                .zip(descs.iter())
+                .map(move |(buf, wg)| TextArea {
+                    buffer: buf,
+                    left: PAD_X * scale + wg.col as f32 * cell_w_px,
+                    top: y,
+                    scale: 1.0,
+                    bounds,
+                    default_color: Color::rgb(wg.fg[0], wg.fg[1], wg.fg[2]),
+                    custom_glyphs: &[],
+                })
+        });
         let url_bar_area = url_bar_pos.and_then(|(x, y, color)| {
             self.url_bar_buffer.as_ref().map(|buf| TextArea {
                 buffer: buf,
@@ -1187,6 +1291,7 @@ impl Gfx {
         let text_areas: Vec<TextArea<'_>> = tab_area
             .into_iter()
             .chain(row_areas)
+            .chain(wide_areas)
             .chain(url_bar_area)
             .collect();
 
@@ -1395,7 +1500,8 @@ mod tests {
         };
         let mut text = String::new();
         let mut spans = Vec::new();
-        build_row_text(&row, 0, &snap, &mut text, &mut spans);
+        let mut wide = Vec::new();
+        build_row_text(&row, 0, &snap, &mut text, &mut spans, &mut wide);
         // One char per cell, no literal control bytes that the shaper would
         // expand.
         assert_eq!(text.chars().count(), 4);
@@ -1435,7 +1541,8 @@ mod tests {
         };
         let mut text = String::new();
         let mut spans = Vec::new();
-        build_row_text(&row, 0, &snap, &mut text, &mut spans);
+        let mut wide = Vec::new();
+        build_row_text(&row, 0, &snap, &mut text, &mut spans, &mut wide);
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].range, 0..4);
         assert_eq!(spans[0].fg, [0; 3]);
@@ -1469,12 +1576,49 @@ mod tests {
             bg: [0; 3],
             selection: None,
         };
-        let (mut t0, mut s0) = (String::new(), Vec::new());
-        let (mut t1, mut s1) = (String::new(), Vec::new());
-        build_row_text(&row, 0, &snap_at(0), &mut t0, &mut s0);
-        build_row_text(&row, 0, &snap_at(1), &mut t1, &mut s1);
+        let (mut t0, mut s0, mut w0) = (String::new(), Vec::new(), Vec::new());
+        let (mut t1, mut s1, mut w1) = (String::new(), Vec::new(), Vec::new());
+        build_row_text(&row, 0, &snap_at(0), &mut t0, &mut s0, &mut w0);
+        build_row_text(&row, 0, &snap_at(1), &mut t1, &mut s1, &mut w1);
         assert_eq!(t0, t1);
         assert_ne!(s0, s1);
+    }
+
+    #[test]
+    fn build_row_text_pulls_wide_glyph_into_overlay() {
+        // A double-width glyph (CJK) is stored as the glyph followed by a
+        // spacer cell that snapshots to '\0'. build_row_text must reserve both
+        // columns with NBSP in the flowed text — so the glyph's font advance
+        // can't drift later cells — and hand the glyph back as a positioned
+        // overlay at its own column.
+        let mut row = vec![SnapCell::default(); 4];
+        row[0].ch = 'A';
+        row[1].ch = '世';
+        row[1].fg = [1, 2, 3];
+        row[2].ch = '\0'; // wide-char spacer
+        row[3].ch = 'B';
+        let snap = GridSnapshot {
+            cells: vec![row.clone()],
+            cursor_line: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            fg: [0; 3],
+            bg: [0; 3],
+            selection: None,
+        };
+        let mut text = String::new();
+        let mut spans = Vec::new();
+        let mut wide = Vec::new();
+        build_row_text(&row, 0, &snap, &mut text, &mut spans, &mut wide);
+        // Four columns, four chars: the wide glyph and its spacer are both NBSP
+        // so every later cell keeps its column.
+        let chars: Vec<char> = text.chars().collect();
+        assert_eq!(chars, vec!['A', '\u{00A0}', '\u{00A0}', 'B']);
+        // The glyph is surfaced once, at its own column, carrying its styling.
+        assert_eq!(wide.len(), 1);
+        assert_eq!(wide[0].col, 1);
+        assert_eq!(wide[0].ch, '世');
+        assert_eq!(wide[0].fg, [1, 2, 3]);
     }
 
     #[test]
