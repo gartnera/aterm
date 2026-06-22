@@ -188,6 +188,35 @@ fn push_box_drawing(
     let half_v_w = lw_h.max(lw_v);
     let _ = (half_h_w, half_v_w);
 
+    // Dashed straight lines (┄┅┆┇┈┉┊┋╌╍╎╏) are pure horizontal or vertical
+    // runs with no junction. Draw the dash pattern once across the FULL cell
+    // span. Splitting the line into left/right (or up/down) half-segments —
+    // as the solid path below does for junction support — restarts the dash
+    // pattern at the centre and runs the gap budget over a half-cell span,
+    // which collapses the dashes to sub-pixel dots that read as sparse,
+    // uneven specks rather than a clean dashed line. A single full-span run
+    // also tiles seamlessly into the neighbouring cell.
+    if s.dash != Dash::Solid {
+        let horizontal = s.left != Weight::None || s.right != Weight::None;
+        if horizontal {
+            if lw_h > 0.0 {
+                push_dashed(quads, x, cy - lw_h * 0.5, cell_w, lw_h, true, s.dash, color);
+            }
+        } else if lw_v > 0.0 {
+            push_dashed(
+                quads,
+                cx - lw_v * 0.5,
+                y,
+                lw_v,
+                cell_h,
+                false,
+                s.dash,
+                color,
+            );
+        }
+        return;
+    }
+
     let draw_segment =
         |quads: &mut Vec<Quad>, x0: f32, y0: f32, x1: f32, y1: f32, w: f32, dash: Dash| {
             if w <= 0.0 {
@@ -375,14 +404,26 @@ fn push_dashed(
         Dash::Triple => 3,
         Dash::Quad => 4,
     };
-    // Dashed: n segments separated by (n-1) gaps; total gap budget is ~25%.
+    // Split the span into `n` equal units; each unit holds one dash plus a
+    // trailing gap (~30% of the unit). Putting the gap *after* every dash —
+    // the last one included — means the pattern lands flush on the cell edge,
+    // so the next cell's first dash sits a full gap away and a run of dashed
+    // cells reads as one evenly-spaced line. Drop to a solid fill if the cell
+    // is too small for the dash to survive at ≥1px.
     let span = if horizontal { w } else { h };
-    let gap_total = (span * 0.25).max(n as f32);
-    let dash_total = span - gap_total;
-    let dash_len = dash_total / n as f32;
-    let gap_len = gap_total / (n as f32 - 1.0).max(1.0);
+    let unit = span / n as f32;
+    // Snap dash length to a whole pixel: the quad pipeline doesn't
+    // anti-alias, so a fractional-width rect covers a ragged, uneven pixel
+    // run. If a cell is too small to fit even a 1px dash with a gap, fall
+    // back to a solid stroke rather than rendering invisible specks.
+    let dash_len = (unit * 0.7).round().clamp(0.0, unit);
+    if dash_len < 1.0 {
+        rect(quads, x, y, w, h, color);
+        return;
+    }
     for i in 0..n {
-        let offset = i as f32 * (dash_len + gap_len);
+        // Snap each dash's start to a whole pixel too, so the gaps stay even.
+        let offset = (i as f32 * unit).round();
         if horizontal {
             rect(quads, x + offset, y, dash_len, h, color);
         } else {
@@ -1018,6 +1059,93 @@ mod tests {
             let q = render(ch, 0.0, 0.0);
             assert!(!q.is_empty(), "no quads emitted for {ch:?}");
         }
+    }
+
+    /// Dashed horizontal lines emit exactly one quad per dash: 3 for the
+    /// triple-dash `┄`, 4 for the quadruple `┈`, 2 for the double `╌`. The old
+    /// renderer split each line into two half-cell segments and ran the dash
+    /// pattern over each, producing twice as many sub-pixel specks instead of a
+    /// clean dashed line.
+    #[test]
+    fn dashed_horizontal_dash_counts() {
+        assert_eq!(render('┄', 0.0, 0.0).len(), 3, "triple dash");
+        assert_eq!(render('┈', 0.0, 0.0).len(), 4, "quad dash");
+        assert_eq!(render('╌', 0.0, 0.0).len(), 2, "double dash");
+    }
+
+    /// Same for the vertical dashed lines `┆┊╎`.
+    #[test]
+    fn dashed_vertical_dash_counts() {
+        assert_eq!(render('┆', 0.0, 0.0).len(), 3, "triple dash vertical");
+        assert_eq!(render('┊', 0.0, 0.0).len(), 4, "quad dash vertical");
+        assert_eq!(render('╎', 0.0, 0.0).len(), 2, "double dash vertical");
+    }
+
+    /// Each dash must be a real, visible segment (≥1px on its long axis) and
+    /// stay inside the cell. Guards against the sub-pixel-speck regression.
+    #[test]
+    fn dashed_segments_are_visible_and_contained() {
+        for ch in ['┄', '┈', '╌', '┅'] {
+            for q in render(ch, 0.0, 0.0) {
+                let (x0, x1) = bounds_x(&q);
+                assert!(x1 - x0 >= 1.0, "{ch:?} dash too thin ({}px wide)", x1 - x0);
+                assert!(
+                    x0 >= -0.01 && x1 <= CW + 0.01,
+                    "{ch:?} dash {:?} escapes the cell",
+                    q.rect
+                );
+            }
+        }
+    }
+
+    /// A dashed line must actually be dashed: its dashes leave gaps, so the
+    /// covered width is strictly less than a solid line's full span.
+    #[test]
+    fn dashed_line_has_gaps() {
+        let solid: f32 = render('─', 0.0, 0.0).iter().map(|q| q.rect[2]).sum();
+        let dashed: f32 = render('┄', 0.0, 0.0).iter().map(|q| q.rect[2]).sum();
+        assert!(
+            dashed < solid,
+            "dashed coverage {dashed} should be less than solid {solid}"
+        );
+    }
+
+    /// The dash pattern tiles across cell boundaries: the left cell's last
+    /// dash ends before the right cell's first dash begins, so a run of dashed
+    /// cells reads as one evenly-spaced line rather than touching dashes.
+    #[test]
+    fn dashed_cells_tile_with_a_boundary_gap() {
+        let left = render('┄', 0.0, 0.0);
+        let right = render('┄', CW, 0.0);
+        let left_end = left
+            .iter()
+            .map(|q| q.rect[0] + q.rect[2])
+            .fold(0.0_f32, f32::max);
+        let right_start = right
+            .iter()
+            .map(|q| q.rect[0])
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            left_end < right_start,
+            "no gap at cell boundary: left ends at {left_end}, right starts at {right_start}"
+        );
+    }
+
+    /// Heavy dashed `┅` is thicker (taller stroke) than light dashed `┄`.
+    #[test]
+    fn heavy_dashed_thicker_than_light_dashed() {
+        let light = render('┄', 0.0, 0.0)
+            .iter()
+            .map(|q| q.rect[3])
+            .fold(0.0_f32, f32::max);
+        let heavy = render('┅', 0.0, 0.0)
+            .iter()
+            .map(|q| q.rect[3])
+            .fold(0.0_f32, f32::max);
+        assert!(
+            heavy > light,
+            "heavy dashed ({heavy}) not thicker than light ({light})"
+        );
     }
 
     /// Heavy `━` should be visibly thicker than light `─`. The whole point
