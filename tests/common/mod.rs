@@ -411,6 +411,25 @@ impl AtermTest {
 
     /// Block until the visible grid contains `needle`. Useful for waiting on
     /// shell output without sleeping a fixed duration. Polls every 50ms.
+    /// Where each glyph of viewport row `row` was drawn in the last frame, in
+    /// cell units. Pixel-level truth the text snapshot can't provide: a glyph
+    /// whose font advance isn't one cell shows up here as later glyphs whose
+    /// `x` no longer equals their `col`.
+    pub fn row_layout(&mut self, row: usize) -> Vec<GlyphPos> {
+        let data = self.request(json!({ "cmd": "row_layout", "row": row }));
+        data["glyphs"]
+            .as_array()
+            .expect("glyphs array")
+            .iter()
+            .map(|v| GlyphPos {
+                col: v["col"].as_u64().expect("col") as usize,
+                x: v["x"].as_f64().expect("x") as f32,
+                w: v["w"].as_f64().expect("w") as f32,
+                overlay: v["overlay"].as_bool().expect("overlay"),
+            })
+            .collect()
+    }
+
     pub fn wait_for_text(&mut self, needle: &str) {
         self.wait_for_text_within(needle, Duration::from_secs(5));
     }
@@ -506,4 +525,14 @@ pub struct TabInfo {
     pub index: usize,
     pub title: String,
     pub active: bool,
+}
+
+/// One glyph's placement from the `row_layout` debug command. Positions are
+/// in cell units relative to the grid's left edge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlyphPos {
+    pub col: usize,
+    pub x: f32,
+    pub w: f32,
+    pub overlay: bool,
 }

@@ -102,6 +102,24 @@ pub struct App {
 }
 
 impl App {
+    /// Render one frame of the active tab to the window surface.
+    fn render_now(&mut self) {
+        let active_tab = self.active_tab;
+        let term = self.tabs.get(active_tab);
+        let hover_url = self.hover_url.as_ref();
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        if let Err(e) = gfx.render(
+            term,
+            &self.tabs,
+            active_tab,
+            TAB_BAR_HEIGHT,
+            TAB_BAR_LEFT_INSET,
+            hover_url,
+        ) {
+            log::error!("render error: {e}");
+        }
+    }
+
     pub fn new(config: Config, proxy: EventLoopProxy<WakeEvent>) -> Self {
         #[cfg(unix)]
         let debug_rx = debug_ipc::start_if_enabled(proxy.clone());
@@ -431,22 +449,7 @@ impl ApplicationHandler<WakeEvent> for App {
                 }
                 window.request_redraw();
             }
-            WindowEvent::RedrawRequested => {
-                let active_tab = self.active_tab;
-                let term = self.tabs.get(active_tab);
-                let hover_url = self.hover_url.as_ref();
-                let Some(gfx) = self.gfx.as_mut() else { return };
-                if let Err(e) = gfx.render(
-                    term,
-                    &self.tabs,
-                    active_tab,
-                    TAB_BAR_HEIGHT,
-                    TAB_BAR_LEFT_INSET,
-                    hover_url,
-                ) {
-                    log::error!("render error: {e}");
-                }
-            }
+            WindowEvent::RedrawRequested => self.render_now(),
             WindowEvent::ModifiersChanged(mods) => {
                 self.mods = mods.state();
                 self.refresh_hover_url(&window);
@@ -1301,6 +1304,23 @@ impl App {
                 Response::ok_data(serde_json::json!({
                     "background": hex_color(self.config.colors.background),
                 }))
+            }
+            Request::RowLayout { row } => {
+                // Shape and draw the current grid first so the layout reflects
+                // what the test just typed, not the last frame that happened
+                // to be presented.
+                self.render_now();
+                let Some(gfx) = self.gfx.as_ref() else {
+                    return Response::err("no renderer");
+                };
+                match gfx.row_layout(row) {
+                    Some(glyphs) => Response::ok_data(serde_json::json!({
+                        "glyphs": glyphs.iter().map(|g| serde_json::json!({
+                            "col": g.col, "x": g.x, "w": g.w, "overlay": g.overlay,
+                        })).collect::<Vec<_>>(),
+                    })),
+                    None => Response::err(format!("row {row} has not been rendered")),
+                }
             }
         }
     }

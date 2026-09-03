@@ -561,3 +561,68 @@ fn snapshot_reflects_typed_command_before_enter() {
         lines.join("\n")
     );
 }
+
+/// Regression test for the opencode busy indicator. Its TUI animates an
+/// 8-cell "Knight Rider" sweep of `■` (U+25A0) over `⬝` (U+2B1D) at the
+/// bottom left of the prompt, and the agent/model labels follow on the same
+/// row. Neither glyph is guaranteed to advance exactly one cell (`⬝` is
+/// missing from most monospace fonts, so it comes from a fallback), and with
+/// the row flowed as one text run every later cell drifted by the accumulated
+/// difference — a different amount per frame, so the whole status line
+/// wobbled sideways while the sweep ran. The fix draws the squares
+/// procedurally and pins any other misfit symbol to its column as an
+/// overlay. Here we print three frames of the sweep, plus a frame of
+/// opencode's alternative "diamonds" style (`⬥◆⬩⬪` over `·`, whose U+2B2x
+/// glyphs take the overlay path rather than the procedural one), each
+/// followed by a marker, and check that every flowed glyph in each row still
+/// sits at its own column.
+#[test]
+fn symbol_glyphs_keep_later_cells_on_grid() {
+    require_display!();
+    let mut t = AtermTest::spawn();
+    t.type_line(
+        "printf '%s\\n' '\u{25A0}\u{2B1D}\u{2B1D}\u{2B1D}\u{2B1D}\u{2B1D}\u{2B1D}\u{2B1D}|grid-marker' \
+         '\u{2B1D}\u{2B1D}\u{2B1D}\u{25A0}\u{25A0}\u{25A0}\u{2B1D}\u{2B1D}|grid-marker' \
+         '\u{2B1D}\u{2B1D}\u{2B1D}\u{2B1D}\u{2B1D}\u{2B1D}\u{2B1D}\u{25A0}|grid-marker' \
+         '\u{2B25}\u{25C6}\u{2B29}\u{2B2A}\u{B7}\u{B7}\u{B7}\u{B7}|grid-marker'",
+    );
+    t.wait_for_text("\u{B7}|grid-marker");
+    let lines = t.snapshot_text();
+    let mut checked = 0;
+    for (row, line) in lines.iter().enumerate() {
+        // Output rows only: the echoed command ends in a quote.
+        if !line.ends_with("|grid-marker") {
+            continue;
+        }
+        let marker_col = line.chars().position(|c| c == '|').expect("marker");
+        assert_eq!(
+            marker_col, 8,
+            "spinner should occupy exactly 8 columns: {line:?}"
+        );
+        let layout = t.row_layout(row);
+        let marker = layout
+            .iter()
+            .find(|g| g.col == marker_col && !g.overlay)
+            .unwrap_or_else(|| panic!("no flowed glyph at marker col {marker_col}: {layout:?}"));
+        assert!(
+            (marker.x - marker_col as f32).abs() < 0.05,
+            "row {row} {line:?}: marker at col {marker_col} drawn at x={} cells\n{layout:#?}",
+            marker.x
+        );
+        for g in layout.iter().filter(|g| !g.overlay) {
+            assert!(
+                (g.x - g.col as f32).abs() < 0.05,
+                "row {row} {line:?}: glyph at col {} drawn at x={} cells\n{layout:#?}",
+                g.col,
+                g.x
+            );
+        }
+        checked += 1;
+    }
+    assert_eq!(
+        checked,
+        4,
+        "expected four spinner rows; grid was:\n{}",
+        lines.join("\n")
+    );
+}

@@ -72,6 +72,12 @@ pub enum Request {
     /// (the real trigger is `WindowEvent::ThemeChanged`, which can't be
     /// synthesized from the debug socket). Returns the new background color.
     SetTheme { light: bool },
+    /// Render a frame, then report where every glyph of viewport row `row`
+    /// landed, in cell units from the grid's left edge: `{glyphs: [{col, x,
+    /// w, overlay}]}`. Lets tests assert that text stays on the column grid
+    /// — the plain-text snapshot can't see rendering-time drift caused by a
+    /// glyph whose font advance isn't one cell.
+    RowLayout { row: usize },
 }
 
 #[derive(Debug, Serialize)]
