@@ -39,6 +39,7 @@ The `AtermTest` helper in `tests/common/mod.rs` exposes:
 | `create_tab()` / `close_tab()` / `select_tab(i)` | tab manipulation |
 | `font_size(delta)` / `font_size_reset()` | adjust + reset, returns the new size |
 | `hover_url(row, col, ctrl)` | probe URL detection, returns `Option<String>` |
+| `row_layout(row)` | `Vec<GlyphPos>` with `{col, x, w, overlay}` in cell units — assert `x == col` to prove a row didn't drift |
 | `wait_for_text(needle)` | poll the grid up to 5s, panic with the grid if it never appears |
 | `wait_for_text_within(needle, dur)` | same with a caller-supplied deadline |
 | `screenshot(label)` | save a PNG to `$ATERM_TEST_ARTIFACTS/` for happy-path captures |
@@ -138,6 +139,7 @@ single-line JSON response per request:
 | `font_size` | `delta: f32` | `{font_size}` |
 | `font_size_reset` | – | `{font_size}` |
 | `hover_url` | `row, col, ctrl` | `{uri, spans}` or `null` |
+| `row_layout` | `row` | `{glyphs: [{col, x, w, overlay}]}` — glyph placement in cell units, after a forced render |
 
 ## Ad-hoc poking from the shell
 

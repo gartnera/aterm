@@ -239,8 +239,19 @@ impl AtermTest {
 
     /// Send a JSON request and parse the response. Panics on transport
     /// error, including the recent log in the message so a crashed child is
-    /// easy to diagnose.
+    /// easy to diagnose, and on a request aterm rejected.
     pub fn request(&mut self, req: Value) -> Value {
+        match self.try_request(req) {
+            Ok(v) => v,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Like [`request`](Self::request), but hands back a request aterm
+    /// rejected as `Err(message)` instead of panicking. Transport errors
+    /// still panic. Used by startup waits that need to tell "the event loop
+    /// hasn't started serving yet" apart from a real failure.
+    pub fn try_request(&mut self, req: Value) -> Result<Value, String> {
         let line = serde_json::to_string(&req).expect("serialize");
         if let Err(e) = writeln!(self.stream, "{line}") {
             panic!(
@@ -273,12 +284,12 @@ impl AtermTest {
         }
         let resp: Value = serde_json::from_str(buf.trim()).expect("parse response");
         if !resp.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            panic!(
+            return Err(format!(
                 "request {req} failed: {}",
                 resp.get("error").and_then(Value::as_str).unwrap_or("?")
-            );
+            ));
         }
-        resp.get("data").cloned().unwrap_or(Value::Null)
+        Ok(resp.get("data").cloned().unwrap_or(Value::Null))
     }
 
     pub fn snapshot_text(&mut self) -> Vec<String> {
@@ -411,6 +422,25 @@ impl AtermTest {
 
     /// Block until the visible grid contains `needle`. Useful for waiting on
     /// shell output without sleeping a fixed duration. Polls every 50ms.
+    /// Where each glyph of viewport row `row` was drawn in the last frame, in
+    /// cell units. Pixel-level truth the text snapshot can't provide: a glyph
+    /// whose font advance isn't one cell shows up here as later glyphs whose
+    /// `x` no longer equals their `col`.
+    pub fn row_layout(&mut self, row: usize) -> Vec<GlyphPos> {
+        let data = self.request(json!({ "cmd": "row_layout", "row": row }));
+        data["glyphs"]
+            .as_array()
+            .expect("glyphs array")
+            .iter()
+            .map(|v| GlyphPos {
+                col: v["col"].as_u64().expect("col") as usize,
+                x: v["x"].as_f64().expect("x") as f32,
+                w: v["w"].as_f64().expect("w") as f32,
+                overlay: v["overlay"].as_bool().expect("overlay"),
+            })
+            .collect()
+    }
+
     pub fn wait_for_text(&mut self, needle: &str) {
         self.wait_for_text_within(needle, Duration::from_secs(5));
     }
@@ -436,10 +466,35 @@ impl AtermTest {
     /// Wait until the shell's first prompt has appeared. The first prompt is
     /// the one printed before the user has typed anything; we detect it by
     /// looking for a line ending in '$' or '#' (the standard sh/bash markers).
+    ///
+    /// The budget covers aterm's whole cold start, not just the shell: the
+    /// debug socket comes up before the renderer, and the first frame on a
+    /// software-Vulkan CI runner (llvmpipe shader JIT, a full system font
+    /// scan) can take several seconds — more when cargo's default test
+    /// parallelism launches one aterm per core at once, all cold. A healthy
+    /// prompt still arrives well inside this; the budget only decides how
+    /// long a genuinely dead shell takes to be reported.
     pub fn wait_for_prompt(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(45);
         loop {
-            let lines = self.snapshot_text();
+            let lines = match self.try_request(json!({ "cmd": "snapshot_text" })) {
+                Ok(data) => data["lines"]
+                    .as_array()
+                    .expect("lines array")
+                    .iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect::<Vec<String>>(),
+                // The socket thread gave up waiting for the main loop, which
+                // is still inside renderer setup. Not a failure yet — keep
+                // waiting until our own deadline.
+                Err(e) if e.contains("timed out waiting for event loop") => {
+                    if Instant::now() > deadline {
+                        panic!("wait_for_prompt: aterm event loop never became responsive: {e}");
+                    }
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            };
             if lines.iter().any(|l| {
                 let t = l.trim_end();
                 t.ends_with('$') || t.ends_with('#') || t.ends_with("$ ") || t.ends_with("# ")
@@ -506,4 +561,14 @@ pub struct TabInfo {
     pub index: usize,
     pub title: String,
     pub active: bool,
+}
+
+/// One glyph's placement from the `row_layout` debug command. Positions are
+/// in cell units relative to the grid's left edge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlyphPos {
+    pub col: usize,
+    pub x: f32,
+    pub w: f32,
+    pub overlay: bool,
 }

@@ -10,6 +10,14 @@
 //! colour-emoji) glyph or draws tofu. Claude Code uses it as its per-message
 //! bullet, so it's worth drawing ourselves as a clean filled circle.
 //!
+//! The filled/hollow squares `■ □` (U+25A0/A1), `▪ ▫` (U+25AA/AB) and
+//! `⬝ ⬞` (U+2B1D/1E) get the same treatment. The opencode TUI animates its
+//! busy indicator as an 8-cell sweep of `■` over `⬝`, and `⬝` in particular is
+//! missing from most monospace fonts (Menlo, DejaVu Sans Mono, …), so the
+//! fallback glyph is whatever some other font happens to provide — a different
+//! size in a different weight, or tofu. Drawing the family ourselves keeps the
+//! three sizes proportional and centred no matter what fonts are installed.
+//!
 //! We sidestep the font for these ranges and emit quads sized to the cell.
 //! Returns `true` if the char was handled (the caller should suppress the
 //! font glyph for that cell).
@@ -18,7 +26,26 @@ use crate::quad::Quad;
 
 pub fn is_handled(ch: char) -> bool {
     let c = ch as u32;
-    (0x2500..=0x259F).contains(&c) || (0x2800..=0x28FF).contains(&c) || c == 0x23FA
+    (0x2500..=0x259F).contains(&c)
+        || (0x2800..=0x28FF).contains(&c)
+        || c == 0x23FA
+        || square_spec(ch).is_some()
+}
+
+/// (side as a fraction of the cell width, filled?) for the square glyphs we
+/// draw procedurally; `None` for everything else. The three sizes mirror the
+/// Unicode names — BLACK SQUARE, BLACK SMALL SQUARE, BLACK VERY SMALL SQUARE —
+/// and the proportions most fonts give them.
+fn square_spec(ch: char) -> Option<(f32, bool)> {
+    Some(match ch {
+        '\u{25A0}' => (0.8, true),  // ■ BLACK SQUARE
+        '\u{25A1}' => (0.8, false), // □ WHITE SQUARE
+        '\u{25AA}' => (0.5, true),  // ▪ BLACK SMALL SQUARE
+        '\u{25AB}' => (0.5, false), // ▫ WHITE SMALL SQUARE
+        '\u{2B1D}' => (0.3, true),  // ⬝ BLACK VERY SMALL SQUARE
+        '\u{2B1E}' => (0.3, false), // ⬞ WHITE VERY SMALL SQUARE
+        _ => return None,
+    })
 }
 
 /// Append quads for `ch` rendered inside the cell at (`x`, `y`) with size
@@ -48,9 +75,43 @@ pub fn push_quads(
     } else if c == 0x23FA {
         push_filled_circle(quads, x, y, cell_w, cell_h, color);
         true
+    } else if let Some((frac, filled)) = square_spec(ch) {
+        push_square(quads, x, y, cell_w, cell_h, color, scale, frac, filled);
+        true
     } else {
         false
     }
+}
+
+/// A square of side `frac × cell width`, centred in the cell. Edges are
+/// snapped to whole physical pixels: the quad pipeline has no anti-aliasing,
+/// so a fractional edge would otherwise render as a lopsided half-lit column.
+/// Hollow variants use the light box-drawing stroke so `□` matches the weight
+/// of an adjacent `─`.
+#[allow(clippy::too_many_arguments)]
+fn push_square(
+    quads: &mut Vec<Quad>,
+    x: f32,
+    y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    color: [f32; 4],
+    scale: f32,
+    frac: f32,
+    filled: bool,
+) {
+    let side = (cell_w.min(cell_h) * frac).round().max(1.0);
+    let x0 = (x + (cell_w - side) * 0.5).round();
+    let y0 = (y + (cell_h - side) * 0.5).round();
+    if filled {
+        rect(quads, x0, y0, side, side, color);
+        return;
+    }
+    let t = weight_for(Weight::Light, scale).min(side * 0.5);
+    rect(quads, x0, y0, side, t, color); // top
+    rect(quads, x0, y0 + side - t, side, t, color); // bottom
+    rect(quads, x0, y0 + t, t, side - 2.0 * t, color); // left
+    rect(quads, x0 + side - t, y0 + t, t, side - 2.0 * t, color); // right
 }
 
 /// `⏺` (U+23FA): a filled circle centred in the cell. The quad pipeline draws
@@ -849,11 +910,111 @@ mod tests {
         assert!(is_handled('⠁'));
         assert!(is_handled('⣿'));
         assert!(is_handled('⏺'));
+        assert!(is_handled('■'));
+        assert!(is_handled('□'));
+        assert!(is_handled('▪'));
+        assert!(is_handled('▫'));
+        assert!(is_handled('⬝'));
+        assert!(is_handled('⬞'));
         // Outside the handled ranges.
         assert!(!is_handled('a'));
         assert!(!is_handled(' '));
         assert!(!is_handled('▲'));
         assert!(!is_handled('●'));
+    }
+
+    fn bbox(cell: &[Quad]) -> (f32, f32, f32, f32) {
+        let x0 = cell.iter().map(|q| bounds_x(q).0).fold(f32::MAX, f32::min);
+        let x1 = cell.iter().map(|q| bounds_x(q).1).fold(f32::MIN, f32::max);
+        let y0 = cell.iter().map(|q| bounds_y(q).0).fold(f32::MAX, f32::min);
+        let y1 = cell.iter().map(|q| bounds_y(q).1).fold(f32::MIN, f32::max);
+        (x0, x1, y0, y1)
+    }
+
+    fn covers(cell: &[Quad], px: f32, py: f32) -> bool {
+        cell.iter().any(|q| {
+            let (x0, x1) = bounds_x(q);
+            let (y0, y1) = bounds_y(q);
+            px >= x0 && px < x1 && py >= y0 && py < y1
+        })
+    }
+
+    /// The three filled squares are square, centred in the cell, stay inside
+    /// it, and step down in size: ■ > ▪ > ⬝. This is what keeps opencode's
+    /// `■⬝⬝⬝⬝⬝⬝⬝` busy sweep looking like one glyph family regardless of which
+    /// font would otherwise have supplied `⬝`.
+    #[test]
+    fn filled_squares_are_centred_and_ordered() {
+        let cell_x = 30.0;
+        let cell_y = 100.0;
+        let mut sides = Vec::new();
+        for ch in ['■', '▪', '⬝'] {
+            let q = render(ch, cell_x, cell_y);
+            assert_eq!(q.len(), 1, "{ch} should be one filled quad");
+            let (x0, x1, y0, y1) = bbox(&q);
+            let w = x1 - x0;
+            let h = y1 - y0;
+            assert!((w - h).abs() < 1e-3, "{ch} not square: {w}x{h}");
+            assert!(
+                x0 >= cell_x && x1 <= cell_x + CW,
+                "{ch} bleeds horizontally"
+            );
+            assert!(y0 >= cell_y && y1 <= cell_y + CH, "{ch} bleeds vertically");
+            // Centred to within the 1px snapping.
+            let cx = (x0 + x1) * 0.5;
+            let cy = (y0 + y1) * 0.5;
+            assert!((cx - (cell_x + CW * 0.5)).abs() <= 0.5, "{ch} off-centre x");
+            assert!((cy - (cell_y + CH * 0.5)).abs() <= 0.5, "{ch} off-centre y");
+            // Whole-pixel edges.
+            assert_eq!(x0.fract(), 0.0);
+            assert_eq!(y0.fract(), 0.0);
+            sides.push(w);
+        }
+        assert!(
+            sides[0] > sides[1] && sides[1] > sides[2],
+            "sizes not ordered: {sides:?}"
+        );
+    }
+
+    /// Hollow squares share their filled twin's footprint but leave the centre
+    /// open, and the stroke is the light box-drawing weight.
+    #[test]
+    fn hollow_squares_match_filled_footprint_with_open_centre() {
+        for (filled, hollow) in [('■', '□'), ('▪', '▫'), ('⬝', '⬞')] {
+            let f = render(filled, 0.0, 0.0);
+            let h = render(hollow, 0.0, 0.0);
+            assert_eq!(
+                bbox(&f),
+                bbox(&h),
+                "{hollow} footprint differs from {filled}"
+            );
+            let (x0, x1, y0, y1) = bbox(&h);
+            let stroke = weight_for(Weight::Light, SCALE);
+            // Just inside each edge is ink; the centre is not (unless the
+            // square is so small that the stroke fills it).
+            assert!(
+                covers(&h, x0 + 0.5, (y0 + y1) * 0.5),
+                "{hollow} left edge missing"
+            );
+            assert!(
+                covers(&h, x1 - 0.5, (y0 + y1) * 0.5),
+                "{hollow} right edge missing"
+            );
+            assert!(
+                covers(&h, (x0 + x1) * 0.5, y0 + 0.5),
+                "{hollow} top edge missing"
+            );
+            assert!(
+                covers(&h, (x0 + x1) * 0.5, y1 - 0.5),
+                "{hollow} bottom edge missing"
+            );
+            if x1 - x0 > 2.0 * stroke {
+                assert!(
+                    !covers(&h, (x0 + x1) * 0.5, (y0 + y1) * 0.5),
+                    "{hollow} centre filled"
+                );
+            }
+        }
     }
 
     /// `⏺` (U+23FA) renders as a disc: the row through the centre must be

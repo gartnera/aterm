@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use glyphon::{
@@ -87,15 +88,23 @@ impl SpanMeta {
     }
 }
 
-/// One wide (double-width) glyph — CJK, emoji, etc. — pulled out of the row's
-/// flowed text so it can be positioned at its exact grid column. The row text
-/// reserves the glyph's two columns with NBSP placeholders; this overlay is
-/// what actually draws the glyph. Keeping it out of the row buffer is what
-/// stops a wide glyph's font advance (rarely exactly two cells) from shoving
-/// every later cell sideways.
+/// One glyph pulled out of the row's flowed text so it can be positioned at
+/// its exact grid column. The row text reserves the glyph's `cols` columns
+/// with NBSP placeholders; this overlay is what actually draws the glyph.
+///
+/// Two kinds of glyph end up here. Wide (double-width) glyphs — CJK, emoji —
+/// whose font advance is rarely exactly two cells. And single-width symbols
+/// the primary font lacks (`⬝`, `➜`, `✓`, …): cosmic-text pulls those from a
+/// fallback font whose advance is whatever that font says, not our cell
+/// width. Either way, leaving the glyph in the flowed text would shove every
+/// later cell in the row sideways by the difference — the opencode TUI's
+/// `■⬝⬝⬝⬝⬝⬝⬝` busy indicator made this visible, wobbling the whole status
+/// line left and right as the sweep animated.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct WideGlyph {
+struct OverlayGlyph {
     col: usize,
+    /// Grid columns the glyph occupies (1 or 2).
+    cols: usize,
     ch: char,
     fg: [u8; 3],
     bold: bool,
@@ -103,16 +112,33 @@ struct WideGlyph {
 }
 
 /// The text and span layout last shaped into the matching `row_buffers`
-/// entry. When a row re-derives to the same text, spans, and wide glyphs (and
-/// the font metrics haven't changed), the buffer's shaped contents are still
-/// valid and the expensive `set_rich_text` + `shape_until_scroll` calls (plus
-/// the wide-glyph overlay buffers) are reused as-is.
+/// entry. When a row re-derives to the same text, spans, and overlay glyphs
+/// (and the font metrics haven't changed), the buffer's shaped contents are
+/// still valid and the expensive `set_rich_text` + `shape_until_scroll` calls
+/// (plus the overlay buffers) are reused as-is.
 #[derive(Default)]
 struct RowCache {
     valid: bool,
     text: String,
     spans: Vec<SpanMeta>,
-    wide: Vec<WideGlyph>,
+    overlays: Vec<OverlayGlyph>,
+}
+
+/// Where one glyph of a rendered row actually landed, in cell units relative
+/// to the row's left edge. Exposed through the debug IPC so tests can assert
+/// that text stays on the column grid — something the plain-text snapshot
+/// can't see, because drift is a rendering-time (font advance) effect.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlyphPos {
+    /// Grid column the glyph belongs to.
+    pub col: usize,
+    /// Left edge of the glyph's advance box, in cells.
+    pub x: f32,
+    /// Advance width, in cells.
+    pub w: f32,
+    /// True when the glyph is drawn as a positioned overlay rather than as
+    /// part of the row's flowed text.
+    pub overlay: bool,
 }
 
 fn family_of(name: &str) -> Family<'_> {
@@ -290,17 +316,26 @@ fn cell_in_selection(snap: &GridSnapshot, row: usize, col: usize) -> bool {
     }
 }
 
+/// Derive the flowed text, styling spans, and overlay glyphs for one row.
+///
+/// `misfit` answers "does this single-width char's font advance differ from
+/// one cell?" — see [`Gfx::glyph_misfits`]. Chars for which it returns true
+/// are replaced by NBSP in the flowed text and drawn as overlays pinned to
+/// their column instead. It is only consulted for non-ASCII chars: ASCII in a
+/// monospace font is one cell by construction, and skipping the lookup keeps
+/// the common case cheap.
 fn build_row_text(
     row: &[crate::terminal::SnapCell],
     row_idx: usize,
     snap: &GridSnapshot,
     text: &mut String,
     spans: &mut Vec<SpanMeta>,
-    wide: &mut Vec<WideGlyph>,
+    overlays: &mut Vec<OverlayGlyph>,
+    misfit: &mut dyn FnMut(char) -> bool,
 ) {
     text.clear();
     spans.clear();
-    wide.clear();
+    overlays.clear();
     let cursor_here = snap.cursor_visible && snap.cursor_line == row_idx;
 
     for (col, cell) in row.iter().enumerate() {
@@ -335,8 +370,9 @@ fn build_row_text(
             // Hold the glyph's first column with NBSP (the spacer cell holds
             // the second) and draw the real glyph as a positioned overlay, so
             // its font advance can't drift the rest of the row.
-            wide.push(WideGlyph {
+            overlays.push(OverlayGlyph {
                 col,
+                cols: 2,
                 ch,
                 fg,
                 bold: cell.bold,
@@ -351,6 +387,19 @@ fn build_row_text(
             // would expand that tab to a tab stop, shoving every later glyph
             // right and desyncing the selection highlight from the text. Each
             // cell must advance exactly one column, so render these as NBSP.
+            '\u{00A0}'
+        } else if !ch.is_ascii() && misfit(ch) {
+            // A single-width symbol whose glyph (usually from a fallback
+            // font) doesn't advance exactly one cell. Same treatment as a
+            // wide glyph: NBSP holds the column, the overlay draws the glyph.
+            overlays.push(OverlayGlyph {
+                col,
+                cols: 1,
+                ch,
+                fg,
+                bold: cell.bold,
+                italic: cell.italic,
+            });
             '\u{00A0}'
         } else {
             ch
@@ -427,6 +476,59 @@ fn measure_cell_width(
     cell
 }
 
+/// Shape `ch` on its own under the current font metrics and report whether
+/// its advance differs from one cell. True means the glyph would drift every
+/// later cell in its row if left in the flowed text, so it must be drawn as a
+/// pinned overlay instead.
+///
+/// The tolerance absorbs float noise in the advance (glyphs from the primary
+/// monospace font measure identical to `M` to within ~1e-4 px) without
+/// excusing a genuinely different fallback advance: a 2% miss on one glyph is
+/// invisible, but the smallest real fallback mismatches seen in practice are
+/// 10–30% of a cell.
+fn glyph_misfits(
+    font_system: &mut FontSystem,
+    metrics: Metrics,
+    family: Family<'_>,
+    cell_w_px: f32,
+    ch: char,
+) -> bool {
+    let mut buf = Buffer::new(font_system, metrics);
+    buf.set_size(
+        font_system,
+        Some(cell_w_px * 4.0),
+        Some(metrics.line_height + 2.0),
+    );
+    let mut tmp = [0u8; 4];
+    buf.set_text(
+        font_system,
+        ch.encode_utf8(&mut tmp),
+        &Attrs::new().family(family),
+        Shaping::Advanced,
+        None,
+    );
+    buf.shape_until_scroll(font_system, false);
+    let advance: f32 = buf.layout_runs().map(|run| run.line_w).sum();
+    (advance - cell_w_px).abs() > misfit_tolerance_px(cell_w_px)
+}
+
+fn misfit_tolerance_px(cell_w_px: f32) -> f32 {
+    (cell_w_px * 0.02).max(0.25)
+}
+
+/// Advance width of a shaped one-glyph overlay buffer, in physical pixels.
+fn overlay_advance_px(buf: &Buffer) -> f32 {
+    buf.layout_runs().map(|run| run.line_w).sum()
+}
+
+/// Left edge (relative to the grid's left edge, physical px) at which to draw
+/// an overlay glyph: the start of its reserved columns, nudged so the glyph's
+/// advance box is centred within them.
+fn overlay_x_px(buf: &Buffer, glyph: &OverlayGlyph, cell_w_px: f32) -> f32 {
+    let slot = glyph.cols as f32 * cell_w_px;
+    glyph.col as f32 * cell_w_px + (slot - overlay_advance_px(buf)) * 0.5
+}
+
 pub struct Gfx {
     window: Arc<Window>,
     device: wgpu::Device,
@@ -460,13 +562,18 @@ pub struct Gfx {
     /// swapped into the cache on change so allocations are recycled.
     row_text_scratch: String,
     row_spans_scratch: Vec<SpanMeta>,
-    /// Per-row overlay buffers for wide glyphs, one buffer per wide glyph in
-    /// the row (column order), parallel to `row_buffers`. Rebuilt only when a
-    /// row's wide-glyph set changes, alongside the row's text re-shape.
-    wide_buffers: Vec<Vec<Buffer>>,
-    /// Scratch for a row's wide glyphs before the cache comparison; swapped
+    /// Per-row overlay buffers, one buffer per overlay glyph in the row
+    /// (column order), parallel to `row_buffers`. Rebuilt only when a row's
+    /// overlay set changes, alongside the row's text re-shape.
+    overlay_buffers: Vec<Vec<Buffer>>,
+    /// Scratch for a row's overlay glyphs before the cache comparison; swapped
     /// into the cache on change so the Vec allocation is recycled.
-    row_wide_scratch: Vec<WideGlyph>,
+    row_overlay_scratch: Vec<OverlayGlyph>,
+    /// Per-char memo of whether the glyph's advance under the current
+    /// `shape_key` is exactly one cell (`false`) or not (`true`, so it must be
+    /// drawn as a pinned overlay). Measuring means shaping a one-char buffer,
+    /// so the answer is cached for the life of the shape key.
+    glyph_misfit_cache: HashMap<char, bool>,
     /// Reusable grid snapshot so the per-row cell vectors survive across
     /// frames instead of being reallocated for every repaint.
     snapshot_scratch: GridSnapshot,
@@ -575,8 +682,9 @@ impl Gfx {
             shape_key: None,
             row_text_scratch: String::new(),
             row_spans_scratch: Vec::new(),
-            wide_buffers: Vec::new(),
-            row_wide_scratch: Vec::new(),
+            overlay_buffers: Vec::new(),
+            row_overlay_scratch: Vec::new(),
+            glyph_misfit_cache: HashMap::new(),
             snapshot_scratch: GridSnapshot::default(),
             tab_buffer: None,
             url_bar_buffer: None,
@@ -627,6 +735,43 @@ impl Gfx {
     }
 
     /// Cell dimensions in *logical* pixels (pre-scale-factor).
+    /// Where every glyph of viewport row `row` landed in the last rendered
+    /// frame, in cell units. `None` if the row hasn't been shaped yet (no
+    /// frame rendered since the grid grew to include it). Debug-IPC only.
+    pub fn row_layout(&self, row: usize) -> Option<Vec<GlyphPos>> {
+        let cache = self.row_caches.get(row).filter(|c| c.valid)?;
+        let buf = self.row_buffers.get(row)?;
+        let cell_w_px = self.cell_width_logical * self.window.scale_factor() as f32;
+        if cell_w_px <= 0.0 {
+            return None;
+        }
+        let mut out = Vec::new();
+        for run in buf.layout_runs() {
+            for g in run.glyphs {
+                out.push(GlyphPos {
+                    // One char per column in the flowed text, so the byte
+                    // offset maps straight to a column.
+                    col: cache.text[..g.start].chars().count(),
+                    x: g.x / cell_w_px,
+                    w: g.w / cell_w_px,
+                    overlay: false,
+                });
+            }
+        }
+        if let Some(bufs) = self.overlay_buffers.get(row) {
+            for (gb, og) in bufs.iter().zip(cache.overlays.iter()) {
+                out.push(GlyphPos {
+                    col: og.col,
+                    x: overlay_x_px(gb, og, cell_w_px) / cell_w_px,
+                    w: overlay_advance_px(gb) / cell_w_px,
+                    overlay: true,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.col.cmp(&b.col));
+        Some(out)
+    }
+
     pub fn cell_dims_logical(&self) -> (f32, f32) {
         (self.cell_width_logical, self.line_height)
     }
@@ -646,6 +791,7 @@ impl Gfx {
         );
         self.row_buffers.clear();
         self.row_caches.clear();
+        self.glyph_misfit_cache.clear();
         self.tab_buffer = None;
         self.url_bar_buffer = None;
     }
@@ -940,6 +1086,7 @@ impl Gfx {
             for cache in &mut self.row_caches {
                 cache.valid = false;
             }
+            self.glyph_misfit_cache.clear();
         }
 
         // Snapshot the active terminal once, into the reusable scratch so the
@@ -1141,18 +1288,28 @@ impl Gfx {
                 self.row_caches
                     .resize_with(snap.cells.len(), RowCache::default);
             }
-            if self.wide_buffers.len() < snap.cells.len() {
-                self.wide_buffers.resize_with(snap.cells.len(), Vec::new);
+            if self.overlay_buffers.len() < snap.cells.len() {
+                self.overlay_buffers.resize_with(snap.cells.len(), Vec::new);
             }
             for (row_idx, row) in snap.cells.iter().enumerate() {
-                build_row_text(
-                    row,
-                    row_idx,
-                    snap,
-                    &mut self.row_text_scratch,
-                    &mut self.row_spans_scratch,
-                    &mut self.row_wide_scratch,
-                );
+                {
+                    let font_system = &mut self.font_system;
+                    let misfit_cache = &mut self.glyph_misfit_cache;
+                    let mut misfit = |ch: char| {
+                        *misfit_cache.entry(ch).or_insert_with(|| {
+                            glyph_misfits(font_system, metrics, family, cell_w_px, ch)
+                        })
+                    };
+                    build_row_text(
+                        row,
+                        row_idx,
+                        snap,
+                        &mut self.row_text_scratch,
+                        &mut self.row_spans_scratch,
+                        &mut self.row_overlay_scratch,
+                        &mut misfit,
+                    );
+                }
                 // Identical text and styling under an unchanged shape_key
                 // means the buffer's shaped contents are already right —
                 // shaping is the dominant per-frame cost, so skip it.
@@ -1160,7 +1317,7 @@ impl Gfx {
                 if cache.valid
                     && cache.text == self.row_text_scratch
                     && cache.spans == self.row_spans_scratch
-                    && cache.wide == self.row_wide_scratch
+                    && cache.overlays == self.row_overlay_scratch
                 {
                     continue;
                 }
@@ -1185,16 +1342,19 @@ impl Gfx {
                 );
                 buf.shape_until_scroll(&mut self.font_system, false);
 
-                // Re-shape this row's wide-glyph overlays. Each lives in its
-                // own one-glyph buffer so it can be placed at its grid column
+                // Re-shape this row's overlays. Each lives in its own
+                // one-glyph buffer so it can be placed at its grid column
                 // independently of its font advance.
-                let wb = &mut self.wide_buffers[row_idx];
+                let wb = &mut self.overlay_buffers[row_idx];
                 wb.clear();
-                for wg in &self.row_wide_scratch {
+                for wg in &self.row_overlay_scratch {
                     let mut gb = Buffer::new(&mut self.font_system, metrics);
+                    // Generous width: the buffer size only drives wrapping,
+                    // and a glyph wider than its cells must still lay out
+                    // rather than be pushed to a second line.
                     gb.set_size(
                         &mut self.font_system,
-                        Some(cell_w_px * 2.0),
+                        Some(cell_w_px * (wg.cols as f32 + 2.0)),
                         Some(cell_h_px + 2.0),
                     );
                     let mut attrs = Attrs::new()
@@ -1221,7 +1381,7 @@ impl Gfx {
                 cache.valid = true;
                 std::mem::swap(&mut cache.text, &mut self.row_text_scratch);
                 std::mem::swap(&mut cache.spans, &mut self.row_spans_scratch);
-                std::mem::swap(&mut cache.wide, &mut self.row_wide_scratch);
+                std::mem::swap(&mut cache.overlays, &mut self.row_overlay_scratch);
             }
             row_count = snap.cells.len();
         }
@@ -1257,19 +1417,20 @@ impl Gfx {
                 custom_glyphs: &[],
             }
         });
-        // Wide-glyph overlays: one TextArea per double-width glyph, placed at
-        // its exact grid column so it sits in the two NBSP columns the row
-        // text reserved for it. `row_caches[i].wide` holds the descriptors in
-        // lockstep with `wide_buffers[i]`.
-        let wide_areas = (0..row_count).flat_map(|i| {
+        // Overlay glyphs: one TextArea per overlay, centred in the NBSP
+        // columns the row text reserved for it so a glyph that is wider or
+        // narrower than its cells spills evenly to both sides rather than
+        // piling into the neighbour on the right. `row_caches[i].overlays`
+        // holds the descriptors in lockstep with `overlay_buffers[i]`.
+        let overlay_areas = (0..row_count).flat_map(|i| {
             let y = top_offset_px + i as f32 * cell_h_px;
-            let descs = &self.row_caches[i].wide;
-            self.wide_buffers[i]
+            let descs = &self.row_caches[i].overlays;
+            self.overlay_buffers[i]
                 .iter()
                 .zip(descs.iter())
                 .map(move |(buf, wg)| TextArea {
                     buffer: buf,
-                    left: PAD_X * scale + wg.col as f32 * cell_w_px,
+                    left: PAD_X * scale + overlay_x_px(buf, wg, cell_w_px),
                     top: y,
                     scale: 1.0,
                     bounds,
@@ -1291,7 +1452,7 @@ impl Gfx {
         let text_areas: Vec<TextArea<'_>> = tab_area
             .into_iter()
             .chain(row_areas)
-            .chain(wide_areas)
+            .chain(overlay_areas)
             .chain(url_bar_area)
             .collect();
 
@@ -1501,7 +1662,15 @@ mod tests {
         let mut text = String::new();
         let mut spans = Vec::new();
         let mut wide = Vec::new();
-        build_row_text(&row, 0, &snap, &mut text, &mut spans, &mut wide);
+        build_row_text(
+            &row,
+            0,
+            &snap,
+            &mut text,
+            &mut spans,
+            &mut wide,
+            &mut |_| false,
+        );
         // One char per cell, no literal control bytes that the shaper would
         // expand.
         assert_eq!(text.chars().count(), 4);
@@ -1542,7 +1711,15 @@ mod tests {
         let mut text = String::new();
         let mut spans = Vec::new();
         let mut wide = Vec::new();
-        build_row_text(&row, 0, &snap, &mut text, &mut spans, &mut wide);
+        build_row_text(
+            &row,
+            0,
+            &snap,
+            &mut text,
+            &mut spans,
+            &mut wide,
+            &mut |_| false,
+        );
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].range, 0..4);
         assert_eq!(spans[0].fg, [0; 3]);
@@ -1578,8 +1755,12 @@ mod tests {
         };
         let (mut t0, mut s0, mut w0) = (String::new(), Vec::new(), Vec::new());
         let (mut t1, mut s1, mut w1) = (String::new(), Vec::new(), Vec::new());
-        build_row_text(&row, 0, &snap_at(0), &mut t0, &mut s0, &mut w0);
-        build_row_text(&row, 0, &snap_at(1), &mut t1, &mut s1, &mut w1);
+        build_row_text(&row, 0, &snap_at(0), &mut t0, &mut s0, &mut w0, &mut |_| {
+            false
+        });
+        build_row_text(&row, 0, &snap_at(1), &mut t1, &mut s1, &mut w1, &mut |_| {
+            false
+        });
         assert_eq!(t0, t1);
         assert_ne!(s0, s1);
     }
@@ -1609,7 +1790,15 @@ mod tests {
         let mut text = String::new();
         let mut spans = Vec::new();
         let mut wide = Vec::new();
-        build_row_text(&row, 0, &snap, &mut text, &mut spans, &mut wide);
+        build_row_text(
+            &row,
+            0,
+            &snap,
+            &mut text,
+            &mut spans,
+            &mut wide,
+            &mut |_| false,
+        );
         // Four columns, four chars: the wide glyph and its spacer are both NBSP
         // so every later cell keeps its column.
         let chars: Vec<char> = text.chars().collect();
@@ -1617,8 +1806,73 @@ mod tests {
         // The glyph is surfaced once, at its own column, carrying its styling.
         assert_eq!(wide.len(), 1);
         assert_eq!(wide[0].col, 1);
+        assert_eq!(wide[0].cols, 2);
         assert_eq!(wide[0].ch, '世');
         assert_eq!(wide[0].fg, [1, 2, 3]);
+    }
+
+    #[test]
+    fn build_row_text_pins_misfit_symbol_as_overlay() {
+        // A single-width symbol whose font advance isn't one cell (reported by
+        // the `misfit` probe) must be held with NBSP in the flowed text and
+        // drawn as a one-column overlay, so the cells after it stay put. A
+        // symbol that does fit stays inline, and ASCII is never even probed.
+        let mut row = vec![SnapCell::default(); 5];
+        row[0].ch = 'a';
+        row[1].ch = '⬥'; // misfit (U+2B25 — not procedural, fallback font)
+        row[1].fg = [9, 8, 7];
+        row[2].ch = '·'; // fits
+        row[3].ch = '⬥'; // misfit again — must hit the same answer
+        row[4].ch = '|';
+        let snap = GridSnapshot {
+            cells: vec![row.clone()],
+            cursor_line: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            fg: [0; 3],
+            bg: [0; 3],
+            selection: None,
+        };
+        let mut probed = Vec::new();
+        let mut misfit = |ch: char| {
+            probed.push(ch);
+            ch == '⬥'
+        };
+        let mut text = String::new();
+        let mut spans = Vec::new();
+        let mut overlays = Vec::new();
+        build_row_text(
+            &row,
+            0,
+            &snap,
+            &mut text,
+            &mut spans,
+            &mut overlays,
+            &mut misfit,
+        );
+        let chars: Vec<char> = text.chars().collect();
+        assert_eq!(chars, vec!['a', '\u{00A0}', '·', '\u{00A0}', '|']);
+        assert_eq!(overlays.len(), 2);
+        assert_eq!(
+            (overlays[0].col, overlays[0].cols, overlays[0].ch),
+            (1, 1, '⬥')
+        );
+        assert_eq!(overlays[0].fg, [9, 8, 7]);
+        assert_eq!(
+            (overlays[1].col, overlays[1].cols, overlays[1].ch),
+            (3, 1, '⬥')
+        );
+        // Only the non-ASCII cells were probed.
+        assert_eq!(probed, vec!['⬥', '·', '⬥']);
+    }
+
+    #[test]
+    fn misfit_tolerance_scales_with_cell_but_has_a_floor() {
+        // Tiny cells: the 0.25px floor wins so sub-pixel float noise on a
+        // primary-font glyph never triggers an overlay.
+        assert_eq!(misfit_tolerance_px(4.0), 0.25);
+        // Normal cells: 2% of the width.
+        assert!((misfit_tolerance_px(20.0) - 0.4).abs() < 1e-6);
     }
 
     #[test]
