@@ -626,3 +626,72 @@ fn symbol_glyphs_keep_later_cells_on_grid() {
         lines.join("\n")
     );
 }
+
+/// Programs that probe the terminal at startup (neovim sends DA1, OSC 11 and a
+/// DSR 6 cursor-position query, then waits for the DSR reply as a sentinel)
+/// need the replies alacritty_terminal formats for us to actually reach the
+/// PTY. Regression test for "did not detect DSR response from terminal".
+#[test]
+#[cfg(unix)]
+fn answers_dsr_and_background_color_queries() {
+    require_display!();
+    let mut t = AtermTest::spawn();
+
+    // A script file sidesteps nested quoting through the IPC + shell. `read
+    // -d` needs bash, so invoke it explicitly rather than relying on $SHELL.
+    let dir = tempfile::tempdir().expect("mktemp");
+    let script = dir.path().join("probe.sh");
+    std::fs::write(
+        &script,
+        concat!(
+            "printf '\\033[6n'\n",
+            "IFS= read -r -s -d R reply\n",
+            "printf 'dsr=<%s>\\n' \"${reply#*[}\"\n",
+            // BEL terminator so the reply is BEL-terminated too and `read`
+            // can stop on it without leaving a stray ESC in the output.
+            "printf '\\033]11;?\\a'\n",
+            "IFS= read -r -s -d $'\\a' reply\n",
+            "printf 'bg=<%s>\\n' \"${reply#*;}\"\n",
+        ),
+    )
+    .expect("write probe script");
+
+    t.type_line(&format!("bash {}", script.display()));
+    t.wait_for_text("bg=<");
+    let lines = t.snapshot_text();
+
+    let dsr = lines
+        .iter()
+        .find_map(|l| l.split_once("dsr=<").map(|(_, rest)| rest))
+        .unwrap_or_else(|| panic!("no dsr line in:\n{}", lines.join("\n")));
+    let dsr = dsr.split('>').next().unwrap_or("");
+    let (row, col) = dsr
+        .split_once(';')
+        .unwrap_or_else(|| panic!("malformed DSR reply {dsr:?} in:\n{}", lines.join("\n")));
+    assert!(
+        row.parse::<u16>().map(|r| r >= 1).unwrap_or(false)
+            && col.parse::<u16>().map(|c| c >= 1).unwrap_or(false),
+        "DSR reply should be 1-based row;col, got {dsr:?} in:\n{}",
+        lines.join("\n")
+    );
+
+    let bg = lines
+        .iter()
+        .find_map(|l| l.split_once("bg=<").map(|(_, rest)| rest))
+        .unwrap_or_else(|| panic!("no bg line in:\n{}", lines.join("\n")));
+    let bg = bg.split('>').next().unwrap_or("");
+    // xterm-style `rgb:rrrr/gggg/bbbb` with 16-bit-per-channel hex.
+    let parts: Vec<&str> = bg
+        .strip_prefix("rgb:")
+        .unwrap_or_else(|| panic!("OSC 11 reply should start with rgb:, got {bg:?}"))
+        .split('/')
+        .collect();
+    assert!(
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|p| p.len() == 4 && u16::from_str_radix(p, 16).is_ok()),
+        "malformed OSC 11 reply {bg:?} in:\n{}",
+        lines.join("\n")
+    );
+}
