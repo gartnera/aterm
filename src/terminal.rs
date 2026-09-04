@@ -314,6 +314,29 @@ fn indexed_from_palette(idx: u8, palette: &ConfigColors) -> [u8; 3] {
     [gray, gray, gray]
 }
 
+/// Inverse of `NamedColor as usize` for the special slots above the 256
+/// indexed colours. alacritty_terminal reports colour queries by slot number,
+/// so `OSC 11 ; ?` arrives here as `257`.
+fn named_color_from_index(index: usize) -> Option<NamedColor> {
+    use NamedColor as N;
+    const ALL: [NamedColor; 13] = [
+        N::Foreground,
+        N::Background,
+        N::Cursor,
+        N::DimBlack,
+        N::DimRed,
+        N::DimGreen,
+        N::DimYellow,
+        N::DimBlue,
+        N::DimMagenta,
+        N::DimCyan,
+        N::DimWhite,
+        N::BrightForeground,
+        N::DimForeground,
+    ];
+    ALL.into_iter().find(|&n| n as usize == index)
+}
+
 fn resolve_color(
     color: AnsiColor,
     colors: &alacritty_terminal::term::color::Colors,
@@ -479,6 +502,10 @@ pub struct TerminalSession {
     title: String,
     cols: u16,
     lines: u16,
+    /// Cell pixel size, kept current by [`resize`](Self::resize) so a
+    /// `CSI 14 t` (text area size in pixels) query can be answered.
+    cell_width: u16,
+    cell_height: u16,
     exited: bool,
     palette: ConfigColors,
     /// When false, OSC 0/1/2 title-change requests from the running program
@@ -620,6 +647,8 @@ impl TerminalSession {
             title: "shell".into(),
             cols,
             lines,
+            cell_width,
+            cell_height,
             exited: false,
             palette,
             dynamic_title,
@@ -919,6 +948,8 @@ impl TerminalSession {
     pub fn resize(&mut self, cols: u16, lines: u16, cell_width: u16, cell_height: u16) {
         self.cols = cols;
         self.lines = lines;
+        self.cell_width = cell_width;
+        self.cell_height = cell_height;
         let window_size = WindowSize {
             num_lines: lines,
             num_cols: cols,
@@ -1045,7 +1076,36 @@ impl TerminalSession {
             .collect()
     }
 
+    /// Resolve the colour a program would see for palette slot `index`
+    /// (0..=255 indexed, 256.. the [`NamedColor`] specials), honouring any
+    /// OSC 4/10/11/12 override the program itself has set. Backs the reply
+    /// to `OSC 4;<n>;?` / `OSC 10;?` / `OSC 11;?` / `OSC 12;?` queries.
+    fn color_at(&self, index: usize) -> Option<Rgb> {
+        if let Some(rgb) = self.term.lock().colors()[index] {
+            return Some(rgb);
+        }
+        let arr = match u8::try_from(index) {
+            Ok(idx) => indexed_from_palette(idx, &self.palette),
+            Err(_) => named_from_palette(named_color_from_index(index)?, &self.palette)?,
+        };
+        Some(Rgb {
+            r: arr[0],
+            g: arr[1],
+            b: arr[2],
+        })
+    }
+
     /// Drain any pending alacritty events. Returns whether a redraw is needed.
+    ///
+    /// Besides bookkeeping (title, exit), this is where terminal *queries*
+    /// get their answers: alacritty_terminal parses `CSI 6 n` (cursor
+    /// position report), `CSI c` (device attributes), `CSI ? u` (kitty
+    /// keyboard flags), `OSC 11 ; ?` (background colour) and friends, but it
+    /// only hands us the reply text — writing it back to the PTY is the
+    /// embedder's job. Programs that probe the terminal at startup (neovim
+    /// sends DA1, OSC 11 and DSR 6, then waits for the DSR reply as a
+    /// sentinel) hang on a timeout and complain — "did not detect DSR
+    /// response from terminal" — if these are dropped.
     pub fn pump_events(&mut self) -> bool {
         let mut wake = false;
         while let Ok(event) = self.events.try_recv() {
@@ -1059,6 +1119,20 @@ impl TerminalSession {
                     if self.dynamic_title {
                         self.title = "shell".into();
                     }
+                }
+                TermEvent::PtyWrite(text) => self.send_input(text.into_bytes()),
+                TermEvent::ColorRequest(index, format) => match self.color_at(index) {
+                    Some(rgb) => self.send_input(format(rgb).into_bytes()),
+                    None => log::debug!("ignoring colour query for unknown index {index}"),
+                },
+                TermEvent::TextAreaSizeRequest(format) => {
+                    let size = WindowSize {
+                        num_lines: self.lines,
+                        num_cols: self.cols,
+                        cell_width: self.cell_width,
+                        cell_height: self.cell_height,
+                    };
+                    self.send_input(format(size).into_bytes());
                 }
                 TermEvent::Wakeup => wake = true,
                 TermEvent::Exit | TermEvent::ChildExit(_) => {
@@ -1075,6 +1149,20 @@ impl TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_color_index_round_trips() {
+        use NamedColor as N;
+        for n in [N::Foreground, N::Background, N::Cursor, N::DimForeground] {
+            assert_eq!(named_color_from_index(n as usize), Some(n));
+        }
+        // OSC 11 (background) arrives as slot 257.
+        assert_eq!(named_color_from_index(257), Some(N::Background));
+        // Indexed colours and out-of-range slots are not named colours.
+        assert_eq!(named_color_from_index(0), None);
+        assert_eq!(named_color_from_index(255), None);
+        assert_eq!(named_color_from_index(269), None);
+    }
 
     #[test]
     fn default_lang_skips_when_locale_already_set() {
