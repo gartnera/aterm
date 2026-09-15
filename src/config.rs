@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use alacritty_terminal::term::Osc52;
+use alacritty_terminal::vte::ansi::CursorShape;
 use serde::Deserialize;
 
 use crate::binding::{self, Keybinding};
@@ -34,6 +36,19 @@ pub struct Config {
     /// window/tab title stays at its initial value. Mirrors alacritty's
     /// `[window].dynamic_title` option.
     pub dynamic_title: bool,
+    /// How much of the OSC 52 clipboard protocol programs may use. Mirrors
+    /// alacritty's `[terminal].osc52` option, including its default: writes
+    /// are allowed (that's the point of OSC 52 — copying from a remote shell
+    /// over ssh), reads are not, since a program that can read the clipboard
+    /// can exfiltrate whatever you last copied.
+    pub osc52: Osc52,
+    /// Cursor shape used until a program asks for another one with DECSCUSR
+    /// (`CSI n SP q`) or `OSC 50 ; CursorShape=n`. Mirrors alacritty's
+    /// `[cursor].style`.
+    pub cursor_shape: CursorShape,
+    /// Beam width / underline height as a fraction of the cell, per
+    /// alacritty's `[cursor].thickness`. Ignored by the block shapes.
+    pub cursor_thickness: f32,
 }
 
 impl Default for Config {
@@ -55,6 +70,9 @@ impl Default for Config {
             padding_y: 6.0,
             bindings: binding::defaults(),
             dynamic_title: true,
+            osc52: Osc52::OnlyCopy,
+            cursor_shape: CursorShape::Block,
+            cursor_thickness: DEFAULT_CURSOR_THICKNESS,
         }
     }
 }
@@ -170,6 +188,42 @@ struct RawConfig {
     window: Option<RawWindow>,
     #[serde(default)]
     keyboard: Option<RawKeyboard>,
+    #[serde(default)]
+    terminal: Option<RawTerminal>,
+    #[serde(default)]
+    cursor: Option<RawCursorConfig>,
+}
+
+/// The top-level `[cursor]` table — shape and thickness. Not to be confused
+/// with `[colors.cursor]`, which is the cursor's *color*.
+#[derive(Debug, Default, Deserialize)]
+struct RawCursorConfig {
+    #[serde(default)]
+    style: Option<RawCursorStyle>,
+    #[serde(default)]
+    thickness: Option<f32>,
+}
+
+/// `style` is either a bare shape (`style = "Beam"`) or a table that also
+/// carries `blinking` (`style = { shape = "Beam", blinking = "On" }`).
+/// aterm doesn't blink the cursor, so only `shape` is read.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawCursorStyle {
+    Shape(String),
+    Table {
+        #[serde(default)]
+        shape: Option<String>,
+    },
+}
+
+/// Alacritty's default beam/underline thickness, as a fraction of the cell.
+const DEFAULT_CURSOR_THICKNESS: f32 = 0.15;
+
+#[derive(Debug, Default, Deserialize)]
+struct RawTerminal {
+    #[serde(default)]
+    osc52: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -395,6 +449,41 @@ fn apply_raw(cfg: &mut Config, raw: RawConfig) {
             cfg.dynamic_title = dt;
         }
     }
+    if let Some(cursor) = raw.cursor {
+        let shape = match cursor.style {
+            Some(RawCursorStyle::Shape(s)) => Some(s),
+            Some(RawCursorStyle::Table { shape }) => shape,
+            None => None,
+        };
+        if let Some(raw_shape) = shape {
+            match parse_cursor_shape(&raw_shape) {
+                Some(s) => cfg.cursor_shape = s,
+                None => log::warn!(
+                    "ignoring [cursor].style = {raw_shape:?}: expected Block, Underline or Beam"
+                ),
+            }
+        }
+        if let Some(t) = cursor.thickness {
+            // Alacritty clamps to (0, 1]; a zero or negative thickness would
+            // render nothing at all, which reads as a broken cursor.
+            if t > 0.0 && t <= 1.0 {
+                cfg.cursor_thickness = t;
+            } else {
+                log::warn!("ignoring [cursor].thickness = {t}: expected a fraction in (0, 1]");
+            }
+        }
+    }
+    if let Some(terminal) = raw.terminal {
+        if let Some(raw_osc52) = terminal.osc52 {
+            match parse_osc52(&raw_osc52) {
+                Some(mode) => cfg.osc52 = mode,
+                None => log::warn!(
+                    "ignoring [terminal].osc52 = {raw_osc52:?}: expected one of \
+                     Disabled, OnlyCopy, OnlyPaste, CopyPaste"
+                ),
+            }
+        }
+    }
     if let Some(colors) = raw.colors {
         // Standard alacritty `[colors]` keys customize the dark palette — that
         // preserves the historical look for users who configured a single
@@ -478,6 +567,42 @@ fn apply_raw(cfg: &mut Config, raw: RawConfig) {
         if !user.is_empty() {
             cfg.bindings = binding::merge(user, binding::defaults());
         }
+    }
+}
+
+/// Parse alacritty's `[terminal].osc52` value.
+///
+/// Alacritty documents the variants in CamelCase (`"OnlyCopy"`) but lowercases
+/// the string before deserializing it, so case never matters there; we match
+/// that and additionally tolerate `_`/`-` separators so `"only_copy"` works
+/// too. Unknown values are rejected (the caller warns) rather than silently
+/// falling back, since guessing wrong here either breaks copy or opens up
+/// clipboard reads.
+fn parse_osc52(s: &str) -> Option<Osc52> {
+    let normalized: String = s
+        .chars()
+        .filter(|c| !matches!(c, '_' | '-' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect();
+    match normalized.as_str() {
+        "disabled" => Some(Osc52::Disabled),
+        "onlycopy" => Some(Osc52::OnlyCopy),
+        "onlypaste" => Some(Osc52::OnlyPaste),
+        "copypaste" => Some(Osc52::CopyPaste),
+        _ => None,
+    }
+}
+
+/// Parse alacritty's `[cursor].style` shape name, case-insensitively (its own
+/// parser is case-insensitive too). `HollowBlock` is deliberately absent:
+/// alacritty doesn't offer it as a configured shape, it's only what a program
+/// can ask for at runtime.
+fn parse_cursor_shape(s: &str) -> Option<CursorShape> {
+    match s.trim().to_lowercase().as_str() {
+        "block" => Some(CursorShape::Block),
+        "underline" => Some(CursorShape::Underline),
+        "beam" => Some(CursorShape::Beam),
+        _ => None,
     }
 }
 
@@ -729,6 +854,87 @@ mod tests {
         .unwrap();
         apply_raw(&mut cfg, raw);
         assert!(!cfg.follow_system_theme);
+    }
+
+    #[test]
+    fn osc52_defaults_to_copy_only() {
+        // Matches alacritty's default: programs may write the clipboard but
+        // not read it back.
+        assert_eq!(Config::default().osc52, Osc52::OnlyCopy);
+        let mut cfg = Config::default();
+        let raw: RawConfig = toml::from_str("[font]\nsize = 12.0\n").unwrap();
+        apply_raw(&mut cfg, raw);
+        assert_eq!(cfg.osc52, Osc52::OnlyCopy);
+    }
+
+    #[test]
+    fn osc52_accepts_every_documented_spelling() {
+        for (text, want) in [
+            ("Disabled", Osc52::Disabled),
+            ("OnlyCopy", Osc52::OnlyCopy),
+            ("OnlyPaste", Osc52::OnlyPaste),
+            ("CopyPaste", Osc52::CopyPaste),
+            // Alacritty lowercases before parsing, so these are equivalent.
+            ("copypaste", Osc52::CopyPaste),
+            ("COPYPASTE", Osc52::CopyPaste),
+            ("copy_paste", Osc52::CopyPaste),
+        ] {
+            let mut cfg = Config::default();
+            let raw: RawConfig =
+                toml::from_str(&format!("[terminal]\nosc52 = \"{text}\"\n")).unwrap();
+            apply_raw(&mut cfg, raw);
+            assert_eq!(cfg.osc52, want, "parsing {text:?}");
+        }
+    }
+
+    #[test]
+    fn osc52_unknown_value_keeps_the_safe_default() {
+        let mut cfg = Config::default();
+        let raw: RawConfig = toml::from_str("[terminal]\nosc52 = \"yes please\"\n").unwrap();
+        apply_raw(&mut cfg, raw);
+        assert_eq!(cfg.osc52, Osc52::OnlyCopy);
+    }
+
+    #[test]
+    fn cursor_style_accepts_bare_shape_and_table() {
+        for text in [
+            "[cursor]\nstyle = \"Beam\"\n",
+            "[cursor]\nstyle = { shape = \"beam\" }\n",
+            // A blinking key aterm doesn't implement must not stop the shape
+            // from being read.
+            "[cursor]\nstyle = { shape = \"BEAM\", blinking = \"On\" }\n",
+        ] {
+            let mut cfg = Config::default();
+            let raw: RawConfig = toml::from_str(text).unwrap();
+            apply_raw(&mut cfg, raw);
+            assert_eq!(cfg.cursor_shape, CursorShape::Beam, "parsing {text:?}");
+        }
+    }
+
+    #[test]
+    fn cursor_shape_defaults_to_block_and_rejects_junk() {
+        assert_eq!(Config::default().cursor_shape, CursorShape::Block);
+        let mut cfg = Config::default();
+        let raw: RawConfig = toml::from_str("[cursor]\nstyle = \"Wedge\"\n").unwrap();
+        apply_raw(&mut cfg, raw);
+        assert_eq!(cfg.cursor_shape, CursorShape::Block);
+    }
+
+    #[test]
+    fn cursor_thickness_only_accepts_a_fraction() {
+        let mut cfg = Config::default();
+        let raw: RawConfig = toml::from_str("[cursor]\nthickness = 0.4\n").unwrap();
+        apply_raw(&mut cfg, raw);
+        assert_eq!(cfg.cursor_thickness, 0.4);
+
+        // Out-of-range values would render an invisible or cell-filling
+        // "beam"; keep the default instead.
+        for bad in ["0.0", "-1.0", "2.0"] {
+            let mut cfg = Config::default();
+            let raw: RawConfig = toml::from_str(&format!("[cursor]\nthickness = {bad}\n")).unwrap();
+            apply_raw(&mut cfg, raw);
+            assert_eq!(cfg.cursor_thickness, DEFAULT_CURSOR_THICKNESS);
+        }
     }
 
     #[test]

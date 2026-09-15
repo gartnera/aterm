@@ -9,7 +9,7 @@ use winit::window::Window;
 
 use crate::config::Colors as ConfigColors;
 use crate::quad::{Quad, QuadPipeline};
-use crate::terminal::{GridSnapshot, TerminalSession, UrlMatch, UrlSpan};
+use crate::terminal::{CursorShapeView, GridSnapshot, TerminalSession, UrlMatch, UrlSpan};
 
 struct TabBarTheme {
     /// Background of the strip behind all tabs (linear-space wgpu color).
@@ -57,6 +57,40 @@ fn linear_rgba(c: [u8; 3]) -> [f32; 4] {
         srgb_to_linear(c[2]) as f32,
         1.0,
     ]
+}
+
+/// Emit the quads for one cursor, in physical pixels.
+///
+/// `thickness` is the fraction of the cell a beam or underline occupies; the
+/// result is floored at one physical pixel so a thin cursor can never vanish
+/// at small font sizes. The block shapes ignore it.
+fn push_cursor_quads(
+    quads: &mut Vec<Quad>,
+    shape: CursorShapeView,
+    cell: [f32; 4],
+    thickness: f32,
+    color: [f32; 4],
+) {
+    let [x, y, cell_w, cell_h] = cell;
+    let mut push = |rect: [f32; 4]| quads.push(Quad { rect, color });
+    match shape {
+        CursorShapeView::Block => push([x, y, cell_w, cell_h]),
+        CursorShapeView::Beam => push([x, y, (cell_w * thickness).max(1.0), cell_h]),
+        CursorShapeView::Underline => {
+            let h = (cell_h * thickness).max(1.0);
+            push([x, y + cell_h - h, cell_w, h]);
+        }
+        CursorShapeView::HollowBlock => {
+            // Four edges rather than one quad, so the glyph stays readable
+            // inside the outline.
+            let t = (cell_h * thickness).max(1.0).min(cell_h / 2.0);
+            let w = (cell_w * thickness).max(1.0).min(cell_w / 2.0);
+            push([x, y, cell_w, t]);
+            push([x, y + cell_h - t, cell_w, t]);
+            push([x, y + t, w, cell_h - 2.0 * t]);
+            push([x + cell_w - w, y + t, w, cell_h - 2.0 * t]);
+        }
+    }
 }
 
 const PAD_X: f32 = 6.0;
@@ -336,15 +370,16 @@ fn build_row_text(
     text.clear();
     spans.clear();
     overlays.clear();
-    let cursor_here = snap.cursor_visible && snap.cursor_line == row_idx;
+    let cursor_col = snap.block_cursor_col(row_idx);
 
     for (col, cell) in row.iter().enumerate() {
         // Skip wide-char-spacer slots; the wide glyph in the previous column
         // already advances two columns visually.
         let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
-        // At the cursor cell we want the glyph to read against the cursor
+        // Under a block cursor we want the glyph to read against the cursor
         // block, so invert fg to the cell's bg (typically the terminal bg).
-        let on_cursor = cursor_here && col == snap.cursor_col;
+        // A beam or underline doesn't cover the glyph, so it stays as it is.
+        let on_cursor = Some(col) == cursor_col;
         let selected = cell_in_selection(snap, row_idx, col);
         let fg = if on_cursor {
             cell.bg
@@ -545,6 +580,9 @@ pub struct Gfx {
     cell_width_logical: f32,
     font_family: String,
     clear_color: wgpu::Color,
+    /// Beam width / underline height as a fraction of the cell, from
+    /// `[cursor].thickness`.
+    cursor_thickness: f32,
     tab_theme: TabBarTheme,
     /// Physical-pixel x-ranges for each rendered tab, refreshed every frame.
     tab_hit_regions: Vec<(usize, f32, f32)>,
@@ -592,6 +630,7 @@ impl Gfx {
         line_height: f32,
         font_family: String,
         colors: ConfigColors,
+        cursor_thickness: f32,
     ) -> Self {
         let bg = colors.background;
         let size = window.inner_size();
@@ -674,6 +713,7 @@ impl Gfx {
                 b: srgb_to_linear(bg[2]),
                 a: 1.0,
             },
+            cursor_thickness,
             tab_theme: TabBarTheme::derive(&colors),
             tab_hit_regions: Vec::new(),
             quads,
@@ -1104,7 +1144,23 @@ impl Gfx {
         } else {
             Color::rgb(0xd0, 0xd0, 0xd0)
         };
+        // The padding around the grid is painted by the surface clear, so it
+        // has to follow the terminal's *current* background — a program that
+        // changed it with `OSC 11` (or repointed the background slot with
+        // `OSC 4`) would otherwise be framed by the config's color.
+        let clear_color = if has_snapshot {
+            let bg = self.snapshot_scratch.bg;
+            wgpu::Color {
+                r: srgb_to_linear(bg[0]),
+                g: srgb_to_linear(bg[1]),
+                b: srgb_to_linear(bg[2]),
+                a: 1.0,
+            }
+        } else {
+            self.clear_color
+        };
 
+        let cursor_thickness = self.cursor_thickness;
         self.quad_scratch.clear();
         self.quad_scratch.push(Quad {
             rect: [0.0, 0.0, width as f32, tab_bar_height * scale],
@@ -1129,8 +1185,7 @@ impl Gfx {
             let default_bg = snap.bg;
             for (row_idx, row) in snap.cells.iter().enumerate() {
                 let y = top_offset_px + row_idx as f32 * cell_h_px;
-                let cursor_col =
-                    (snap.cursor_visible && snap.cursor_line == row_idx).then_some(snap.cursor_col);
+                let cursor_col = snap.block_cursor_col(row_idx);
                 let mut run: Option<(usize, [u8; 3])> = None;
                 for (col, cell) in row.iter().enumerate() {
                     let is_cursor = Some(col) == cursor_col;
@@ -1188,10 +1243,13 @@ impl Gfx {
             if snap.cursor_visible {
                 let x = PAD_X * scale + snap.cursor_col as f32 * cell_w_px;
                 let y = top_offset_px + snap.cursor_line as f32 * cell_h_px;
-                quads.push(Quad {
-                    rect: [x, y, cell_w_px, cell_h_px],
-                    color: linear_rgba(snap.fg),
-                });
+                push_cursor_quads(
+                    quads,
+                    snap.cursor_shape,
+                    [x, y, cell_w_px, cell_h_px],
+                    cursor_thickness,
+                    linear_rgba(snap.fg),
+                );
             }
 
             // Procedural glyphs: box-drawing, block elements, braille. The
@@ -1200,8 +1258,7 @@ impl Gfx {
             // bg/cursor, before text) so the cursor's fg block inverts them
             // the same way the text inverts.
             for (row_idx, row) in snap.cells.iter().enumerate() {
-                let cursor_col_here =
-                    (snap.cursor_visible && snap.cursor_line == row_idx).then_some(snap.cursor_col);
+                let cursor_col_here = snap.block_cursor_col(row_idx);
                 for (col, cell) in row.iter().enumerate() {
                     if !crate::box_drawing::is_handled(cell.ch) {
                         continue;
@@ -1502,7 +1559,7 @@ impl Gfx {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1588,12 +1645,96 @@ mod tests {
         }
     }
 
+    fn cursor_rects(shape: CursorShapeView, thickness: f32) -> Vec<[f32; 4]> {
+        let mut quads = Vec::new();
+        push_cursor_quads(
+            &mut quads,
+            shape,
+            [10.0, 20.0, 8.0, 16.0],
+            thickness,
+            [1.0, 1.0, 1.0, 1.0],
+        );
+        quads.into_iter().map(|q| q.rect).collect()
+    }
+
+    #[test]
+    fn cursor_shapes_stay_inside_their_cell() {
+        assert_eq!(
+            cursor_rects(CursorShapeView::Block, 0.15),
+            vec![[10.0, 20.0, 8.0, 16.0]]
+        );
+        // Beam hugs the left edge, full height.
+        assert_eq!(
+            cursor_rects(CursorShapeView::Beam, 0.25),
+            vec![[10.0, 20.0, 2.0, 16.0]]
+        );
+        // Underline sits on the bottom edge: y + cell_h - h.
+        assert_eq!(
+            cursor_rects(CursorShapeView::Underline, 0.25),
+            vec![[10.0, 32.0, 8.0, 4.0]]
+        );
+        // Hollow block is four edges that together cover the cell's border
+        // and nothing outside it.
+        let hollow = cursor_rects(CursorShapeView::HollowBlock, 0.25);
+        assert_eq!(hollow.len(), 4);
+        for [x, y, w, h] in hollow {
+            assert!(x >= 10.0 && x + w <= 18.0, "x span {x}..{}", x + w);
+            assert!(y >= 20.0 && y + h <= 36.0, "y span {y}..{}", y + h);
+        }
+    }
+
+    #[test]
+    fn thin_cursors_never_round_away_to_nothing() {
+        // A 0.01 fraction of a small cell would be sub-pixel; the floor keeps
+        // the cursor visible instead of rendering a zero-width quad.
+        for shape in [CursorShapeView::Beam, CursorShapeView::Underline] {
+            for [_, _, w, h] in cursor_rects(shape, 0.01) {
+                assert!(w >= 1.0 && h >= 1.0, "{shape:?} degenerate: {w}x{h}");
+            }
+        }
+    }
+
+    /// Only a filled block hides the cell under it, so only it may invert the
+    /// glyph or suppress the cell's own background.
+    #[test]
+    fn only_a_block_cursor_claims_its_cell() {
+        let mut snap = snap_with_selection(SelectionView {
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 0,
+            is_block: false,
+        });
+        snap.selection = None;
+        snap.cursor_visible = true;
+        snap.cursor_line = 2;
+        snap.cursor_col = 4;
+
+        snap.cursor_shape = CursorShapeView::Block;
+        assert_eq!(snap.block_cursor_col(2), Some(4));
+        assert_eq!(snap.block_cursor_col(1), None, "other rows are untouched");
+
+        for shape in [
+            CursorShapeView::Beam,
+            CursorShapeView::Underline,
+            CursorShapeView::HollowBlock,
+        ] {
+            snap.cursor_shape = shape;
+            assert_eq!(snap.block_cursor_col(2), None, "{shape:?}");
+        }
+
+        snap.cursor_shape = CursorShapeView::Block;
+        snap.cursor_visible = false;
+        assert_eq!(snap.block_cursor_col(2), None, "hidden cursor");
+    }
+
     fn snap_with_selection(sel: SelectionView) -> GridSnapshot {
         GridSnapshot {
             cells: vec![vec![SnapCell::default(); 10]; 5],
             cursor_line: 0,
             cursor_col: 0,
             cursor_visible: false,
+            cursor_shape: CursorShapeView::Block,
             fg: [0; 3],
             bg: [0; 3],
             selection: Some(sel),
@@ -1655,6 +1796,7 @@ mod tests {
             cursor_line: 0,
             cursor_col: 0,
             cursor_visible: false,
+            cursor_shape: CursorShapeView::Block,
             fg: [0; 3],
             bg: [0; 3],
             selection: None,
@@ -1704,6 +1846,7 @@ mod tests {
             cursor_line: 0,
             cursor_col: 0,
             cursor_visible: false,
+            cursor_shape: CursorShapeView::Block,
             fg: [0; 3],
             bg: [0; 3],
             selection: None,
@@ -1749,6 +1892,7 @@ mod tests {
             cursor_line: 0,
             cursor_col: col,
             cursor_visible: true,
+            cursor_shape: CursorShapeView::Block,
             fg: [0; 3],
             bg: [0; 3],
             selection: None,
@@ -1783,6 +1927,7 @@ mod tests {
             cursor_line: 0,
             cursor_col: 0,
             cursor_visible: false,
+            cursor_shape: CursorShapeView::Block,
             fg: [0; 3],
             bg: [0; 3],
             selection: None,
@@ -1829,6 +1974,7 @@ mod tests {
             cursor_line: 0,
             cursor_col: 0,
             cursor_visible: false,
+            cursor_shape: CursorShapeView::Block,
             fg: [0; 3],
             bg: [0; 3],
             selection: None,

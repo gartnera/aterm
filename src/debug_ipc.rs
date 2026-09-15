@@ -64,8 +64,21 @@ pub enum Request {
     /// and return the resulting selection text. Exercises the semantic
     /// selection path without synthesizing raw mouse events.
     SelectWord { row: usize, col: usize },
+    /// Return the OS clipboard's current text (null when aterm has no
+    /// clipboard handle or the read failed). Lets tests observe the result of
+    /// an OSC 52 copy without a second X client.
+    Clipboard,
+    /// Overwrite the OS clipboard. Test back door used to seed a known value
+    /// before exercising paste / OSC 52 clipboard reads.
+    SetClipboard { text: String },
+    /// Report the cursor's viewport position, whether it is visible
+    /// (DECTCEM / `CursorShape=Hidden`), and the shape a program last asked
+    /// for via DECSCUSR or OSC 50.
+    Cursor,
     /// Report the active theme: the resolved background/foreground colors (as
-    /// `#rrggbb`) and whether aterm is following the system appearance.
+    /// `#rrggbb`), whether aterm is following the system appearance, and the
+    /// background the terminal is *currently* rendering with — which a
+    /// program can repoint with OSC 11 / OSC 4 and reset with OSC 111 / 104.
     Theme,
     /// Force the active palette to the light or dark scheme, as a system
     /// appearance change would. Test back door for the live theme-switch path

@@ -25,6 +25,8 @@ honored up to a depth of 4.
 | `[colors.normal]` | `black` `red` `green` `yellow` `blue` `magenta` `cyan` `white` |
 | `[colors.bright]` | (same eight) |
 | `[[keyboard.bindings]]` | `key`, `mods`, `action` or `chars` |
+| `[cursor]` | `style` (shape), `thickness` |
+| `[terminal]` | `osc52` |
 
 Colors accept `#RRGGBB`, `0xRRGGBB`, or `RRGGBB`. `#RRGGBBAA` is accepted
 but the alpha is discarded (the renderer doesn't composite translucent
@@ -38,6 +40,47 @@ working directory of the currently active shell. The lookup uses
 `/proc/<pid>/cwd` on Linux and `proc_pidinfo` on macOS — no shell
 configuration is required. On other platforms the new tab spawns
 wherever aterm itself was launched from.
+
+### Clipboard (OSC 52)
+
+Programs can copy to the system clipboard with the OSC 52 escape sequence —
+this is what `tmux`'s `set-clipboard on`, neovim's `osc52` provider and
+`yank` use, and it's the only way a program on the far side of an `ssh`
+session can reach your local clipboard.
+
+```sh
+printf '\033]52;c;%s\a' "$(printf 'copied!' | base64)"
+```
+
+Copying is allowed by default; reading the clipboard back (`OSC 52 ; c ; ?`)
+is not, since a program that can read the clipboard can exfiltrate whatever
+you last copied. Change that with alacritty's `[terminal].osc52` key:
+
+```toml
+[terminal]
+osc52 = "CopyPaste"   # Disabled | OnlyCopy (default) | OnlyPaste | CopyPaste
+```
+
+aterm has a single clipboard, so a sequence addressed to the primary
+selection (`p`/`s` instead of `c`) lands on that same clipboard rather than
+being dropped.
+
+### Cursor
+
+The cursor is a block by default and follows what the running program asks
+for with DECSCUSR (`CSI n SP q`) or `OSC 50 ; CursorShape=n` — so vim, fish
+and zsh's vi-mode switch it to a bar in insert mode without any
+configuration. `[cursor]` sets the shape it starts from (and returns to on
+a program's `CSI 0 SP q` reset):
+
+```toml
+[cursor]
+style = "Beam"      # Block (default) | Underline | Beam
+thickness = 0.15    # beam width / underline height, as a fraction of the cell
+```
+
+`style` also accepts alacritty's table form, `style = { shape = "Beam" }`.
+A cursor is not blinked: aterm reads `shape` and ignores `blinking`.
 
 ### Keybindings
 

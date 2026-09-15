@@ -27,6 +27,22 @@ pub fn has_display() -> bool {
         .unwrap_or(false)
 }
 
+/// Serialize tests that touch the OS clipboard.
+///
+/// The X clipboard is one global resource shared by every aterm this suite
+/// spawns, and there is no clipboard manager under Xvfb — whichever process
+/// last claimed the selection owns it, so two clipboard tests running at once
+/// clobber each other. cargo runs a test binary's tests as threads in a single
+/// process, so a plain mutex is enough to keep them apart. Hold the guard for
+/// the whole test: dropping the owning aterm drops the clipboard contents with
+/// it.
+pub fn clipboard_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A panicking clipboard test poisons the lock; the next one still wants
+    // exclusive access, not a failure of its own.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Macro that turns a test into a no-op (with a printed reason) if no display
 /// is available. Use at the top of every test that calls AtermTest::spawn.
 #[macro_export]
@@ -79,6 +95,9 @@ pub struct AtermTest {
     log_buf: Arc<Mutex<String>>,
     /// Handle for the background stderr-pump thread so Drop can join it.
     log_thread: Option<JoinHandle<()>>,
+    /// Tempdir backing `$XDG_CONFIG_HOME` for tests that spawn with a config.
+    /// Held only so it is removed when the test ends.
+    _config_dir: tempfile::TempDir,
 }
 
 impl AtermTest {
@@ -97,12 +116,35 @@ impl AtermTest {
     /// Same as `spawn`, but lets the caller pick the test name used in
     /// failure-screenshot filenames.
     pub fn spawn_named(test_name: String) -> Self {
+        Self::spawn_inner(test_name, None)
+    }
+
+    /// Spawn aterm with `config_toml` as its alacritty config.
+    ///
+    /// The file is written into a throwaway `$XDG_CONFIG_HOME`, which aterm
+    /// checks first, so the test is isolated from whatever config the machine
+    /// running it happens to have. Pass `""` to test the built-in defaults
+    /// with that same isolation.
+    #[track_caller]
+    pub fn spawn_with_config(config_toml: &str) -> Self {
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("aterm_test")
+            .to_string();
+        Self::spawn_inner(name, Some(config_toml))
+    }
+
+    fn spawn_inner(test_name: String, config_toml: Option<&str>) -> Self {
         let dir = tempfile::tempdir().expect("mktemp");
         let sock_path = dir.path().join("aterm.sock");
         // Leak the tempdir handle: we want the directory to outlive this fn
         // so the socket path stays valid while the child runs. Drop removes
         // the socket file explicitly.
         let _ = dir.keep();
+        // Separate tempdir for a per-test config, kept alive by the handle we
+        // hand to the AtermTest below — aterm re-reads nothing after startup,
+        // but the directory must still exist while the process boots.
+        let config_dir = tempfile::tempdir().expect("mktemp config");
 
         let log_path = artifacts_dir().join(format!("{test_name}.log"));
         // Truncate any log from a previous run so we don't read stale output
@@ -111,6 +153,13 @@ impl AtermTest {
 
         let mut cmd = Command::new(aterm_binary());
         cmd.env("ATERM_DEBUG_SOCK", &sock_path);
+        if let Some(toml) = config_toml {
+            let cfg_home = config_dir.path().join("config");
+            let alacritty_dir = cfg_home.join("alacritty");
+            std::fs::create_dir_all(&alacritty_dir).expect("mkdir config");
+            std::fs::write(alacritty_dir.join("alacritty.toml"), toml).expect("write config");
+            cmd.env("XDG_CONFIG_HOME", &cfg_home);
+        }
         // Verbose by default — these logs are what you read when a test
         // fails. Override with ATERM_LOG to e.g. trim to "warn" if a noisy
         // test floods the file.
@@ -195,6 +244,7 @@ impl AtermTest {
             log_path,
             log_buf,
             log_thread: Some(log_thread),
+            _config_dir: config_dir,
         };
         // Wait for the shell to print its initial prompt before handing back
         // control. Tests can then issue commands and trust that the PTY is
@@ -393,6 +443,91 @@ impl AtermTest {
         data.get("text").and_then(Value::as_str).map(str::to_string)
     }
 
+    /// Read the OS clipboard through aterm (the same handle OSC 52 writes
+    /// to). None when aterm has no clipboard handle.
+    pub fn clipboard(&mut self) -> Option<String> {
+        let data = self.request(json!({ "cmd": "clipboard" }));
+        data.get("text").and_then(Value::as_str).map(str::to_string)
+    }
+
+    /// Seed the OS clipboard with a known value.
+    pub fn set_clipboard(&mut self, text: &str) {
+        self.request(json!({ "cmd": "set_clipboard", "text": text }));
+    }
+
+    /// Poll the clipboard until it equals `want`, or panic with what it
+    /// actually held. OSC 52 copies land asynchronously: the PTY read, the
+    /// parse and the clipboard write all happen on different threads.
+    #[track_caller]
+    pub fn wait_for_clipboard(&mut self, want: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = self.clipboard();
+            if got.as_deref() == Some(want) {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!("clipboard never became {want:?}; last value was {got:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The cursor's `{shape, line, col, visible}` as reported by aterm.
+    pub fn cursor(&mut self) -> CursorInfo {
+        let data = self.request(json!({ "cmd": "cursor" }));
+        CursorInfo {
+            shape: data["shape"].as_str().unwrap_or("").to_string(),
+            line: data["line"].as_u64().unwrap_or(0) as usize,
+            col: data["col"].as_u64().unwrap_or(0) as usize,
+            visible: data["visible"].as_bool().unwrap_or(false),
+        }
+    }
+
+    /// Poll until the cursor's shape is `want`, or panic with what it is.
+    /// A shape change arrives through the PTY, so it lands asynchronously.
+    #[track_caller]
+    pub fn wait_for_cursor_shape(&mut self, want: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = self.cursor();
+            if got.shape == want {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!("cursor shape never became {want:?}; last was {got:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The background the grid is currently painted with, as `#rrggbb`. This
+    /// tracks OSC 11 / OSC 4 overrides, unlike `theme_background`, which
+    /// reports what the config resolved to.
+    pub fn terminal_background(&mut self) -> String {
+        let data = self.request(json!({ "cmd": "theme" }));
+        data.get("terminal_background")
+            .and_then(Value::as_str)
+            .expect("terminal_background")
+            .to_string()
+    }
+
+    /// Poll until the rendered background is `want` (`#rrggbb`).
+    #[track_caller]
+    pub fn wait_for_terminal_background(&mut self, want: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = self.terminal_background();
+            if got == want {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!("terminal background never became {want}; last was {got}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Return the active theme's background color as `#rrggbb`.
     pub fn theme_background(&mut self) -> String {
         let data = self.request(json!({ "cmd": "theme" }));
@@ -554,6 +689,15 @@ impl Drop for AtermTest {
             let _ = std::fs::remove_dir_all(parent);
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct CursorInfo {
+    /// `block`, `hollow_block`, `beam` or `underline`.
+    pub shape: String,
+    pub line: usize,
+    pub col: usize,
+    pub visible: bool,
 }
 
 #[derive(Debug, Clone)]

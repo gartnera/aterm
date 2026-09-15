@@ -5,7 +5,7 @@ use alacritty_terminal::event_loop::{EventLoop as PtyLoop, Msg, Notifier};
 
 use winit::event_loop::EventLoopProxy;
 
-use crate::config::Colors as ConfigColors;
+use crate::config::{Colors as ConfigColors, Config};
 use crate::WakeEvent;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
@@ -17,7 +17,9 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::{point_to_viewport, viewport_to_point, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
+use alacritty_terminal::vte::ansi::{
+    Color as AnsiColor, CursorShape, CursorStyle, NamedColor, Rgb,
+};
 use alacritty_terminal::Term;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
@@ -46,6 +48,10 @@ pub struct GridSnapshot {
     pub cursor_line: usize,
     pub cursor_col: usize,
     pub cursor_visible: bool,
+    /// Shape the program asked for via `OSC 50 ; CursorShape=n` or DECSCUSR
+    /// (`CSI n SP q`), falling back to the configured default. `Hidden` is
+    /// folded into `cursor_visible` instead of appearing here.
+    pub cursor_shape: CursorShapeView,
     pub fg: [u8; 3],
     /// Terminal's default background — cells with this bg are not drawn so
     /// they fall through to the surface clear color.
@@ -54,6 +60,49 @@ pub struct GridSnapshot {
     /// inclusive. For non-block selections, rows between start.line and
     /// end.line are fully selected across their entire width.
     pub selection: Option<SelectionView>,
+}
+
+/// The cursor shapes aterm draws. A narrower version of alacritty's
+/// [`CursorShape`] — `Hidden` lives in `GridSnapshot::cursor_visible`, so the
+/// renderer never has to consider a shape that draws nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorShapeView {
+    /// Filled block covering the whole cell; the glyph under it is inverted.
+    #[default]
+    Block,
+    /// Outline of the cell, leaving the glyph visible.
+    HollowBlock,
+    /// Vertical bar at the cell's left edge (vim insert mode, `CSI 6 q`).
+    Beam,
+    /// Horizontal bar along the cell's bottom edge (`CSI 4 q`).
+    Underline,
+}
+
+impl CursorShapeView {
+    /// Stable lowercase name, used by the debug IPC so tests can assert on
+    /// the shape a program asked for.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::HollowBlock => "hollow_block",
+            Self::Beam => "beam",
+            Self::Underline => "underline",
+        }
+    }
+}
+
+impl GridSnapshot {
+    /// The column a *filled block* cursor covers on `row`, if any.
+    ///
+    /// Only the block shape hides the cell underneath, so it alone suppresses
+    /// the cell's own background and inverts the glyph drawn there. A beam or
+    /// underline sits beside the glyph and must leave both alone.
+    pub fn block_cursor_col(&self, row: usize) -> Option<usize> {
+        (self.cursor_visible
+            && self.cursor_line == row
+            && self.cursor_shape == CursorShapeView::Block)
+            .then_some(self.cursor_col)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -488,6 +537,26 @@ fn match_to_spans(
     spans
 }
 
+/// A clipboard request a program made through OSC 52, handed up to the app
+/// layer because the OS clipboard handle lives there (one per window, not one
+/// per tab).
+///
+/// aterm has a single clipboard, so both selections OSC 52 can name — `c`
+/// (clipboard) and `p`/`s` (primary selection) — map onto it. That mirrors
+/// macOS, where there is no primary selection either, and beats dropping a
+/// `p` request on the floor: a program that asked for *a* clipboard gets the
+/// only one aterm has.
+pub enum ClipboardOp {
+    /// `OSC 52 ; c ; <base64>` — store this text on the system clipboard.
+    /// Already base64-decoded and UTF-8 validated by alacritty_terminal.
+    Store(String),
+    /// `OSC 52 ; c ; ?` — the program wants the clipboard's contents. The
+    /// payload formats the reply escape sequence, which the caller writes
+    /// back to the PTY. Only produced when the config allows clipboard reads
+    /// (see [`crate::config::Config::osc52`]).
+    Load(Arc<dyn Fn(&str) -> String + Sync + Send>),
+}
+
 impl EventListener for ChannelListener {
     fn send_event(&self, event: TermEvent) {
         let _ = self.tx.send(event);
@@ -511,6 +580,10 @@ pub struct TerminalSession {
     /// When false, OSC 0/1/2 title-change requests from the running program
     /// are ignored — the tab keeps its initial title.
     dynamic_title: bool,
+    /// OSC 52 clipboard requests parsed since the last drain. Queued here
+    /// rather than handled inline because the OS clipboard handle lives in
+    /// the app layer; see [`take_clipboard_ops`](Self::take_clipboard_ops).
+    clipboard_ops: Vec<ClipboardOp>,
     /// PID of the shell process spawned for this tab. Used to resolve the
     /// shell's current working directory when the user opens a new tab so
     /// it inherits the cd'd-to location.
@@ -539,9 +612,8 @@ impl TerminalSession {
         cell_width: u16,
         cell_height: u16,
         proxy: EventLoopProxy<WakeEvent>,
-        palette: ConfigColors,
+        config: &Config,
         working_directory: Option<std::path::PathBuf>,
-        dynamic_title: bool,
     ) -> std::io::Result<Self> {
         let window_size = WindowSize {
             num_lines: lines,
@@ -626,7 +698,18 @@ impl TerminalSession {
             proxy,
         };
 
-        let term_config = TermConfig::default();
+        // Everything else stays at alacritty's defaults. `osc52` decides
+        // whether a program can reach the local clipboard; the cursor style is
+        // what a program's DECSCUSR / OSC 50 reset (`CSI 0 SP q`) falls back
+        // to, so it has to be the user's configured shape, not alacritty's.
+        let term_config = TermConfig {
+            osc52: config.osc52,
+            default_cursor_style: CursorStyle {
+                shape: config.cursor_shape,
+                blinking: false,
+            },
+            ..TermConfig::default()
+        };
         let term = Term::new(term_config, &term_size, listener.clone());
         let term = Arc::new(FairMutex::new(term));
 
@@ -650,8 +733,9 @@ impl TerminalSession {
             cell_width,
             cell_height,
             exited: false,
-            palette,
-            dynamic_title,
+            palette: config.colors.clone(),
+            dynamic_title: config.dynamic_title,
+            clipboard_ops: Vec::new(),
             shell_pid: Some(shell_pid),
             #[cfg(unix)]
             tty_fd,
@@ -990,6 +1074,13 @@ impl TerminalSession {
         let lines = term.screen_lines();
         let cursor_point = content.cursor.point;
         out.cursor_visible = !matches!(content.cursor.shape, CursorShape::Hidden);
+        out.cursor_shape = match content.cursor.shape {
+            CursorShape::Beam => CursorShapeView::Beam,
+            CursorShape::Underline => CursorShapeView::Underline,
+            CursorShape::HollowBlock => CursorShapeView::HollowBlock,
+            // Hidden never reaches the renderer (cursor_visible is false).
+            CursorShape::Block | CursorShape::Hidden => CursorShapeView::Block,
+        };
         out.selection = content.selection.and_then(|range| {
             // Convert to viewport coordinates and clamp to the visible grid so
             // selections that extend into scrollback off-screen render as a
@@ -1095,6 +1186,14 @@ impl TerminalSession {
         })
     }
 
+    /// Take the OSC 52 clipboard requests collected by
+    /// [`pump_events`](Self::pump_events). The app drains these after every
+    /// pump: it owns the OS clipboard handle, and a `Load` reply has to be
+    /// written back to this session's PTY.
+    pub fn take_clipboard_ops(&mut self) -> Vec<ClipboardOp> {
+        std::mem::take(&mut self.clipboard_ops)
+    }
+
     /// Drain any pending alacritty events. Returns whether a redraw is needed.
     ///
     /// Besides bookkeeping (title, exit), this is where terminal *queries*
@@ -1102,7 +1201,9 @@ impl TerminalSession {
     /// position report), `CSI c` (device attributes), `CSI ? u` (kitty
     /// keyboard flags), `OSC 11 ; ?` (background colour) and friends, but it
     /// only hands us the reply text — writing it back to the PTY is the
-    /// embedder's job. Programs that probe the terminal at startup (neovim
+    /// embedder's job. Same for OSC 52 clipboard requests, which are queued
+    /// for the app layer (see
+    /// [`take_clipboard_ops`](Self::take_clipboard_ops)). Programs that probe the terminal at startup (neovim
     /// sends DA1, OSC 11 and DSR 6, then waits for the DSR reply as a
     /// sentinel) hang on a timeout and complain — "did not detect DSR
     /// response from terminal" — if these are dropped.
@@ -1133,6 +1234,16 @@ impl TerminalSession {
                         cell_height: self.cell_height,
                     };
                     self.send_input(format(size).into_bytes());
+                }
+                // OSC 52. alacritty_terminal has already enforced the
+                // configured policy (and decoded/validated the payload) by
+                // the time either of these is emitted, so anything arriving
+                // here is allowed to proceed.
+                TermEvent::ClipboardStore(_, text) => {
+                    self.clipboard_ops.push(ClipboardOp::Store(text))
+                }
+                TermEvent::ClipboardLoad(_, format) => {
+                    self.clipboard_ops.push(ClipboardOp::Load(format))
                 }
                 TermEvent::Wakeup => wake = true,
                 TermEvent::Exit | TermEvent::ChildExit(_) => {

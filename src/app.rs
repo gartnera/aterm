@@ -21,10 +21,16 @@ use crate::config::{self, Config};
 use crate::debug_ipc;
 use crate::gfx::Gfx;
 use crate::input;
-use crate::terminal::{self, MouseReporting, TerminalSession, UrlMatch};
+use crate::terminal::{self, ClipboardOp, MouseReporting, TerminalSession, UrlMatch};
 use crate::WakeEvent;
 
 pub const TAB_BAR_HEIGHT: f32 = 28.0;
+
+/// Defensive cap on how much text may be pushed onto the OS clipboard in one
+/// go. For a mouse selection anything larger is almost certainly a mis-drag
+/// across the whole scrollback; for OSC 52 it bounds what a remote program
+/// can make aterm allocate.
+const MAX_COPY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum gap between two left-clicks on the same cell for the second to
 /// count as a double-click (word selection). Matches the common ~300ms
@@ -185,9 +191,8 @@ impl App {
             cell_w_px,
             cell_h_px,
             self.proxy.clone(),
-            self.config.colors.clone(),
+            &self.config,
             cwd,
-            self.config.dynamic_title,
         ) {
             Ok(s) => {
                 let idx = (self.active_tab + 1).min(self.tabs.len());
@@ -220,19 +225,22 @@ impl App {
     }
 
     fn copy_selection(&mut self) {
-        // Defensive cap on copied size. Anything larger than this is almost
-        // certainly a mis-drag across the entire scrollback; the limit keeps
-        // a runaway selection from pushing tens-of-MB onto the OS clipboard.
-        const MAX_COPY_BYTES: usize = 16 * 1024 * 1024;
         let Some(session) = self.tabs.get(self.active_tab) else {
             return;
         };
         let Some(text) = session.selection_text() else {
             return;
         };
+        self.set_clipboard_text(text, "selection");
+    }
+
+    /// Put `text` on the OS clipboard. `source` only names the origin for log
+    /// messages ("selection", "OSC 52"). Shared by Cmd+C and OSC 52 so both
+    /// paths get the same size cap.
+    fn set_clipboard_text(&mut self, text: String, source: &str) {
         if text.len() > MAX_COPY_BYTES {
             log::warn!(
-                "selection is {} bytes; refusing to copy more than {} bytes to the clipboard",
+                "{source} is {} bytes; refusing to copy more than {} bytes to the clipboard",
                 text.len(),
                 MAX_COPY_BYTES
             );
@@ -243,6 +251,39 @@ impl App {
         };
         if let Err(e) = cb.set_text(text) {
             log::warn!("clipboard set_text: {e}");
+        }
+    }
+
+    /// Read the OS clipboard, or None when there is no clipboard handle or
+    /// the read failed.
+    fn clipboard_text(&mut self) -> Option<String> {
+        let cb = self.clipboard.as_mut()?;
+        match cb.get_text() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                log::warn!("clipboard get_text: {e}");
+                None
+            }
+        }
+    }
+
+    /// Service the OSC 52 requests each tab collected during `pump_events`.
+    ///
+    /// Reads (`OSC 52 ; c ; ?`) only reach us when the user opted into them
+    /// via `[terminal].osc52`; alacritty_terminal drops them otherwise. The
+    /// reply goes back to the tab that asked, which may not be the active one
+    /// — a background job's copy shouldn't be silently discarded.
+    fn drain_clipboard_ops(&mut self) {
+        for i in 0..self.tabs.len() {
+            for op in self.tabs[i].take_clipboard_ops() {
+                match op {
+                    ClipboardOp::Store(text) => self.set_clipboard_text(text, "OSC 52 copy"),
+                    ClipboardOp::Load(format) => {
+                        let reply = format(&self.clipboard_text().unwrap_or_default());
+                        self.tabs[i].send_input(reply.into_bytes());
+                    }
+                }
+            }
         }
     }
 
@@ -323,22 +364,15 @@ impl App {
     }
 
     fn paste(&mut self) {
-        let Some(session) = self.tabs.get(self.active_tab) else {
+        let Some(text) = self.clipboard_text() else {
             return;
-        };
-        let Some(cb) = self.clipboard.as_mut() else {
-            return;
-        };
-        let text = match cb.get_text() {
-            Ok(t) => t,
-            Err(e) => {
-                log::warn!("clipboard get_text: {e}");
-                return;
-            }
         };
         if text.is_empty() {
             return;
         }
+        let Some(session) = self.tabs.get(self.active_tab) else {
+            return;
+        };
         // CRLF → CR (terminals interpret CR as Enter) and strip embedded
         // bracketed-paste end markers (\x1b[201~) so an attacker who can
         // stage text on the clipboard can't break out of paste mode and
@@ -393,6 +427,7 @@ impl ApplicationHandler<WakeEvent> for App {
             line_height,
             self.config.font_family.clone(),
             self.config.colors.clone(),
+            self.config.cursor_thickness,
         ));
         self.window = Some(window.clone());
         self.gfx = Some(gfx);
@@ -407,9 +442,8 @@ impl ApplicationHandler<WakeEvent> for App {
             cell_w_px,
             cell_h_px,
             self.proxy.clone(),
-            self.config.colors.clone(),
+            &self.config,
             None,
-            self.config.dynamic_title,
         ) {
             Ok(s) => {
                 self.tabs.push(s);
@@ -582,6 +616,8 @@ impl ApplicationHandler<WakeEvent> for App {
                 wake = true;
             }
         }
+        // OSC 52 requests that pump surfaced need the app-level clipboard.
+        self.drain_clipboard_ops();
 
         // Reap tabs whose shell has exited. If that empties the tab list,
         // close the app.
@@ -1287,10 +1323,35 @@ impl App {
                     "text": session.selection_text(),
                 }))
             }
+            Request::Clipboard => Response::ok_data(serde_json::json!({
+                "text": self.clipboard_text(),
+            })),
+            Request::SetClipboard { text } => {
+                self.set_clipboard_text(text, "debug ipc");
+                Response::ok_empty()
+            }
+            Request::Cursor => {
+                let Some(session) = self.tabs.get(self.active_tab) else {
+                    return Response::err("no active tab");
+                };
+                let snap = session.snapshot();
+                Response::ok_data(serde_json::json!({
+                    "line": snap.cursor_line,
+                    "col": snap.cursor_col,
+                    "visible": snap.cursor_visible,
+                    "shape": snap.cursor_shape.name(),
+                }))
+            }
             Request::Theme => Response::ok_data(serde_json::json!({
                 "background": hex_color(self.config.colors.background),
                 "foreground": hex_color(self.config.colors.foreground),
                 "follow_system_theme": self.config.follow_system_theme,
+                // What the grid is actually painted with right now: the
+                // config background unless a program moved it with OSC 11.
+                "terminal_background": self
+                    .tabs
+                    .get(self.active_tab)
+                    .map(|t| hex_color(t.snapshot().bg)),
             })),
             Request::SetTheme { light } => {
                 let colors = if light {
