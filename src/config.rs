@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use alacritty_terminal::term::Osc52;
 use serde::Deserialize;
 
 use crate::binding::{self, Keybinding};
@@ -34,6 +35,12 @@ pub struct Config {
     /// window/tab title stays at its initial value. Mirrors alacritty's
     /// `[window].dynamic_title` option.
     pub dynamic_title: bool,
+    /// How much of the OSC 52 clipboard protocol programs may use. Mirrors
+    /// alacritty's `[terminal].osc52` option, including its default: writes
+    /// are allowed (that's the point of OSC 52 — copying from a remote shell
+    /// over ssh), reads are not, since a program that can read the clipboard
+    /// can exfiltrate whatever you last copied.
+    pub osc52: Osc52,
 }
 
 impl Default for Config {
@@ -55,6 +62,7 @@ impl Default for Config {
             padding_y: 6.0,
             bindings: binding::defaults(),
             dynamic_title: true,
+            osc52: Osc52::OnlyCopy,
         }
     }
 }
@@ -170,6 +178,14 @@ struct RawConfig {
     window: Option<RawWindow>,
     #[serde(default)]
     keyboard: Option<RawKeyboard>,
+    #[serde(default)]
+    terminal: Option<RawTerminal>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawTerminal {
+    #[serde(default)]
+    osc52: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -395,6 +411,17 @@ fn apply_raw(cfg: &mut Config, raw: RawConfig) {
             cfg.dynamic_title = dt;
         }
     }
+    if let Some(terminal) = raw.terminal {
+        if let Some(raw_osc52) = terminal.osc52 {
+            match parse_osc52(&raw_osc52) {
+                Some(mode) => cfg.osc52 = mode,
+                None => log::warn!(
+                    "ignoring [terminal].osc52 = {raw_osc52:?}: expected one of \
+                     Disabled, OnlyCopy, OnlyPaste, CopyPaste"
+                ),
+            }
+        }
+    }
     if let Some(colors) = raw.colors {
         // Standard alacritty `[colors]` keys customize the dark palette — that
         // preserves the historical look for users who configured a single
@@ -478,6 +505,29 @@ fn apply_raw(cfg: &mut Config, raw: RawConfig) {
         if !user.is_empty() {
             cfg.bindings = binding::merge(user, binding::defaults());
         }
+    }
+}
+
+/// Parse alacritty's `[terminal].osc52` value.
+///
+/// Alacritty documents the variants in CamelCase (`"OnlyCopy"`) but lowercases
+/// the string before deserializing it, so case never matters there; we match
+/// that and additionally tolerate `_`/`-` separators so `"only_copy"` works
+/// too. Unknown values are rejected (the caller warns) rather than silently
+/// falling back, since guessing wrong here either breaks copy or opens up
+/// clipboard reads.
+fn parse_osc52(s: &str) -> Option<Osc52> {
+    let normalized: String = s
+        .chars()
+        .filter(|c| !matches!(c, '_' | '-' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect();
+    match normalized.as_str() {
+        "disabled" => Some(Osc52::Disabled),
+        "onlycopy" => Some(Osc52::OnlyCopy),
+        "onlypaste" => Some(Osc52::OnlyPaste),
+        "copypaste" => Some(Osc52::CopyPaste),
+        _ => None,
     }
 }
 
@@ -729,6 +779,45 @@ mod tests {
         .unwrap();
         apply_raw(&mut cfg, raw);
         assert!(!cfg.follow_system_theme);
+    }
+
+    #[test]
+    fn osc52_defaults_to_copy_only() {
+        // Matches alacritty's default: programs may write the clipboard but
+        // not read it back.
+        assert_eq!(Config::default().osc52, Osc52::OnlyCopy);
+        let mut cfg = Config::default();
+        let raw: RawConfig = toml::from_str("[font]\nsize = 12.0\n").unwrap();
+        apply_raw(&mut cfg, raw);
+        assert_eq!(cfg.osc52, Osc52::OnlyCopy);
+    }
+
+    #[test]
+    fn osc52_accepts_every_documented_spelling() {
+        for (text, want) in [
+            ("Disabled", Osc52::Disabled),
+            ("OnlyCopy", Osc52::OnlyCopy),
+            ("OnlyPaste", Osc52::OnlyPaste),
+            ("CopyPaste", Osc52::CopyPaste),
+            // Alacritty lowercases before parsing, so these are equivalent.
+            ("copypaste", Osc52::CopyPaste),
+            ("COPYPASTE", Osc52::CopyPaste),
+            ("copy_paste", Osc52::CopyPaste),
+        ] {
+            let mut cfg = Config::default();
+            let raw: RawConfig =
+                toml::from_str(&format!("[terminal]\nosc52 = \"{text}\"\n")).unwrap();
+            apply_raw(&mut cfg, raw);
+            assert_eq!(cfg.osc52, want, "parsing {text:?}");
+        }
+    }
+
+    #[test]
+    fn osc52_unknown_value_keeps_the_safe_default() {
+        let mut cfg = Config::default();
+        let raw: RawConfig = toml::from_str("[terminal]\nosc52 = \"yes please\"\n").unwrap();
+        apply_raw(&mut cfg, raw);
+        assert_eq!(cfg.osc52, Osc52::OnlyCopy);
     }
 
     #[test]

@@ -64,6 +64,13 @@ pub enum Request {
     /// and return the resulting selection text. Exercises the semantic
     /// selection path without synthesizing raw mouse events.
     SelectWord { row: usize, col: usize },
+    /// Return the OS clipboard's current text (null when aterm has no
+    /// clipboard handle or the read failed). Lets tests observe the result of
+    /// an OSC 52 copy without a second X client.
+    Clipboard,
+    /// Overwrite the OS clipboard. Test back door used to seed a known value
+    /// before exercising paste / OSC 52 clipboard reads.
+    SetClipboard { text: String },
     /// Report the active theme: the resolved background/foreground colors (as
     /// `#rrggbb`) and whether aterm is following the system appearance.
     Theme,

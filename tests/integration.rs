@@ -695,3 +695,138 @@ fn answers_dsr_and_background_color_queries() {
         lines.join("\n")
     );
 }
+
+/// Write `script` to a temp file and run it under bash in the active tab.
+/// Returns the tempdir, which the caller must keep alive for the run.
+fn run_bash_script(t: &mut AtermTest, script: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("mktemp");
+    let path = dir.path().join("osc52.sh");
+    std::fs::write(&path, script).expect("write script");
+    // A script file sidesteps nested quoting through the IPC + shell, and
+    // `read -d` needs bash, so invoke it explicitly rather than via $SHELL.
+    t.type_line(&format!("bash {}", path.display()));
+    dir
+}
+
+/// `OSC 52 ; c ; <base64>` is how a program running inside the terminal —
+/// typically over ssh, where it has no access to the local clipboard —
+/// asks the terminal to copy on its behalf. tmux's `set-clipboard on`,
+/// neovim's osc52 provider and `yank` all speak it.
+#[test]
+fn osc52_copies_program_text_to_the_system_clipboard() {
+    require_display!();
+    let _clipboard = common::clipboard_guard();
+    // Empty config: aterm's defaults (copy allowed) under a config dir the
+    // developer's own alacritty.toml can't reach into.
+    let mut t = AtermTest::spawn_with_config("");
+    t.set_clipboard("clipboard-before-osc52");
+
+    let _dir = run_bash_script(
+        &mut t,
+        concat!(
+            "payload='hello from osc52 ✓'\n",
+            "printf '\\033]52;c;%s\\a' \"$(printf '%s' \"$payload\" | base64)\"\n",
+            "echo OSC52_COPY_SENT\n",
+        ),
+    );
+    t.wait_for_text("OSC52_COPY_SENT");
+    t.wait_for_clipboard("hello from osc52 ✓");
+}
+
+/// The selection byte `p` (primary) has nowhere else to go on a terminal with
+/// a single clipboard, so it lands there too rather than being dropped.
+#[test]
+fn osc52_primary_selection_target_also_reaches_the_clipboard() {
+    require_display!();
+    let _clipboard = common::clipboard_guard();
+    let mut t = AtermTest::spawn_with_config("");
+    t.set_clipboard("clipboard-before-osc52");
+
+    let _dir = run_bash_script(
+        &mut t,
+        concat!(
+            "printf '\\033]52;p;%s\\a' \"$(printf '%s' 'primary-target' | base64)\"\n",
+            "echo OSC52_COPY_SENT\n",
+        ),
+    );
+    t.wait_for_text("OSC52_COPY_SENT");
+    t.wait_for_clipboard("primary-target");
+}
+
+/// `[terminal].osc52 = "Disabled"` turns the whole protocol off, for users who
+/// don't want a remote program touching their clipboard at all.
+#[test]
+fn osc52_copy_can_be_disabled_by_config() {
+    require_display!();
+    let _clipboard = common::clipboard_guard();
+    let mut t = AtermTest::spawn_with_config("[terminal]\nosc52 = \"Disabled\"\n");
+    t.set_clipboard("clipboard-before-osc52");
+
+    let _dir = run_bash_script(
+        &mut t,
+        concat!(
+            "printf '\\033]52;c;%s\\a' \"$(printf '%s' 'should-not-copy' | base64)\"\n",
+            "echo OSC52_COPY_SENT\n",
+        ),
+    );
+    t.wait_for_text("OSC52_COPY_SENT");
+    // The sequence has been parsed by the time the following echo renders;
+    // the short grace period covers the clipboard write that a regression
+    // would queue behind it.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(
+        t.clipboard().as_deref(),
+        Some("clipboard-before-osc52"),
+        "OSC 52 copy should be ignored when the config disables it"
+    );
+}
+
+/// `OSC 52 ; c ; ?` asks the terminal to hand the clipboard's contents *back*
+/// to the program. Run the query and report what (if anything) came back.
+fn osc52_query_reply(t: &mut AtermTest) -> String {
+    let _dir = run_bash_script(
+        t,
+        concat!(
+            "printf '\\033]52;c;?\\a'\n",
+            // BEL terminator in the query means the reply is BEL-terminated,
+            // so `read -d` can stop on it. -t bounds the wait for the case
+            // where the terminal (correctly) never answers.
+            "IFS= read -r -s -t 3 -d $'\\a' reply\n",
+            "printf 'osc52=<%s>\\n' \"$(printf '%s' \"${reply#*;c;}\" | base64 -d 2>/dev/null)\"\n",
+        ),
+    );
+    t.wait_for_text_within("osc52=<", std::time::Duration::from_secs(10));
+    let lines = t.snapshot_text();
+    let reply = lines
+        .iter()
+        .find_map(|l| l.split_once("osc52=<").map(|(_, rest)| rest))
+        .unwrap_or_else(|| panic!("no osc52 line in:\n{}", lines.join("\n")));
+    reply.split('>').next().unwrap_or("").to_string()
+}
+
+/// Reads are denied out of the box (alacritty's default, and the reason the
+/// default isn't simply "on"): a program that can read the clipboard can
+/// exfiltrate whatever you last copied, which OSC 52's copy direction gains
+/// nothing from.
+#[test]
+fn osc52_clipboard_read_is_denied_by_default() {
+    require_display!();
+    let _clipboard = common::clipboard_guard();
+    let mut t = AtermTest::spawn_with_config("");
+    t.set_clipboard("secret-clip-42");
+    assert_eq!(
+        osc52_query_reply(&mut t),
+        "",
+        "the terminal should not answer an OSC 52 clipboard query by default"
+    );
+}
+
+/// ...but a user who opts in with `CopyPaste` gets the reply.
+#[test]
+fn osc52_clipboard_read_works_when_configured() {
+    require_display!();
+    let _clipboard = common::clipboard_guard();
+    let mut t = AtermTest::spawn_with_config("[terminal]\nosc52 = \"CopyPaste\"\n");
+    t.set_clipboard("secret-clip-42");
+    assert_eq!(osc52_query_reply(&mut t), "secret-clip-42");
+}

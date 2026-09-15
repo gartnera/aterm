@@ -32,6 +32,7 @@ The `AtermTest` helper in `tests/common/mod.rs` exposes:
 | Method | Purpose |
 |---|---|
 | `spawn()` | start aterm with its own debug socket; waits for the first shell prompt |
+| `spawn_with_config(toml)` | same, but with `toml` as the alacritty config in a throwaway `$XDG_CONFIG_HOME` (pass `""` for isolated defaults) |
 | `snapshot_text()` | grid contents as `Vec<String>` (one per row, trailing whitespace trimmed) |
 | `tabs()` | `Vec<TabInfo>` with `{index, title, active}` |
 | `title()` | OS window title |
@@ -40,6 +41,8 @@ The `AtermTest` helper in `tests/common/mod.rs` exposes:
 | `font_size(delta)` / `font_size_reset()` | adjust + reset, returns the new size |
 | `hover_url(row, col, ctrl)` | probe URL detection, returns `Option<String>` |
 | `row_layout(row)` | `Vec<GlyphPos>` with `{col, x, w, overlay}` in cell units — assert `x == col` to prove a row didn't drift |
+| `clipboard()` / `set_clipboard(text)` | read/write the OS clipboard through aterm (the handle OSC 52 writes to) |
+| `wait_for_clipboard(want)` | poll the clipboard up to 5s, panic with what it actually held |
 | `wait_for_text(needle)` | poll the grid up to 5s, panic with the grid if it never appears |
 | `wait_for_text_within(needle, dur)` | same with a caller-supplied deadline |
 | `screenshot(label)` | save a PNG to `$ATERM_TEST_ARTIFACTS/` for happy-path captures |
@@ -47,6 +50,11 @@ The `AtermTest` helper in `tests/common/mod.rs` exposes:
 
 Prefer `wait_for_text` over `thread::sleep` — it polls every 50ms and on
 timeout panics with the visible grid embedded in the message.
+
+Tests that touch the clipboard must take `common::clipboard_guard()` first
+and hold it for the whole test. The X clipboard is one global resource shared
+by every aterm the suite spawns, so without the guard two such tests running
+in parallel clobber each other's value.
 
 ## Running the tests
 
@@ -139,6 +147,8 @@ single-line JSON response per request:
 | `font_size` | `delta: f32` | `{font_size}` |
 | `font_size_reset` | – | `{font_size}` |
 | `hover_url` | `row, col, ctrl` | `{uri, spans}` or `null` |
+| `clipboard` | – | `{text}` (null if aterm has no clipboard handle) |
+| `set_clipboard` | `text: String` | – |
 | `row_layout` | `row` | `{glyphs: [{col, x, w, overlay}]}` — glyph placement in cell units, after a forced render |
 
 ## Ad-hoc poking from the shell

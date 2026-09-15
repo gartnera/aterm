@@ -14,8 +14,8 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::{point_to_viewport, viewport_to_point, TermMode};
+use alacritty_terminal::term::{Config as TermConfig, Osc52};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use alacritty_terminal::Term;
@@ -488,6 +488,26 @@ fn match_to_spans(
     spans
 }
 
+/// A clipboard request a program made through OSC 52, handed up to the app
+/// layer because the OS clipboard handle lives there (one per window, not one
+/// per tab).
+///
+/// aterm has a single clipboard, so both selections OSC 52 can name — `c`
+/// (clipboard) and `p`/`s` (primary selection) — map onto it. That mirrors
+/// macOS, where there is no primary selection either, and beats dropping a
+/// `p` request on the floor: a program that asked for *a* clipboard gets the
+/// only one aterm has.
+pub enum ClipboardOp {
+    /// `OSC 52 ; c ; <base64>` — store this text on the system clipboard.
+    /// Already base64-decoded and UTF-8 validated by alacritty_terminal.
+    Store(String),
+    /// `OSC 52 ; c ; ?` — the program wants the clipboard's contents. The
+    /// payload formats the reply escape sequence, which the caller writes
+    /// back to the PTY. Only produced when the config allows clipboard reads
+    /// (see [`crate::config::Config::osc52`]).
+    Load(Arc<dyn Fn(&str) -> String + Sync + Send>),
+}
+
 impl EventListener for ChannelListener {
     fn send_event(&self, event: TermEvent) {
         let _ = self.tx.send(event);
@@ -511,6 +531,10 @@ pub struct TerminalSession {
     /// When false, OSC 0/1/2 title-change requests from the running program
     /// are ignored — the tab keeps its initial title.
     dynamic_title: bool,
+    /// OSC 52 clipboard requests parsed since the last drain. Queued here
+    /// rather than handled inline because the OS clipboard handle lives in
+    /// the app layer; see [`take_clipboard_ops`](Self::take_clipboard_ops).
+    clipboard_ops: Vec<ClipboardOp>,
     /// PID of the shell process spawned for this tab. Used to resolve the
     /// shell's current working directory when the user opens a new tab so
     /// it inherits the cd'd-to location.
@@ -533,6 +557,7 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         cols: u16,
         lines: u16,
@@ -542,6 +567,7 @@ impl TerminalSession {
         palette: ConfigColors,
         working_directory: Option<std::path::PathBuf>,
         dynamic_title: bool,
+        osc52: Osc52,
     ) -> std::io::Result<Self> {
         let window_size = WindowSize {
             num_lines: lines,
@@ -626,7 +652,13 @@ impl TerminalSession {
             proxy,
         };
 
-        let term_config = TermConfig::default();
+        // Everything else stays at alacritty's defaults; `osc52` is the one
+        // knob aterm exposes, since it decides whether a remote program can
+        // reach the local clipboard.
+        let term_config = TermConfig {
+            osc52,
+            ..TermConfig::default()
+        };
         let term = Term::new(term_config, &term_size, listener.clone());
         let term = Arc::new(FairMutex::new(term));
 
@@ -652,6 +684,7 @@ impl TerminalSession {
             exited: false,
             palette,
             dynamic_title,
+            clipboard_ops: Vec::new(),
             shell_pid: Some(shell_pid),
             #[cfg(unix)]
             tty_fd,
@@ -1095,6 +1128,14 @@ impl TerminalSession {
         })
     }
 
+    /// Take the OSC 52 clipboard requests collected by
+    /// [`pump_events`](Self::pump_events). The app drains these after every
+    /// pump: it owns the OS clipboard handle, and a `Load` reply has to be
+    /// written back to this session's PTY.
+    pub fn take_clipboard_ops(&mut self) -> Vec<ClipboardOp> {
+        std::mem::take(&mut self.clipboard_ops)
+    }
+
     /// Drain any pending alacritty events. Returns whether a redraw is needed.
     ///
     /// Besides bookkeeping (title, exit), this is where terminal *queries*
@@ -1102,7 +1143,9 @@ impl TerminalSession {
     /// position report), `CSI c` (device attributes), `CSI ? u` (kitty
     /// keyboard flags), `OSC 11 ; ?` (background colour) and friends, but it
     /// only hands us the reply text — writing it back to the PTY is the
-    /// embedder's job. Programs that probe the terminal at startup (neovim
+    /// embedder's job. Same for OSC 52 clipboard requests, which are queued
+    /// for the app layer (see
+    /// [`take_clipboard_ops`](Self::take_clipboard_ops)). Programs that probe the terminal at startup (neovim
     /// sends DA1, OSC 11 and DSR 6, then waits for the DSR reply as a
     /// sentinel) hang on a timeout and complain — "did not detect DSR
     /// response from terminal" — if these are dropped.
@@ -1133,6 +1176,16 @@ impl TerminalSession {
                         cell_height: self.cell_height,
                     };
                     self.send_input(format(size).into_bytes());
+                }
+                // OSC 52. alacritty_terminal has already enforced the
+                // configured policy (and decoded/validated the payload) by
+                // the time either of these is emitted, so anything arriving
+                // here is allowed to proceed.
+                TermEvent::ClipboardStore(_, text) => {
+                    self.clipboard_ops.push(ClipboardOp::Store(text))
+                }
+                TermEvent::ClipboardLoad(_, format) => {
+                    self.clipboard_ops.push(ClipboardOp::Load(format))
                 }
                 TermEvent::Wakeup => wake = true,
                 TermEvent::Exit | TermEvent::ChildExit(_) => {
