@@ -473,6 +473,61 @@ impl AtermTest {
         }
     }
 
+    /// The cursor's `{shape, line, col, visible}` as reported by aterm.
+    pub fn cursor(&mut self) -> CursorInfo {
+        let data = self.request(json!({ "cmd": "cursor" }));
+        CursorInfo {
+            shape: data["shape"].as_str().unwrap_or("").to_string(),
+            line: data["line"].as_u64().unwrap_or(0) as usize,
+            col: data["col"].as_u64().unwrap_or(0) as usize,
+            visible: data["visible"].as_bool().unwrap_or(false),
+        }
+    }
+
+    /// Poll until the cursor's shape is `want`, or panic with what it is.
+    /// A shape change arrives through the PTY, so it lands asynchronously.
+    #[track_caller]
+    pub fn wait_for_cursor_shape(&mut self, want: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = self.cursor();
+            if got.shape == want {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!("cursor shape never became {want:?}; last was {got:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The background the grid is currently painted with, as `#rrggbb`. This
+    /// tracks OSC 11 / OSC 4 overrides, unlike `theme_background`, which
+    /// reports what the config resolved to.
+    pub fn terminal_background(&mut self) -> String {
+        let data = self.request(json!({ "cmd": "theme" }));
+        data.get("terminal_background")
+            .and_then(Value::as_str)
+            .expect("terminal_background")
+            .to_string()
+    }
+
+    /// Poll until the rendered background is `want` (`#rrggbb`).
+    #[track_caller]
+    pub fn wait_for_terminal_background(&mut self, want: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = self.terminal_background();
+            if got == want {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!("terminal background never became {want}; last was {got}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Return the active theme's background color as `#rrggbb`.
     pub fn theme_background(&mut self) -> String {
         let data = self.request(json!({ "cmd": "theme" }));
@@ -634,6 +689,15 @@ impl Drop for AtermTest {
             let _ = std::fs::remove_dir_all(parent);
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct CursorInfo {
+    /// `block`, `hollow_block`, `beam` or `underline`.
+    pub shape: String,
+    pub line: usize,
+    pub col: usize,
+    pub visible: bool,
 }
 
 #[derive(Debug, Clone)]

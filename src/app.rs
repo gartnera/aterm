@@ -191,10 +191,8 @@ impl App {
             cell_w_px,
             cell_h_px,
             self.proxy.clone(),
-            self.config.colors.clone(),
+            &self.config,
             cwd,
-            self.config.dynamic_title,
-            self.config.osc52,
         ) {
             Ok(s) => {
                 let idx = (self.active_tab + 1).min(self.tabs.len());
@@ -429,6 +427,7 @@ impl ApplicationHandler<WakeEvent> for App {
             line_height,
             self.config.font_family.clone(),
             self.config.colors.clone(),
+            self.config.cursor_thickness,
         ));
         self.window = Some(window.clone());
         self.gfx = Some(gfx);
@@ -443,10 +442,8 @@ impl ApplicationHandler<WakeEvent> for App {
             cell_w_px,
             cell_h_px,
             self.proxy.clone(),
-            self.config.colors.clone(),
+            &self.config,
             None,
-            self.config.dynamic_title,
-            self.config.osc52,
         ) {
             Ok(s) => {
                 self.tabs.push(s);
@@ -1333,10 +1330,28 @@ impl App {
                 self.set_clipboard_text(text, "debug ipc");
                 Response::ok_empty()
             }
+            Request::Cursor => {
+                let Some(session) = self.tabs.get(self.active_tab) else {
+                    return Response::err("no active tab");
+                };
+                let snap = session.snapshot();
+                Response::ok_data(serde_json::json!({
+                    "line": snap.cursor_line,
+                    "col": snap.cursor_col,
+                    "visible": snap.cursor_visible,
+                    "shape": snap.cursor_shape.name(),
+                }))
+            }
             Request::Theme => Response::ok_data(serde_json::json!({
                 "background": hex_color(self.config.colors.background),
                 "foreground": hex_color(self.config.colors.foreground),
                 "follow_system_theme": self.config.follow_system_theme,
+                // What the grid is actually painted with right now: the
+                // config background unless a program moved it with OSC 11.
+                "terminal_background": self
+                    .tabs
+                    .get(self.active_tab)
+                    .map(|t| hex_color(t.snapshot().bg)),
             })),
             Request::SetTheme { light } => {
                 let colors = if light {

@@ -5,7 +5,7 @@ use alacritty_terminal::event_loop::{EventLoop as PtyLoop, Msg, Notifier};
 
 use winit::event_loop::EventLoopProxy;
 
-use crate::config::Colors as ConfigColors;
+use crate::config::{Colors as ConfigColors, Config};
 use crate::WakeEvent;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
@@ -14,10 +14,12 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::term::{point_to_viewport, viewport_to_point, TermMode};
-use alacritty_terminal::term::{Config as TermConfig, Osc52};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
+use alacritty_terminal::vte::ansi::{
+    Color as AnsiColor, CursorShape, CursorStyle, NamedColor, Rgb,
+};
 use alacritty_terminal::Term;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
@@ -46,6 +48,10 @@ pub struct GridSnapshot {
     pub cursor_line: usize,
     pub cursor_col: usize,
     pub cursor_visible: bool,
+    /// Shape the program asked for via `OSC 50 ; CursorShape=n` or DECSCUSR
+    /// (`CSI n SP q`), falling back to the configured default. `Hidden` is
+    /// folded into `cursor_visible` instead of appearing here.
+    pub cursor_shape: CursorShapeView,
     pub fg: [u8; 3],
     /// Terminal's default background — cells with this bg are not drawn so
     /// they fall through to the surface clear color.
@@ -54,6 +60,49 @@ pub struct GridSnapshot {
     /// inclusive. For non-block selections, rows between start.line and
     /// end.line are fully selected across their entire width.
     pub selection: Option<SelectionView>,
+}
+
+/// The cursor shapes aterm draws. A narrower version of alacritty's
+/// [`CursorShape`] — `Hidden` lives in `GridSnapshot::cursor_visible`, so the
+/// renderer never has to consider a shape that draws nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorShapeView {
+    /// Filled block covering the whole cell; the glyph under it is inverted.
+    #[default]
+    Block,
+    /// Outline of the cell, leaving the glyph visible.
+    HollowBlock,
+    /// Vertical bar at the cell's left edge (vim insert mode, `CSI 6 q`).
+    Beam,
+    /// Horizontal bar along the cell's bottom edge (`CSI 4 q`).
+    Underline,
+}
+
+impl CursorShapeView {
+    /// Stable lowercase name, used by the debug IPC so tests can assert on
+    /// the shape a program asked for.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::HollowBlock => "hollow_block",
+            Self::Beam => "beam",
+            Self::Underline => "underline",
+        }
+    }
+}
+
+impl GridSnapshot {
+    /// The column a *filled block* cursor covers on `row`, if any.
+    ///
+    /// Only the block shape hides the cell underneath, so it alone suppresses
+    /// the cell's own background and inverts the glyph drawn there. A beam or
+    /// underline sits beside the glyph and must leave both alone.
+    pub fn block_cursor_col(&self, row: usize) -> Option<usize> {
+        (self.cursor_visible
+            && self.cursor_line == row
+            && self.cursor_shape == CursorShapeView::Block)
+            .then_some(self.cursor_col)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -557,17 +606,14 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         cols: u16,
         lines: u16,
         cell_width: u16,
         cell_height: u16,
         proxy: EventLoopProxy<WakeEvent>,
-        palette: ConfigColors,
+        config: &Config,
         working_directory: Option<std::path::PathBuf>,
-        dynamic_title: bool,
-        osc52: Osc52,
     ) -> std::io::Result<Self> {
         let window_size = WindowSize {
             num_lines: lines,
@@ -652,11 +698,16 @@ impl TerminalSession {
             proxy,
         };
 
-        // Everything else stays at alacritty's defaults; `osc52` is the one
-        // knob aterm exposes, since it decides whether a remote program can
-        // reach the local clipboard.
+        // Everything else stays at alacritty's defaults. `osc52` decides
+        // whether a program can reach the local clipboard; the cursor style is
+        // what a program's DECSCUSR / OSC 50 reset (`CSI 0 SP q`) falls back
+        // to, so it has to be the user's configured shape, not alacritty's.
         let term_config = TermConfig {
-            osc52,
+            osc52: config.osc52,
+            default_cursor_style: CursorStyle {
+                shape: config.cursor_shape,
+                blinking: false,
+            },
             ..TermConfig::default()
         };
         let term = Term::new(term_config, &term_size, listener.clone());
@@ -682,8 +733,8 @@ impl TerminalSession {
             cell_width,
             cell_height,
             exited: false,
-            palette,
-            dynamic_title,
+            palette: config.colors.clone(),
+            dynamic_title: config.dynamic_title,
             clipboard_ops: Vec::new(),
             shell_pid: Some(shell_pid),
             #[cfg(unix)]
@@ -1023,6 +1074,13 @@ impl TerminalSession {
         let lines = term.screen_lines();
         let cursor_point = content.cursor.point;
         out.cursor_visible = !matches!(content.cursor.shape, CursorShape::Hidden);
+        out.cursor_shape = match content.cursor.shape {
+            CursorShape::Beam => CursorShapeView::Beam,
+            CursorShape::Underline => CursorShapeView::Underline,
+            CursorShape::HollowBlock => CursorShapeView::HollowBlock,
+            // Hidden never reaches the renderer (cursor_visible is false).
+            CursorShape::Block | CursorShape::Hidden => CursorShapeView::Block,
+        };
         out.selection = content.selection.and_then(|range| {
             // Convert to viewport coordinates and clamp to the visible grid so
             // selections that extend into scrollback off-screen render as a

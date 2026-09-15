@@ -830,3 +830,160 @@ fn osc52_clipboard_read_works_when_configured() {
     t.set_clipboard("secret-clip-42");
     assert_eq!(osc52_query_reply(&mut t), "secret-clip-42");
 }
+
+/// DECSCUSR (`CSI n SP q`) is how vim, fish and zsh's vi-mode switch the
+/// cursor between a block and a bar. `n` pairs a shape with a blink state;
+/// aterm doesn't blink, so 5/6 land on the same beam as 4/3's underline.
+#[test]
+fn cursor_shape_follows_decscusr() {
+    require_display!();
+    let mut t = AtermTest::spawn_with_config("");
+    assert_eq!(t.cursor().shape, "block", "default shape");
+
+    for (param, want) in [
+        ("6", "beam"),
+        ("5", "beam"),
+        ("4", "underline"),
+        ("3", "underline"),
+        ("2", "block"),
+        // 0 means "reset to the terminal's configured default".
+        ("0", "block"),
+    ] {
+        t.type_line(&format!("printf '\\033[{param} q'"));
+        t.wait_for_cursor_shape(want);
+    }
+}
+
+/// `OSC 50 ; CursorShape=n` is the same request in OSC form (Konsole's, also
+/// emitted by some tmux configs and by `zsh-vi-mode`).
+#[test]
+fn cursor_shape_follows_osc_50() {
+    require_display!();
+    let mut t = AtermTest::spawn_with_config("");
+
+    for (shape, want) in [("1", "beam"), ("2", "underline"), ("0", "block")] {
+        t.type_line(&format!("printf '\\033]50;CursorShape={shape}\\a'"));
+        t.wait_for_cursor_shape(want);
+    }
+}
+
+/// `[cursor].style` picks the shape aterm starts with — and the one a
+/// program's `CSI 0 SP q` reset returns to, which is the whole reason it has
+/// to reach alacritty_terminal's config rather than just the renderer.
+#[test]
+fn cursor_shape_default_comes_from_config() {
+    require_display!();
+    let mut t = AtermTest::spawn_with_config("[cursor]\nstyle = \"Beam\"\n");
+    assert_eq!(t.cursor().shape, "beam", "configured default shape");
+
+    t.type_line("printf '\\033[2 q'");
+    t.wait_for_cursor_shape("block");
+    t.type_line("printf '\\033[0 q'");
+    t.wait_for_cursor_shape("beam");
+}
+
+/// DECTCEM (`CSI ? 25 l/h`) hides and shows the cursor — every full-screen
+/// program does this while repainting.
+#[test]
+fn cursor_visibility_follows_dectcem() {
+    require_display!();
+    let mut t = AtermTest::spawn_with_config("");
+    assert!(t.cursor().visible, "cursor starts visible");
+
+    t.type_line("printf '\\033[?25l'");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while t.cursor().visible {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cursor never hid after DECTCEM reset"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    t.type_line("printf '\\033[?25h'");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !t.cursor().visible {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cursor never came back after DECTCEM set"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// `OSC 11` repoints the background; `OSC 111` puts it back. The reported
+/// value is what the grid — and the padding around it — is painted with.
+#[test]
+fn osc11_changes_the_rendered_background() {
+    require_display!();
+    let mut t = AtermTest::spawn_with_config("[colors.primary]\nbackground = \"#101010\"\n");
+    assert_eq!(t.terminal_background(), "#101010");
+
+    t.type_line("printf '\\033]11;#3a1f5d\\a'");
+    t.wait_for_terminal_background("#3a1f5d");
+
+    t.type_line("printf '\\033]111\\a'");
+    t.wait_for_terminal_background("#101010");
+}
+
+/// `OSC 4` repoints a palette slot, and `OSC 104` resets it. Slot 1 (red) is
+/// what `\033[31m` text renders with.
+#[test]
+fn osc4_repoints_a_palette_slot() {
+    require_display!();
+    let mut t = AtermTest::spawn_with_config("[colors.normal]\nred = \"#aa0000\"\n");
+
+    // Ask the terminal what slot 1 is, before and after changing it: the
+    // reply is generated from the same table the renderer reads.
+    assert_eq!(query_color(&mut t, "4;1"), "#aa0000");
+    t.type_line("printf '\\033]4;1;#00cc44\\a'");
+    wait_for_color(&mut t, "4;1", "#00cc44");
+    t.type_line("printf '\\033]104;1\\a'");
+    wait_for_color(&mut t, "4;1", "#aa0000");
+}
+
+/// Ask the terminal for a color with `OSC <spec> ; ?` and return the reply as
+/// `#rrggbb`. `spec` is e.g. `"4;1"` for palette slot 1 or `"11"` for the
+/// background.
+fn query_color(t: &mut AtermTest, spec: &str) -> String {
+    let dir = tempfile::tempdir().expect("mktemp");
+    let path = dir.path().join("query.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "printf '\\033]{spec};?\\a'\n\
+             IFS= read -r -s -t 3 -d $'\\a' reply\n\
+             printf 'color=<%s>\\n' \"${{reply#*;rgb:}}\"\n"
+        ),
+    )
+    .expect("write query script");
+    t.type_line(&format!("bash {}", path.display()));
+    t.wait_for_text_within("color=<", std::time::Duration::from_secs(10));
+    let lines = t.snapshot_text();
+    let raw = lines
+        .iter()
+        .rev()
+        .find_map(|l| l.split_once("color=<").map(|(_, rest)| rest))
+        .unwrap_or_else(|| panic!("no color line in:\n{}", lines.join("\n")));
+    let raw = raw.split('>').next().unwrap_or("");
+    // xterm replies with 16 bits per channel (`rgb:aaaa/0000/0000`); take the
+    // high byte of each so the test can compare against the config's #rrggbb.
+    let parts: Vec<&str> = raw.split('/').collect();
+    assert_eq!(parts.len(), 3, "malformed color reply {raw:?}");
+    format!("#{}{}{}", &parts[0][..2], &parts[1][..2], &parts[2][..2])
+}
+
+fn wait_for_color(t: &mut AtermTest, spec: &str, want: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let got = query_color(t, spec);
+        if got == want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "color {spec} never became {want}; last was {got}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}

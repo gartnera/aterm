@@ -41,6 +41,9 @@ The `AtermTest` helper in `tests/common/mod.rs` exposes:
 | `font_size(delta)` / `font_size_reset()` | adjust + reset, returns the new size |
 | `hover_url(row, col, ctrl)` | probe URL detection, returns `Option<String>` |
 | `row_layout(row)` | `Vec<GlyphPos>` with `{col, x, w, overlay}` in cell units — assert `x == col` to prove a row didn't drift |
+| `cursor()` | `CursorInfo { shape, line, col, visible }` for the active tab |
+| `wait_for_cursor_shape(shape)` | poll until the cursor shape matches, panic with what it was |
+| `terminal_background()` / `wait_for_terminal_background(hex)` | the background the grid is painted with, tracking OSC 11 / OSC 4 |
 | `clipboard()` / `set_clipboard(text)` | read/write the OS clipboard through aterm (the handle OSC 52 writes to) |
 | `wait_for_clipboard(want)` | poll the clipboard up to 5s, panic with what it actually held |
 | `wait_for_text(needle)` | poll the grid up to 5s, panic with the grid if it never appears |
@@ -147,6 +150,7 @@ single-line JSON response per request:
 | `font_size` | `delta: f32` | `{font_size}` |
 | `font_size_reset` | – | `{font_size}` |
 | `hover_url` | `row, col, ctrl` | `{uri, spans}` or `null` |
+| `cursor` | – | `{shape, line, col, visible}` |
 | `clipboard` | – | `{text}` (null if aterm has no clipboard handle) |
 | `set_clipboard` | `text: String` | – |
 | `row_layout` | `row` | `{glyphs: [{col, x, w, overlay}]}` — glyph placement in cell units, after a forced render |
