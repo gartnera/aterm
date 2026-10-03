@@ -24,21 +24,55 @@ struct TabBarTheme {
     accent: [f32; 4],
     /// Text color for the active tab (sRGB; glyphon uses sRGB).
     active_fg: [u8; 3],
-    /// Text color for inactive tabs.
+    /// Text color for inactive tabs: the foreground dimmed toward the
+    /// inactive pill, but never below `INACTIVE_TAB_MIN_CONTRAST`.
     inactive_fg: [u8; 3],
 }
 
+/// WCAG AA contrast for normal text. Inactive tab labels are dimmed to read
+/// as secondary, but no further than this against their pill.
+const INACTIVE_TAB_MIN_CONTRAST: f64 = 4.5;
+
 impl TabBarTheme {
     fn derive(colors: &ConfigColors) -> Self {
+        let inactive_bg = darken(colors.background, 0.82);
         Self {
             bar_bg: linear_rgba(darken(colors.background, 0.55)),
             active_bg: linear_rgba(colors.background),
-            inactive_bg: linear_rgba(darken(colors.background, 0.82)),
+            inactive_bg: linear_rgba(inactive_bg),
             accent: linear_rgba(colors.bright.blue),
             active_fg: colors.foreground,
-            inactive_fg: colors.bright.black,
+            inactive_fg: dimmed_text(colors.foreground, inactive_bg, INACTIVE_TAB_MIN_CONTRAST),
         }
     }
+}
+
+/// Fade `fg` toward `bg` as far as possible (up to halfway) while keeping at
+/// least `min_contrast` against `bg`. Deriving this from the foreground rather
+/// than a palette slot like bright black keeps it legible on light schemes,
+/// where bright black is a pale gray that all but vanishes on a gray pill.
+fn dimmed_text(fg: [u8; 3], bg: [u8; 3], min_contrast: f64) -> [u8; 3] {
+    const MAX_FADE: f32 = 0.5;
+    const STEPS: u8 = 20;
+    (0..=STEPS)
+        .rev()
+        .map(|i| mix(fg, bg, MAX_FADE * i as f32 / STEPS as f32))
+        .find(|&c| contrast_ratio(c, bg) >= min_contrast)
+        .unwrap_or(fg)
+}
+
+fn mix(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    std::array::from_fn(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8)
+}
+
+fn relative_luminance([r, g, b]: [u8; 3]) -> f64 {
+    0.2126 * srgb_to_linear(r) + 0.7152 * srgb_to_linear(g) + 0.0722 * srgb_to_linear(b)
+}
+
+/// WCAG 2 contrast ratio between two sRGB colors, in `1.0..=21.0`.
+fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f64 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 fn darken([r, g, b]: [u8; 3], factor: f32) -> [u8; 3] {
@@ -1588,6 +1622,26 @@ impl Gfx {
 mod tests {
     use super::*;
     use crate::terminal::{GridSnapshot, SelectionView, SnapCell};
+
+    #[test]
+    fn inactive_tab_text_is_legible_in_both_default_schemes() {
+        for colors in [ConfigColors::default_dark(), ConfigColors::default_light()] {
+            let pill = darken(colors.background, 0.82);
+            let theme = TabBarTheme::derive(&colors);
+            let ratio = contrast_ratio(theme.inactive_fg, pill);
+            assert!(
+                ratio >= INACTIVE_TAB_MIN_CONTRAST,
+                "{ratio:.2} for {colors:?}"
+            );
+            // Still dimmer than the active label, so the active tab stands out.
+            assert!(ratio < contrast_ratio(colors.foreground, pill));
+        }
+    }
+
+    #[test]
+    fn dimmed_text_keeps_fg_when_contrast_is_already_low() {
+        assert_eq!(dimmed_text([0x80; 3], [0x70; 3], 4.5), [0x80; 3]);
+    }
 
     #[test]
     fn compact_keeps_short_strings_intact() {
