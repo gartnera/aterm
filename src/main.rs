@@ -16,6 +16,7 @@ mod gfx;
 mod input;
 mod quad;
 mod terminal;
+mod theme_mode;
 
 use app::App;
 

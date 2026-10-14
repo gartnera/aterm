@@ -1,6 +1,6 @@
 [package]
 name = "aterm"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 rust-version = "1.85"
 description = "A minimal tabbed terminal built on alacritty_terminal, winit, and wgpu."
@@ -30,6 +30,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
 arboard = "3"
+# Only for the poller types in alacritty_terminal's `EventedReadWrite` trait,
+# which `theme_mode::FilteredPty` implements. Keep in step with alacritty.
+polling = "3"
 
 [target.'cfg(unix)'.dependencies]
 # tcgetpgrp() for foreground-process detection (both Linux and macOS).

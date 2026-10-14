@@ -65,6 +65,18 @@ aterm has a single clipboard, so a sequence addressed to the primary
 selection (`p`/`s` instead of `c`) lands on that same clipboard rather than
 being dropped.
 
+### Light/dark reporting (mode 2031)
+
+Programs can ask whether the terminal is using a dark or light scheme with
+`CSI ? 996 n`. They can also set DEC private mode 2031 (`CSI ? 2031 h`) to
+be told when it changes. This is
+[contour's extension](https://contour-terminal.org/vt-extensions/color-palette-update-notifications/),
+and neovim 0.11+ uses it to switch `'background'` when the OS appearance
+flips. The reply and the notification are both `CSI ? 997 ; 1 n` (dark) or
+`CSI ? 997 ; 2 n` (light). Dark or light is judged from the active palette's
+background, so a single light scheme is reported as light even when aterm
+isn't following the system theme.
+
 ### Cursor
 
 The cursor is a block by default and follows what the running program asks

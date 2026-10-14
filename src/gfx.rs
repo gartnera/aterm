@@ -65,7 +65,7 @@ fn mix(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     std::array::from_fn(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8)
 }
 
-fn relative_luminance([r, g, b]: [u8; 3]) -> f64 {
+pub(crate) fn relative_luminance([r, g, b]: [u8; 3]) -> f64 {
     0.2126 * srgb_to_linear(r) + 0.7152 * srgb_to_linear(g) + 0.0722 * srgb_to_linear(b)
 }
 

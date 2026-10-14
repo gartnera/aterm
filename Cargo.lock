@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "aterm"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "alacritty_terminal",
  "arboard",
@@ -222,6 +222,7 @@ dependencies = [
  "libc",
  "log",
  "parking_lot",
+ "polling",
  "pollster",
  "serde",
  "serde_json",
