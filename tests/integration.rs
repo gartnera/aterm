@@ -696,6 +696,67 @@ fn answers_dsr_and_background_color_queries() {
     );
 }
 
+/// Color-scheme reporting (contour's extension, used by neovim 0.11+ to keep
+/// `'background'` in sync with the OS): `CSI ? 996 n` asks dark-or-light,
+/// DECRQM `?2031` says whether update notifications are on, and with mode
+/// 2031 set a palette swap is announced unprompted as `CSI ? 997 ; 1|2 n`.
+#[test]
+#[cfg(unix)]
+fn reports_color_scheme_and_mode_2031_updates() {
+    require_display!();
+    let mut t = AtermTest::spawn();
+    t.set_theme(false);
+
+    // `read -d` stops on each reply's final byte (`n` for the scheme report,
+    // `y` for DECRPM); `${r#*[}` drops the leading ESC [ so the rest prints.
+    let _dir = run_bash_script(
+        &mut t,
+        concat!(
+            "printf '\\033[?996n'; IFS= read -r -s -t 3 -d n r\n",
+            "printf 'scheme=<%s>\\n' \"${r#*[}\"\n",
+            "printf '\\033[?2031$p'; IFS= read -r -s -t 3 -d y r\n",
+            "printf 'before=<%s>\\n' \"${r#*[}\"\n",
+            "printf '\\033[?2031h\\033[?2031$p'; IFS= read -r -s -t 3 -d y r\n",
+            "printf 'after=<%s>\\n' \"${r#*[}\"\n",
+            "printf 'waiting\\n'\n",
+            "IFS= read -r -s -t 10 -d n r\n",
+            "printf 'notify=<%s>\\n' \"${r#*[}\"\n",
+            "printf '\\033[?2031l\\033[?2031$p'; IFS= read -r -s -t 3 -d y r\n",
+            "printf 'off=<%s>\\n' \"${r#*[}\"\n",
+            "printf '\\033[?996n'; IFS= read -r -s -t 3 -d n r\n",
+            "printf 'scheme2=<%s>\\n' \"${r#*[}\"\n",
+        ),
+    );
+    t.wait_for_text("waiting");
+    t.set_theme(true);
+    t.wait_for_text("scheme2=<");
+
+    let lines = t.snapshot_text();
+    let field = |name: &str| -> String {
+        let tag = format!("{name}=<");
+        lines
+            .iter()
+            .find_map(|l| l.split_once(tag.as_str()).map(|(_, rest)| rest))
+            .and_then(|rest| rest.split('>').next())
+            .unwrap_or_else(|| panic!("no {name} line in:\n{}", lines.join("\n")))
+            .to_string()
+    };
+    assert_eq!(field("scheme"), "?997;1", "dark scheme should report 1");
+    assert_eq!(field("before"), "?2031;2$", "mode 2031 starts reset");
+    assert_eq!(field("after"), "?2031;1$", "DECSET 2031 should stick");
+    assert_eq!(
+        field("notify"),
+        "?997;2",
+        "switching to light should notify"
+    );
+    assert_eq!(field("off"), "?2031;2$", "DECRST 2031 should clear it");
+    assert_eq!(
+        field("scheme2"),
+        "?997;2",
+        "query should see the light scheme"
+    );
+}
+
 /// Write `script` to a temp file and run it under bash in the active tab.
 /// Returns the tempdir, which the caller must keep alive for the run.
 fn run_bash_script(t: &mut AtermTest, script: &str) -> tempfile::TempDir {

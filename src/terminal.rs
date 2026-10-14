@@ -6,6 +6,7 @@ use alacritty_terminal::event_loop::{EventLoop as PtyLoop, Msg, Notifier};
 use winit::event_loop::EventLoopProxy;
 
 use crate::config::{Colors as ConfigColors, Config};
+use crate::theme_mode::{self, FilteredPty, ThemeState};
 use crate::WakeEvent;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
@@ -577,6 +578,9 @@ pub struct TerminalSession {
     cell_height: u16,
     exited: bool,
     palette: ConfigColors,
+    /// Dark/light state for `CSI ? 996 n` and mode 2031, shared with the
+    /// PTY reader that answers the queries (see [`crate::theme_mode`]).
+    theme: Arc<ThemeState>,
     /// When false, OSC 0/1/2 title-change requests from the running program
     /// are ignored — the tab keeps its initial title.
     dynamic_title: bool,
@@ -713,6 +717,8 @@ impl TerminalSession {
         let term = Term::new(term_config, &term_size, listener.clone());
         let term = Arc::new(FairMutex::new(term));
 
+        let theme = ThemeState::new(config.colors.is_dark());
+        let pty = FilteredPty::new(pty, theme.clone(), listener.clone());
         let pty_loop = PtyLoop::new(
             term.clone(),
             listener,
@@ -734,6 +740,7 @@ impl TerminalSession {
             cell_height,
             exited: false,
             palette: config.colors.clone(),
+            theme,
             dynamic_title: config.dynamic_title,
             clipboard_ops: Vec::new(),
             shell_pid: Some(shell_pid),
@@ -1050,9 +1057,17 @@ impl TerminalSession {
     /// Replace the color palette used to resolve named/indexed/default cell
     /// colors when this tab is snapshotted for rendering. Called when the OS
     /// light/dark appearance changes so existing tabs repaint in the new
-    /// scheme.
+    /// scheme. A program that turned on mode 2031 is told about the change.
     pub fn set_palette(&mut self, palette: ConfigColors) {
+        if palette == self.palette {
+            return;
+        }
+        let dark = palette.is_dark();
         self.palette = palette;
+        self.theme.set_dark(dark);
+        if self.theme.updates_enabled() {
+            self.send_input(theme_mode::scheme_report(dark).into_bytes());
+        }
     }
 
     /// Snapshot the current viewport for rendering. Takes the lock briefly,

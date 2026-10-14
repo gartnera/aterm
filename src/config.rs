@@ -114,6 +114,17 @@ impl Default for Colors {
 }
 
 impl Colors {
+    /// Whether this is a dark scheme, judged by its background: dark when
+    /// white text on it contrasts more than black text would. This is what
+    /// a mode-2031 / `CSI ? 996 n` report says, so a single user scheme
+    /// is reported correctly even when aterm isn't following the OS theme.
+    pub fn is_dark(&self) -> bool {
+        // Contrast against white beats contrast against black exactly when
+        // (L + 0.05)^2 < 1.05 * 0.05.
+        let l = crate::gfx::relative_luminance(self.background);
+        (l + 0.05) * (l + 0.05) < 1.05 * 0.05
+    }
+
     /// Matches alacritty's built-in default scheme so the look is identical
     /// when no `[colors]` table is provided. Used when the system theme is
     /// dark or when theme detection is unavailable.
@@ -717,6 +728,18 @@ mod tests {
     fn parse_hex_eight_digits_drops_alpha() {
         assert_eq!(parse_hex("#1a2b3cff"), Some([0x1a, 0x2b, 0x3c]));
         assert_eq!(parse_hex("0x1a2b3c80"), Some([0x1a, 0x2b, 0x3c]));
+    }
+
+    #[test]
+    fn builtin_schemes_report_their_darkness() {
+        assert!(Colors::default_dark().is_dark());
+        assert!(!Colors::default_light().is_dark());
+        let with_bg = |background| Colors {
+            background,
+            ..Colors::default_dark()
+        };
+        assert!(with_bg([0x00, 0x2b, 0x36]).is_dark()); // solarized dark
+        assert!(!with_bg([0xfd, 0xf6, 0xe3]).is_dark()); // solarized light
     }
 
     #[test]
