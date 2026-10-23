@@ -604,6 +604,9 @@ pub struct Gfx {
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
+    /// The window scale factor `surface_config` was last sized under, so a
+    /// DPI change nobody reported can be noticed (`out_of_sync_with_window`).
+    surface_scale: f64,
     font_system: FontSystem,
     swash_cache: SwashCache,
     text_atlas: TextAtlas,
@@ -668,6 +671,7 @@ impl Gfx {
     ) -> Self {
         let bg = colors.background;
         let size = window.inner_size();
+        let scale = window.scale_factor();
         let instance = wgpu::Instance::default();
         let surface = instance
             .create_surface(window.clone())
@@ -732,6 +736,7 @@ impl Gfx {
             queue,
             surface,
             surface_config,
+            surface_scale: scale,
             font_system,
             swash_cache,
             text_atlas,
@@ -905,7 +910,34 @@ impl Gfx {
         }
         self.surface_config.width = size.width;
         self.surface_config.height = size.height;
+        self.surface_scale = self.window.scale_factor();
         self.surface.configure(&self.device, &self.surface_config);
+    }
+
+    /// The window's current physical size if the surface no longer matches
+    /// it — a different size, or the same size under a different scale
+    /// factor. `None` when in sync, or when the window is minimized (zero
+    /// size), which `resize` ignores anyway.
+    ///
+    /// Moving a window to a display with another scale factor is normally
+    /// announced by `ScaleFactorChanged` + `Resized`, but macOS doesn't
+    /// always deliver the backing-properties change those come from (e.g.
+    /// across display reconfiguration). Comparing against the live window
+    /// state catches that case, since `scale_factor()` and `inner_size()`
+    /// are read straight from the window.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn out_of_sync_with_window(&self) -> Option<winit::dpi::PhysicalSize<u32>> {
+        let size = self.window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return None;
+        }
+        let same_size =
+            size.width == self.surface_config.width && size.height == self.surface_config.height;
+        if same_size && self.window.scale_factor() == self.surface_scale {
+            None
+        } else {
+            Some(size)
+        }
     }
 
     /// Build the tab strip: per-tab text segments, hit regions, and the
@@ -1568,14 +1600,20 @@ impl Gfx {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            // Skipping a frame leaves the previous one on screen until
+            // something else asks for a repaint, so retry right away.
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
+                self.window.request_redraw();
                 return Ok(());
             }
-            // Occluded (window hidden) and Timeout aren't errors — skip the frame.
-            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.window.request_redraw();
                 return Ok(());
             }
+            // Window hidden: nothing to show. The app repaints on
+            // `WindowEvent::Occluded(false)` instead of spinning here.
+            wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
             other => return Err(format!("surface texture unavailable: {other:?}")),
         };
         let view = frame
