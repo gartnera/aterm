@@ -8,6 +8,7 @@ use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::search::RegexSearch;
 use arboard::Clipboard;
 use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{ModifiersState, PhysicalKey};
@@ -110,6 +111,12 @@ pub struct App {
 impl App {
     /// Render one frame of the active tab to the window surface.
     fn render_now(&mut self) {
+        // Last line of defense against a missed DPI change: never draw into
+        // a surface sized for a different scale than the window's.
+        #[cfg(target_os = "macos")]
+        if let Some(window) = self.window.clone() {
+            self.sync_window_size(&window);
+        }
         let active_tab = self.active_tab;
         let term = self.tabs.get(active_tab);
         let hover_url = self.hover_url.as_ref();
@@ -123,6 +130,26 @@ impl App {
             hover_url,
         ) {
             log::error!("render error: {e}");
+        }
+    }
+
+    /// Resize the surface to `size` and reflow every tab's grid to match.
+    fn apply_window_size(&mut self, size: PhysicalSize<u32>, window: &Window) {
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        gfx.resize(size);
+        let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
+        let (cell_w_px, cell_h_px) = cell_dims_px(gfx, window);
+        for tab in &mut self.tabs {
+            tab.resize(cols, lines, cell_w_px, cell_h_px);
+        }
+    }
+
+    /// Bring the surface and grids in line with the window's current size
+    /// and scale factor if they've drifted.
+    #[cfg(target_os = "macos")]
+    fn sync_window_size(&mut self, window: &Window) {
+        if let Some(size) = self.gfx.as_ref().and_then(|g| g.out_of_sync_with_window()) {
+            self.apply_window_size(size, window);
         }
     }
 
@@ -474,15 +501,27 @@ impl ApplicationHandler<WakeEvent> for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                let Some(gfx) = self.gfx.as_mut() else { return };
-                gfx.resize(size);
-                let (cols, lines) = gfx.grid_for_window(TAB_BAR_HEIGHT);
-                let (cell_w_px, cell_h_px) = cell_dims_px(gfx, &window);
-                for tab in &mut self.tabs {
-                    tab.resize(cols, lines, cell_w_px, cell_h_px);
-                }
+                self.apply_window_size(size, &window);
                 window.request_redraw();
             }
+            // The window landed on a display with a different scale factor,
+            // or moved (possibly onto one). On macOS the window keeps its
+            // logical size, so its new physical size is already in place:
+            // resync from the live window rather than depend on the `Resized`
+            // winit sends next, which macOS doesn't always trigger when a
+            // window crosses displays. Repaint either way — a frame drawn
+            // mid-transition may never have reached the screen, and nothing
+            // else would replace it until the next keypress. (Elsewhere the
+            // resize lands after this event, so syncing here would reflow
+            // twice.)
+            #[cfg(target_os = "macos")]
+            WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Moved(_) => {
+                self.sync_window_size(&window);
+                window.request_redraw();
+            }
+            // Frames requested while the window was hidden were skipped (the
+            // surface reports Occluded), so repaint once it's visible again.
+            WindowEvent::Occluded(false) => window.request_redraw(),
             WindowEvent::RedrawRequested => self.render_now(),
             WindowEvent::ModifiersChanged(mods) => {
                 self.mods = mods.state();
