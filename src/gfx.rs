@@ -506,14 +506,8 @@ fn measure_cell_width(
     let measure = |fs: &mut FontSystem, text: &str| -> f32 {
         let metrics = Metrics::new(font_size, line_height);
         let mut buf = Buffer::new(fs, metrics);
-        buf.set_size(fs, Some(1000.0), Some(line_height + 4.0));
-        buf.set_text(
-            fs,
-            text,
-            &Attrs::new().family(family),
-            Shaping::Advanced,
-            None,
-        );
+        buf.set_size(Some(1000.0), Some(line_height + 4.0));
+        buf.set_text(text, &Attrs::new().family(family), Shaping::Advanced, None);
         buf.shape_until_scroll(fs, false);
         buf.layout_runs()
             .flat_map(|run| run.glyphs.iter())
@@ -563,14 +557,9 @@ fn glyph_misfits(
     ch: char,
 ) -> bool {
     let mut buf = Buffer::new(font_system, metrics);
-    buf.set_size(
-        font_system,
-        Some(cell_w_px * 4.0),
-        Some(metrics.line_height + 2.0),
-    );
+    buf.set_size(Some(cell_w_px * 4.0), Some(metrics.line_height + 2.0));
     let mut tmp = [0u8; 4];
     buf.set_text(
-        font_system,
         ch.encode_utf8(&mut tmp),
         &Attrs::new().family(family),
         Shaping::Advanced,
@@ -681,6 +670,7 @@ impl Gfx {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .expect("no adapter");
@@ -706,6 +696,7 @@ impl Gfx {
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
@@ -1076,8 +1067,8 @@ impl Gfx {
         let buf = self
             .tab_buffer
             .get_or_insert_with(|| Buffer::new(&mut self.font_system, metrics));
-        buf.set_metrics(&mut self.font_system, metrics);
-        buf.set_size(&mut self.font_system, Some(width as f32), Some(bar_h_px));
+        buf.set_metrics(metrics);
+        buf.set_size(Some(width as f32), Some(bar_h_px));
         let family = family_of(&self.font_family);
         let active_fg = self.tab_theme.active_fg;
         let inactive_fg = self.tab_theme.inactive_fg;
@@ -1091,13 +1082,7 @@ impl Gfx {
             }
             (text.as_str(), attrs)
         });
-        buf.set_rich_text(
-            &mut self.font_system,
-            spans,
-            &Attrs::new().family(family),
-            Shaping::Advanced,
-            None,
-        );
+        buf.set_rich_text(spans, &Attrs::new().family(family), Shaping::Advanced, None);
         buf.shape_until_scroll(&mut self.font_system, false);
 
         (
@@ -1143,12 +1128,11 @@ impl Gfx {
         let buf = self
             .url_bar_buffer
             .get_or_insert_with(|| Buffer::new(&mut self.font_system, metrics));
-        buf.set_metrics(&mut self.font_system, metrics);
-        buf.set_size(&mut self.font_system, Some(bar_w_px), Some(bar_h_px));
+        buf.set_metrics(metrics);
+        buf.set_size(Some(bar_w_px), Some(bar_h_px));
         let fg = self.tab_theme.active_fg;
         let family = family_of(&self.font_family);
         buf.set_text(
-            &mut self.font_system,
             &display,
             &Attrs::new()
                 .family(family)
@@ -1445,9 +1429,8 @@ impl Gfx {
                     continue;
                 }
                 let buf = &mut self.row_buffers[row_idx];
-                buf.set_metrics(&mut self.font_system, metrics);
+                buf.set_metrics(metrics);
                 buf.set_size(
-                    &mut self.font_system,
                     Some(cell_w_px * row.len() as f32 + cell_w_px),
                     Some(cell_h_px + 2.0),
                 );
@@ -1456,13 +1439,7 @@ impl Gfx {
                     .row_spans_scratch
                     .iter()
                     .map(|s| (&text[s.range.clone()], s.attrs(family)));
-                buf.set_rich_text(
-                    &mut self.font_system,
-                    spans,
-                    &Attrs::new().family(family),
-                    Shaping::Advanced,
-                    None,
-                );
+                buf.set_rich_text(spans, &Attrs::new().family(family), Shaping::Advanced, None);
                 buf.shape_until_scroll(&mut self.font_system, false);
 
                 // Re-shape this row's overlays. Each lives in its own
@@ -1476,7 +1453,6 @@ impl Gfx {
                     // and a glyph wider than its cells must still lay out
                     // rather than be pushed to a second line.
                     gb.set_size(
-                        &mut self.font_system,
                         Some(cell_w_px * (wg.cols as f32 + 2.0)),
                         Some(cell_h_px + 2.0),
                     );
@@ -1490,13 +1466,7 @@ impl Gfx {
                         attrs = attrs.style(glyphon::Style::Italic);
                     }
                     let mut tmp = [0u8; 4];
-                    gb.set_text(
-                        &mut self.font_system,
-                        wg.ch.encode_utf8(&mut tmp),
-                        &attrs,
-                        Shaping::Advanced,
-                        None,
-                    );
+                    gb.set_text(wg.ch.encode_utf8(&mut tmp), &attrs, Shaping::Advanced, None);
                     gb.shape_until_scroll(&mut self.font_system, false);
                     wb.push(gb);
                 }
@@ -1650,7 +1620,7 @@ impl Gfx {
             }
         }
         self.queue.submit(Some(encoder.finish()));
-        frame.present();
+        self.queue.present(frame);
         self.text_atlas.trim();
         Ok(())
     }
