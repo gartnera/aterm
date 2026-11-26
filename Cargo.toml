@@ -1,6 +1,6 @@
 [package]
 name = "aterm"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2021"
 rust-version = "1.95"
 description = "A minimal tabbed terminal built on alacritty_terminal, winit, and wgpu."
